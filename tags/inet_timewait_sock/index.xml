@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>Inet_timewait_sock on 深栈</title><link>https://1bit2.github.io/tags/inet_timewait_sock/</link><description>Recent content in Inet_timewait_sock on 深栈</description><generator>Hugo -- gohugo.io</generator><language>en-us</language><lastBuildDate>Thu, 16 Apr 2026 00:00:00 +0000</lastBuildDate><atom:link href="https://1bit2.github.io/tags/inet_timewait_sock/index.xml" rel="self" type="application/rss+xml"/><item><title>close(socket) 的 fd 归还时机与 TIME_WAIT 资源分析</title><link>https://1bit2.github.io/p/closesocket-%E7%9A%84-fd-%E5%BD%92%E8%BF%98%E6%97%B6%E6%9C%BA%E4%B8%8E-time_wait-%E8%B5%84%E6%BA%90%E5%88%86%E6%9E%90/</link><pubDate>Thu, 16 Apr 2026 00:00:00 +0000</pubDate><guid>https://1bit2.github.io/p/closesocket-%E7%9A%84-fd-%E5%BD%92%E8%BF%98%E6%97%B6%E6%9C%BA%E4%B8%8E-time_wait-%E8%B5%84%E6%BA%90%E5%88%86%E6%9E%90/</guid><description>&lt;blockquote&gt;
+&lt;p&gt;&lt;strong&gt;本文已扩充并迁移至 &lt;a class="link" href="TCP%e5%9b%9b%e6%ac%a1%e6%8c%a5%e6%89%8b%e4%b8%8eclose.md" &gt;TCP 四次挥手与 close 深度源码分析&lt;/a&gt;&lt;/strong&gt;，请阅读新版。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;h1 id="closesocket-的-fd-归还时机与-time_wait-资源分析"&gt;close(socket) 的 fd 归还时机与 TIME_WAIT 资源分析
+&lt;/h1&gt;&lt;blockquote&gt;
+&lt;p&gt;基于 Linux 5.15.78，追踪 &lt;code&gt;close(fd)&lt;/code&gt; 从 fd 表到协议栈到 TIME_WAIT 的完整路径。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;h2 id="概述"&gt;概述
+&lt;/h2&gt;&lt;p&gt;&lt;code&gt;close(fd)&lt;/code&gt; 对 socket 而言涉及两个独立的&amp;quot;释放&amp;quot;：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;fd 号归还&lt;/strong&gt;：在 &lt;code&gt;close&lt;/code&gt; 入口处&lt;strong&gt;立即完成&lt;/strong&gt;，fd 可被下次 &lt;code&gt;open&lt;/code&gt;/&lt;code&gt;socket&lt;/code&gt; 复用&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;协议栈资源释放&lt;/strong&gt;：通过 &lt;code&gt;fput&lt;/code&gt; → &lt;code&gt;sock_close&lt;/code&gt; → &lt;code&gt;tcp_close&lt;/code&gt; 异步完成，可能经历 FIN_WAIT → TIME_WAIT 等漫长状态&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这两者的时间差是理解 TIME_WAIT &amp;ldquo;不占 fd 但占端口&amp;quot;的关键。&lt;/p&gt;
+&lt;h2 id="调用链总览"&gt;调用链总览
+&lt;/h2&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;span class="lnt"&gt;21
+&lt;/span&gt;&lt;span class="lnt"&gt;22
+&lt;/span&gt;&lt;span class="lnt"&gt;23
+&lt;/span&gt;&lt;span class="lnt"&gt;24
+&lt;/span&gt;&lt;span class="lnt"&gt;25
+&lt;/span&gt;&lt;span class="lnt"&gt;26
+&lt;/span&gt;&lt;span class="lnt"&gt;27
+&lt;/span&gt;&lt;span class="lnt"&gt;28
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;close(fd)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ▼
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;close_fd(fd) [fs/file.c:663]
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── pick_file(files, fd) ← fd 号立即归还
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ├── fdt-&amp;gt;fd[fd] = NULL
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ └── __put_unused_fd(files, fd) (清 open_fds 位图)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── filp_close(file, files)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── fput(file)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── 引用归零时 → file-&amp;gt;f_op-&amp;gt;release
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ▼
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; sock_close(inode, filp) [net/socket.c:1361]
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── __sock_release(socket, inode)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── socket-&amp;gt;ops-&amp;gt;release = inet_release [af_inet.c:457]
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── sk-&amp;gt;sk_prot-&amp;gt;close = tcp_close [tcp.c:3417]
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 正常关闭: tcp_send_fin → FIN_WAIT1
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 有未读数据: tcp_send_active_reset → RST
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── SO_LINGER=0: disconnect → RST
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── sock_orphan(sk) ← sk 与 socket/file 断开
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── 可能进入:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── TCP_CLOSE → inet_csk_destroy_sock
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── TCP_FIN_WAIT2 → tcp_time_wait()
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── TCP_TIME_WAIT (由对端 FIN 触发)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h2 id="详细分析"&gt;详细分析
+&lt;/h2&gt;&lt;h3 id="阶段-1fd-号立即回收fsfilec"&gt;阶段 1：fd 号立即回收（fs/file.c）
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;close_fd&lt;/code&gt; 调用 &lt;code&gt;pick_file&lt;/code&gt;，在持有 &lt;code&gt;files-&amp;gt;file_lock&lt;/code&gt; 的情况下：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="nf"&gt;rcu_assign_pointer&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;fdt&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;fd&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;fd&lt;/span&gt;&lt;span class="p"&gt;],&lt;/span&gt; &lt;span class="nb"&gt;NULL&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt; &lt;span class="c1"&gt;// 清空槽位
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="nf"&gt;__put_unused_fd&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;files&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;fd&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt; &lt;span class="c1"&gt;// 清 open_fds 位图 + 更新 next_fd
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;此后该 fd 号立即可被 &lt;code&gt;get_unused_fd_flags&lt;/code&gt; 再次分配&lt;/strong&gt;。返回的 &lt;code&gt;file&lt;/code&gt; 指针交给 &lt;code&gt;filp_close&lt;/code&gt;。&lt;/p&gt;
+&lt;h3 id="阶段-2file-引用归零触发协议栈释放"&gt;阶段 2：file 引用归零触发协议栈释放
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;filp_close&lt;/code&gt; → &lt;code&gt;fput&lt;/code&gt; 递减 &lt;code&gt;file&lt;/code&gt; 的引用计数。当引用归零时（可能延迟到 &lt;code&gt;task_work&lt;/code&gt; 或 RCU 回调），调用 &lt;code&gt;file-&amp;gt;f_op-&amp;gt;release&lt;/code&gt;，对 socket 即 &lt;code&gt;sock_close&lt;/code&gt;。&lt;/p&gt;
+&lt;h3 id="阶段-3tcp_close--协议层关闭决策"&gt;阶段 3：tcp_close — 协议层关闭决策
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;tcp_close&lt;/code&gt; 根据当前状态和数据情况选择关闭方式：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;条件&lt;/th&gt;
+&lt;th&gt;行为&lt;/th&gt;
+&lt;th&gt;发送&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;接收缓冲区有未读数据&lt;/td&gt;
+&lt;td&gt;丢弃数据，强制关闭&lt;/td&gt;
+&lt;td&gt;RST&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;SO_LINGER&lt;/code&gt; 且 &lt;code&gt;linger_time=0&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;立即断开&lt;/td&gt;
+&lt;td&gt;RST&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;正常关闭&lt;/td&gt;
+&lt;td&gt;优雅关闭&lt;/td&gt;
+&lt;td&gt;FIN&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;已在 &lt;code&gt;TCP_CLOSE&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;直接销毁&lt;/td&gt;
+&lt;td&gt;无&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;正常情况下 &lt;code&gt;tcp_close_state()&lt;/code&gt; 执行状态转换：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;ESTABLISHED → FIN_WAIT1&lt;/code&gt;（发 FIN）&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;CLOSE_WAIT → LAST_ACK&lt;/code&gt;（发 FIN）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3 id="阶段-4sock_orphan--断开用户态关联"&gt;阶段 4：sock_orphan — 断开用户态关联
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="nf"&gt;sock_orphan&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;这一步至关重要：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;sk-&amp;gt;sk_socket = NULL&lt;/code&gt; — sock 不再关联 BSD socket&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;sk-&amp;gt;sk_wq = NULL&lt;/code&gt; — 没有进程在等待&lt;/li&gt;
+&lt;li&gt;设置 &lt;code&gt;SOCK_DEAD&lt;/code&gt; 标志&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;从此刻起，sock 成为&amp;quot;孤儿&amp;rdquo;&lt;/strong&gt;——没有 fd、没有 file、没有进程可以操作它，但 TCP 状态机仍在内核中运行（等待对端 FIN、重传等）。&lt;/p&gt;
+&lt;h3 id="阶段-5time_wait--轻量替身"&gt;阶段 5：TIME_WAIT — 轻量替身
+&lt;/h3&gt;&lt;p&gt;当连接进入 TIME_WAIT 状态时（通常由 &lt;code&gt;tcp_time_wait()&lt;/code&gt; 触发），内核做了一个关键优化：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;用 &lt;code&gt;inet_timewait_sock&lt;/code&gt;（约 168 字节）替换完整的 &lt;code&gt;tcp_sock&lt;/code&gt;（约 2KB）&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;tcp_time_wait(sk, TCP_FIN_WAIT2/TCP_TIME_WAIT, tmo)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 分配 inet_timewait_sock (从 tcp_death_row 的 slab 分配)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 拷贝必要字段（地址/端口/序列号等）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 注册到 TIME_WAIT 定时器（默认 60 秒）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── 释放原 tcp_sock
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;TIME_WAIT 定时器到期后（2MSL = 60s），&lt;code&gt;inet_timewait_sock&lt;/code&gt; 被释放，端口号归还。&lt;/p&gt;
+&lt;h2 id="各阶段资源状态一览"&gt;各阶段资源状态一览
+&lt;/h2&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;时间轴 ───────────────────────────────────────────────►
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;close() fput归零 sock_orphan 进入TW TW超时
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ │ │ │ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ▼ ▼ ▼ ▼ ▼
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│fd: 回收│ │file: │ │sock: │ │tw_sock│ │全部 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│file:存在│ │释放 │ │orphan│ │替代 │ │释放 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│sock:存在│ │sock: │ │无fd │ │~168B │ │端口 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ │存在 │ │无file│ │占端口 │ │归还 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;└──────┘ └──────┘ └──────┘ └──────┘ └──────┘
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h2 id="关键数据结构"&gt;关键数据结构
+&lt;/h2&gt;&lt;h3 id="inet_timewait_sock"&gt;inet_timewait_sock
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;span class="lnt"&gt;7
+&lt;/span&gt;&lt;span class="lnt"&gt;8
+&lt;/span&gt;&lt;span class="lnt"&gt;9
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;inet_timewait_sock&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;sock_common&lt;/span&gt; &lt;span class="n"&gt;__tw_common&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// 地址/端口/哈希（复用 sock 的公共头）
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;volatile&lt;/span&gt; &lt;span class="kt"&gt;unsigned&lt;/span&gt; &lt;span class="kt"&gt;char&lt;/span&gt; &lt;span class="n"&gt;tw_substate&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// TIME_WAIT 子状态
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;unsigned&lt;/span&gt; &lt;span class="kt"&gt;char&lt;/span&gt; &lt;span class="n"&gt;tw_rcv_wscale&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// 窗口缩放（验证迟到包用）
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;__be16&lt;/span&gt; &lt;span class="n"&gt;tw_sport&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// 源端口
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;inet_bind_bucket&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;tw_tb&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// 绑定桶（占用端口号）
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;hlist_node&lt;/span&gt; &lt;span class="n"&gt;tw_death_node&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// TIME_WAIT 定时器链表
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// ... 约 168 字节
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;相比完整 &lt;code&gt;tcp_sock&lt;/code&gt; 的 2KB+，节省了拥塞窗口、重传队列、乱序队列、发送/接收缓冲区等所有活跃连接才需要的字段。&lt;/p&gt;
+&lt;h2 id="常见问题"&gt;常见问题
+&lt;/h2&gt;&lt;h3 id="q-time_wait-会消耗-fd-吗"&gt;Q: TIME_WAIT 会消耗 fd 吗？
+&lt;/h3&gt;&lt;p&gt;&lt;strong&gt;不会。&lt;/strong&gt; fd 在 &lt;code&gt;close&lt;/code&gt; 入口处就已归还，TIME_WAIT 时连 &lt;code&gt;struct file&lt;/code&gt; 和 &lt;code&gt;struct socket&lt;/code&gt; 都已释放。&lt;code&gt;inet_timewait_sock&lt;/code&gt; 只占用&lt;strong&gt;端口号&lt;/strong&gt;和约 168 字节内存。&lt;/p&gt;
+&lt;h3 id="q-大量-time_wait-的影响是什么"&gt;Q: 大量 TIME_WAIT 的影响是什么？
+&lt;/h3&gt;&lt;p&gt;不影响 fd 配额（&lt;code&gt;ulimit -n&lt;/code&gt;），但会：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;占用端口号（影响 &lt;code&gt;connect&lt;/code&gt; 时可用的源端口范围）&lt;/li&gt;
+&lt;li&gt;占用 &lt;code&gt;ehash&lt;/code&gt; 哈希表槽位&lt;/li&gt;
+&lt;li&gt;每条约 168 字节内存（1 万条 ≈ 1.6MB，一般不是瓶颈）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;缓解方式：&lt;code&gt;net.ipv4.tcp_tw_reuse=1&lt;/code&gt;、&lt;code&gt;SO_REUSEADDR&lt;/code&gt;、扩大 &lt;code&gt;ip_local_port_range&lt;/code&gt;。&lt;/p&gt;
+&lt;h3 id="q-close-后-fd-号能立即被复用吗"&gt;Q: close 后 fd 号能立即被复用吗？
+&lt;/h3&gt;&lt;p&gt;&lt;strong&gt;能。&lt;/strong&gt; &lt;code&gt;pick_file&lt;/code&gt; 在 &lt;code&gt;close_fd&lt;/code&gt; 一开始就清空 &lt;code&gt;fdt-&amp;gt;fd[fd]&lt;/code&gt; 并归还位图。即使 &lt;code&gt;fput&lt;/code&gt; 尚未执行（file 引用未归零），fd 号已经可以被下次 &lt;code&gt;open&lt;/code&gt;/&lt;code&gt;socket&lt;/code&gt;/&lt;code&gt;accept&lt;/code&gt; 分配。这也是为什么以下代码可能出现问题：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="nf"&gt;close&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;fd&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;// 另一个线程同时 accept()，恰好拿到同一个 fd 号
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;// 如果此线程还在用&amp;#34;旧 fd&amp;#34;做事，就会操作到错误的连接
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h3 id="q-so_linger-设置为非零超时时会怎样"&gt;Q: SO_LINGER 设置为非零超时时会怎样？
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;close&lt;/code&gt; 会在 &lt;code&gt;sk_stream_wait_close&lt;/code&gt; 中&lt;strong&gt;阻塞&lt;/strong&gt;当前进程，等待数据发送完成或超时。但 fd 号&lt;strong&gt;仍然在阻塞之前就已归还&lt;/strong&gt;（&lt;code&gt;pick_file&lt;/code&gt; 先于 &lt;code&gt;filp_close&lt;/code&gt; 执行）。&lt;/p&gt;</description></item></channel></rss>

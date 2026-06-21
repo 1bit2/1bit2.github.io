@@ -1,0 +1,700 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="TCP数据就绪与Epoll唤醒机制分析 概述 本文档详细分析Linux内核中TCP数据到达后如何通过sk->sk_data_ready回调触发epoll唤醒机制，最终通知用户空间应用程序的完整流程。\n一、核心调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 TCP数据包到达 ↓ tcp_data_queue() // TCP输入处理 ↓ tcp_data_ready(sk) // 检查是否满足唤醒条件 ↓ sk->sk_data_ready(sk) // 调用数据就绪回调（默认是sock_def_readable） ↓ sock_def_readable(sk) // 唤醒等待队列 ↓ wake_up_interruptible_sync_poll() // 唤醒等待进程 ↓ ep_poll_callback() // epoll的回调函数 ↓ wake_up(&amp;ep->wq) // 唤醒epoll_wait ↓ 用户空间应用程序被唤醒 二、关键函数详解 2.1 tcp_data_ready (net/ipv4/tcp_input.c) 功能: TCP数据就绪通知函数\n"><title>TCP数据就绪与Epoll唤醒机制分析</title><link rel=canonical href=https://1bit2.github.io/p/tcp%E6%95%B0%E6%8D%AE%E5%B0%B1%E7%BB%AA%E4%B8%8Eepoll%E5%94%A4%E9%86%92%E6%9C%BA%E5%88%B6%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP数据就绪与Epoll唤醒机制分析"><meta property='og:description' content="TCP数据就绪与Epoll唤醒机制分析 概述 本文档详细分析Linux内核中TCP数据到达后如何通过sk->sk_data_ready回调触发epoll唤醒机制，最终通知用户空间应用程序的完整流程。\n一、核心调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 TCP数据包到达 ↓ tcp_data_queue() // TCP输入处理 ↓ tcp_data_ready(sk) // 检查是否满足唤醒条件 ↓ sk->sk_data_ready(sk) // 调用数据就绪回调（默认是sock_def_readable） ↓ sock_def_readable(sk) // 唤醒等待队列 ↓ wake_up_interruptible_sync_poll() // 唤醒等待进程 ↓ ep_poll_callback() // epoll的回调函数 ↓ wake_up(&amp;ep->wq) // 唤醒epoll_wait ↓ 用户空间应用程序被唤醒 二、关键函数详解 2.1 tcp_data_ready (net/ipv4/tcp_input.c) 功能: TCP数据就绪通知函数\n"><meta property='og:url' content='https://1bit2.github.io/p/tcp%E6%95%B0%E6%8D%AE%E5%B0%B1%E7%BB%AA%E4%B8%8Eepoll%E5%94%A4%E9%86%92%E6%9C%BA%E5%88%B6%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='epoll'><meta property='article:tag' content='sk_data_ready'><meta property='article:tag' content='tcp_data_queue'><meta property='article:published_time' content='2026-04-16T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-16T00:00:00+00:00'><meta name=twitter:title content="TCP数据就绪与Epoll唤醒机制分析"><meta name=twitter:description content="TCP数据就绪与Epoll唤醒机制分析 概述 本文档详细分析Linux内核中TCP数据到达后如何通过sk->sk_data_ready回调触发epoll唤醒机制，最终通知用户空间应用程序的完整流程。\n一、核心调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 TCP数据包到达 ↓ tcp_data_queue() // TCP输入处理 ↓ tcp_data_ready(sk) // 检查是否满足唤醒条件 ↓ sk->sk_data_ready(sk) // 调用数据就绪回调（默认是sock_def_readable） ↓ sock_def_readable(sk) // 唤醒等待队列 ↓ wake_up_interruptible_sync_poll() // 唤醒等待进程 ↓ ep_poll_callback() // epoll的回调函数 ↓ wake_up(&amp;ep->wq) // 唤醒epoll_wait ↓ 用户空间应用程序被唤醒 二、关键函数详解 2.1 tcp_data_ready (net/ipv4/tcp_input.c) 功能: TCP数据就绪通知函数\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#概述>概述</a></li><li><a href=#一核心调用链>一、核心调用链</a></li><li><a href=#二关键函数详解>二、关键函数详解</a><ol><li><a href=#21-tcp_data_ready-netipv4tcp_inputc>2.1 tcp_data_ready (net/ipv4/tcp_input.c)</a></li><li><a href=#22-tcp_epollin_ready-includenettcph>2.2 tcp_epollin_ready (include/net/tcp.h)</a></li><li><a href=#23-sock_init_data-netcoresockc>2.3 sock_init_data (net/core/sock.c)</a></li><li><a href=#24-sock_def_readable-netcoresockc>2.4 sock_def_readable (net/core/sock.c)</a></li><li><a href=#25-ep_poll_callback-fseventpollc>2.5 ep_poll_callback (fs/eventpoll.c)</a></li></ol></li><li><a href=#三完整流程图>三、完整流程图</a></li><li><a href=#四关键数据结构>四、关键数据结构</a><ol><li><a href=#41-struct-sock>4.1 struct sock</a></li><li><a href=#42-struct-socket_wq>4.2 struct socket_wq</a></li><li><a href=#43-wait_queue_entry_t>4.3 wait_queue_entry_t</a></li></ol></li><li><a href=#五回调函数注册流程>五、回调函数注册流程</a><ol><li><a href=#51-socket初始化>5.1 socket初始化</a></li><li><a href=#52-epoll回调注册>5.2 epoll回调注册</a></li></ol></li><li><a href=#六性能优化点>六、性能优化点</a><ol><li><a href=#61-唤醒条件优化>6.1 唤醒条件优化</a></li><li><a href=#62-无锁操作>6.2 无锁操作</a></li><li><a href=#63-busy-poll>6.3 Busy Poll</a></li></ol></li><li><a href=#七特殊场景>七、特殊场景</a><ol><li><a href=#71-嵌套epoll>7.1 嵌套epoll</a></li><li><a href=#72-epolloneshot模式>7.2 EPOLLONESHOT模式</a></li><li><a href=#73-epollexclusive模式>7.3 EPOLLEXCLUSIVE模式</a></li></ol></li><li><a href=#八调试技巧>八、调试技巧</a><ol><li><a href=#81-追踪点>8.1 追踪点</a></li><li><a href=#82-内核参数>8.2 内核参数</a></li><li><a href=#83-常用工具>8.3 常用工具</a></li></ol></li><li><a href=#九总结>九、总结</a><ol><li><a href=#91-关键流程>9.1 关键流程</a></li><li><a href=#92-设计亮点>9.2 设计亮点</a></li><li><a href=#93-性能考虑>9.3 性能考虑</a></li></ol></li><li><a href=#十相关文件>十、相关文件</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp%E6%95%B0%E6%8D%AE%E5%B0%B1%E7%BB%AA%E4%B8%8Eepoll%E5%94%A4%E9%86%92%E6%9C%BA%E5%88%B6%E5%88%86%E6%9E%90/>TCP数据就绪与Epoll唤醒机制分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 16, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>7 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp数据就绪与epoll唤醒机制分析>TCP数据就绪与Epoll唤醒机制分析</h1><h2 id=概述>概述</h2><p>本文档详细分析Linux内核中TCP数据到达后如何通过<code>sk->sk_data_ready</code>回调触发epoll唤醒机制，最终通知用户空间应用程序的完整流程。</p><hr><h2 id=一核心调用链>一、核心调用链</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>TCP数据包到达
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_data_queue()                    // TCP输入处理
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_data_ready(sk)                  // 检查是否满足唤醒条件
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sk-&gt;sk_data_ready(sk)               // 调用数据就绪回调（默认是sock_def_readable）
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock_def_readable(sk)               // 唤醒等待队列
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>wake_up_interruptible_sync_poll()   // 唤醒等待进程
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>ep_poll_callback()                  // epoll的回调函数
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>wake_up(&amp;ep-&gt;wq)                    // 唤醒epoll_wait
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>用户空间应用程序被唤醒
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=二关键函数详解>二、关键函数详解</h2><h3 id=21-tcp_data_ready-netipv4tcp_inputc>2.1 tcp_data_ready (net/ipv4/tcp_input.c)</h3><p><strong>功能</strong>: TCP数据就绪通知函数</p><p><strong>调用时机</strong>:</p><ul><li>当TCP接收到数据并加入接收队列后</li><li>在<code>tcp_data_queue()</code>函数中调用</li></ul><p><strong>源码</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_data_ready</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 检查是否有足够的数据可读，或socket已完成关闭 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_epollin_ready</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_rcvlowat</span><span class=p>)</span> <span class=o>||</span> <span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DONE</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 调用数据就绪回调函数（通常是sock_def_readable） */</span>
+</span></span><span class=line><span class=cl>        <span class=n>sk</span><span class=o>-&gt;</span><span class=nf>sk_data_ready</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键点</strong>:</p><ol><li>不是每次收到数据都会调用回调</li><li>需要满足唤醒条件（通过<code>tcp_epollin_ready</code>检查）</li><li><code>sk->sk_data_ready</code>是一个函数指针，可以被替换</li></ol><h3 id=22-tcp_epollin_ready-includenettcph>2.2 tcp_epollin_ready (include/net/tcp.h)</h3><p><strong>功能</strong>: 检查TCP socket是否有足够数据可读</p><p><strong>判断条件</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>tcp_epollin_ready</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>target</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 计算可用数据量：接收序号 - 已复制序号 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>avail</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>)</span> <span class=o>-</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>copied_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 如果没有可用数据，返回false */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>avail</span> <span class=o>&lt;=</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>     * 满足以下任一条件即可唤醒：
+</span></span></span><span class=line><span class=cl><span class=cm>     * 1. 可用数据 &gt;= 目标字节数（通常是sk_rcvlowat）
+</span></span></span><span class=line><span class=cl><span class=cm>     * 2. 接收缓冲区有内存压力
+</span></span></span><span class=line><span class=cl><span class=cm>     * 3. 接收窗口 &lt;= 一个MSS（避免小窗口综合征）
+</span></span></span><span class=line><span class=cl><span class=cm>     */</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=p>(</span><span class=n>avail</span> <span class=o>&gt;=</span> <span class=n>target</span><span class=p>)</span> <span class=o>||</span> <span class=nf>tcp_rmem_pressure</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>           <span class=p>(</span><span class=nf>tcp_receive_window</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&lt;=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>rcv_mss</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>唤醒条件</strong>:</p><ol><li><strong>数据量充足</strong>: 可用数据 >= <code>sk_rcvlowat</code>（默认1字节）</li><li><strong>内存压力</strong>: 接收缓冲区内存不足，需要尽快让应用读取</li><li><strong>窗口限制</strong>: 接收窗口很小（≤ MSS），避免小窗口问题</li></ol><h3 id=23-sock_init_data-netcoresockc>2.3 sock_init_data (net/core/sock.c)</h3><p><strong>功能</strong>: 初始化socket数据结构</p><p><strong>关键初始化</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>void</span> <span class=nf>sock_init_data</span><span class=p>(</span><span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=n>sock</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ... 其他初始化 ...
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>     * 初始化回调函数为默认实现
+</span></span></span><span class=line><span class=cl><span class=cm>     * 这些回调可以被协议栈或应用层替换
+</span></span></span><span class=line><span class=cl><span class=cm>     */</span>
+</span></span><span class=line><span class=cl>    <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state_change</span>  <span class=o>=</span> <span class=n>sock_def_wakeup</span><span class=p>;</span>       <span class=cm>/* 状态变化回调 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_data_ready</span>    <span class=o>=</span> <span class=n>sock_def_readable</span><span class=p>;</span>     <span class=cm>/* 数据就绪回调 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_write_space</span>   <span class=o>=</span> <span class=n>sock_def_write_space</span><span class=p>;</span>  <span class=cm>/* 写空间可用回调 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_error_report</span>  <span class=o>=</span> <span class=n>sock_def_error_report</span><span class=p>;</span> <span class=cm>/* 错误报告回调 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_destruct</span>      <span class=o>=</span> <span class=n>sock_def_destruct</span><span class=p>;</span>     <span class=cm>/* 析构回调 */</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// ... 其他初始化 ...
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>重要说明</strong>:</p><ul><li><code>sk_data_ready</code>默认指向<code>sock_def_readable</code></li><li>某些协议或应用可能会替换这个回调</li><li>例如：TLS、BPF、RDS等会设置自己的回调</li></ul><h3 id=24-sock_def_readable-netcoresockc>2.4 sock_def_readable (net/core/sock.c)</h3><p><strong>功能</strong>: socket默认的数据就绪回调函数</p><p><strong>源码</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>void</span> <span class=nf>sock_def_readable</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>socket_wq</span> <span class=o>*</span><span class=n>wq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>rcu_read_lock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 获取socket的等待队列 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>wq</span> <span class=o>=</span> <span class=nf>rcu_dereference</span><span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_wq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 如果有进程在等待队列上睡眠 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>skwq_has_sleeper</span><span class=p>(</span><span class=n>wq</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>         * 唤醒等待队列上的进程，通知以下事件：
+</span></span></span><span class=line><span class=cl><span class=cm>         * EPOLLIN: 有数据可读
+</span></span></span><span class=line><span class=cl><span class=cm>         * EPOLLPRI: 有紧急数据可读
+</span></span></span><span class=line><span class=cl><span class=cm>         * EPOLLRDNORM: 有普通数据可读
+</span></span></span><span class=line><span class=cl><span class=cm>         * EPOLLRDBAND: 有带外数据可读
+</span></span></span><span class=line><span class=cl><span class=cm>         */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>wake_up_interruptible_sync_poll</span><span class=p>(</span><span class=o>&amp;</span><span class=n>wq</span><span class=o>-&gt;</span><span class=n>wait</span><span class=p>,</span> <span class=n>EPOLLIN</span> <span class=o>|</span> <span class=n>EPOLLPRI</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>                        <span class=n>EPOLLRDNORM</span> <span class=o>|</span> <span class=n>EPOLLRDBAND</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 异步通知（如SIGIO信号） */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sk_wake_async</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_WAKE_WAITD</span><span class=p>,</span> <span class=n>POLL_IN</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>rcu_read_unlock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>工作流程</strong>:</p><ol><li>获取socket的等待队列（<code>sk_wq</code>）</li><li>检查是否有进程在等待</li><li>调用<code>wake_up_interruptible_sync_poll()</code>唤醒等待进程</li><li>触发异步通知（SIGIO信号）</li></ol><p><strong>事件类型</strong>:</p><ul><li><code>EPOLLIN</code>: 有数据可读</li><li><code>EPOLLPRI</code>: 有紧急数据</li><li><code>EPOLLRDNORM</code>: 有普通数据</li><li><code>EPOLLRDBAND</code>: 有带外数据</li></ul><h3 id=25-ep_poll_callback-fseventpollc>2.5 ep_poll_callback (fs/eventpoll.c)</h3><p><strong>功能</strong>: epoll的poll回调函数</p><p><strong>注册时机</strong>: 在<code>ep_insert()</code>中通过<code>ep_ptable_queue_proc()</code>注册</p><p><strong>源码关键部分</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>ep_poll_callback</span><span class=p>(</span><span class=kt>wait_queue_entry_t</span> <span class=o>*</span><span class=n>wait</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=n>mode</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sync</span><span class=p>,</span> <span class=kt>void</span> <span class=o>*</span><span class=n>key</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>pwake</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>epitem</span> <span class=o>*</span><span class=n>epi</span> <span class=o>=</span> <span class=nf>ep_item_from_wait</span><span class=p>(</span><span class=n>wait</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>eventpoll</span> <span class=o>*</span><span class=n>ep</span> <span class=o>=</span> <span class=n>epi</span><span class=o>-&gt;</span><span class=n>ep</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>__poll_t</span> <span class=n>pollflags</span> <span class=o>=</span> <span class=nf>key_to_poll</span><span class=p>(</span><span class=n>key</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>flags</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>ewake</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>read_lock_irqsave</span><span class=p>(</span><span class=o>&amp;</span><span class=n>ep</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>,</span> <span class=n>flags</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 设置busy poll的NAPI ID */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>ep_set_busy_poll_napi_id</span><span class=p>(</span><span class=n>epi</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 检查事件掩码是否匹配 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>epi</span><span class=o>-&gt;</span><span class=n>event</span><span class=p>.</span><span class=n>events</span> <span class=o>&amp;</span> <span class=o>~</span><span class=n>EP_PRIVATE_BITS</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out_unlock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>pollflags</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=p>(</span><span class=n>pollflags</span> <span class=o>&amp;</span> <span class=n>epi</span><span class=o>-&gt;</span><span class=n>event</span><span class=p>.</span><span class=n>events</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out_unlock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>     * 将事件加入就绪列表或溢出列表
+</span></span></span><span class=line><span class=cl><span class=cm>     */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>ep</span><span class=o>-&gt;</span><span class=n>ovflist</span><span class=p>)</span> <span class=o>!=</span> <span class=n>EP_UNACTIVE_PTR</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 扫描期间，将事件加入溢出列表 */</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>chain_epi_lockless</span><span class=p>(</span><span class=n>epi</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=nf>ep_pm_stay_awake_rcu</span><span class=p>(</span><span class=n>epi</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>ep_is_linked</span><span class=p>(</span><span class=n>epi</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 通常情况下，将事件添加到就绪列表 */</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>list_add_tail_lockless</span><span class=p>(</span><span class=o>&amp;</span><span class=n>epi</span><span class=o>-&gt;</span><span class=n>rdllink</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>ep</span><span class=o>-&gt;</span><span class=n>rdllist</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=nf>ep_pm_stay_awake_rcu</span><span class=p>(</span><span class=n>epi</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 唤醒epoll_wait等待的进程 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>waitqueue_active</span><span class=p>(</span><span class=o>&amp;</span><span class=n>ep</span><span class=o>-&gt;</span><span class=n>wq</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>wake_up</span><span class=p>(</span><span class=o>&amp;</span><span class=n>ep</span><span class=o>-&gt;</span><span class=n>wq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* 如果有嵌套epoll在等待，标记需要唤醒 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>waitqueue_active</span><span class=p>(</span><span class=o>&amp;</span><span class=n>ep</span><span class=o>-&gt;</span><span class=n>poll_wait</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=n>pwake</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>out_unlock</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=nf>read_unlock_irqrestore</span><span class=p>(</span><span class=o>&amp;</span><span class=n>ep</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>,</span> <span class=n>flags</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 必须在锁外调用此函数（嵌套epoll唤醒） */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>pwake</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>ep_poll_safewake</span><span class=p>(</span><span class=n>ep</span><span class=p>,</span> <span class=n>epi</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ewake</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>工作流程</strong>:</p><ol><li><strong>获取上下文</strong>: 从等待队列项获取epitem和eventpoll</li><li><strong>检查事件</strong>: 验证触发的事件是否匹配监控的事件</li><li><strong>加入就绪列表</strong>:<ul><li>正常情况：加入<code>rdllist</code></li><li>扫描期间：加入<code>ovflist</code>（溢出列表）</li></ul></li><li><strong>唤醒进程</strong>: 调用<code>wake_up(&amp;ep->wq)</code>唤醒<code>epoll_wait</code></li><li><strong>嵌套epoll</strong>: 如果有嵌套epoll，调用<code>ep_poll_safewake</code></li></ol><p><strong>并发控制</strong>:</p><ul><li>使用读锁保护（<code>read_lock_irqsave</code>）</li><li>无锁操作就绪列表（<code>list_add_tail_lockless</code>）</li><li>使用cmpxchg检测并发</li></ul><hr><h2 id=三完整流程图>三、完整流程图</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>  1
+</span><span class=lnt>  2
+</span><span class=lnt>  3
+</span><span class=lnt>  4
+</span><span class=lnt>  5
+</span><span class=lnt>  6
+</span><span class=lnt>  7
+</span><span class=lnt>  8
+</span><span class=lnt>  9
+</span><span class=lnt> 10
+</span><span class=lnt> 11
+</span><span class=lnt> 12
+</span><span class=lnt> 13
+</span><span class=lnt> 14
+</span><span class=lnt> 15
+</span><span class=lnt> 16
+</span><span class=lnt> 17
+</span><span class=lnt> 18
+</span><span class=lnt> 19
+</span><span class=lnt> 20
+</span><span class=lnt> 21
+</span><span class=lnt> 22
+</span><span class=lnt> 23
+</span><span class=lnt> 24
+</span><span class=lnt> 25
+</span><span class=lnt> 26
+</span><span class=lnt> 27
+</span><span class=lnt> 28
+</span><span class=lnt> 29
+</span><span class=lnt> 30
+</span><span class=lnt> 31
+</span><span class=lnt> 32
+</span><span class=lnt> 33
+</span><span class=lnt> 34
+</span><span class=lnt> 35
+</span><span class=lnt> 36
+</span><span class=lnt> 37
+</span><span class=lnt> 38
+</span><span class=lnt> 39
+</span><span class=lnt> 40
+</span><span class=lnt> 41
+</span><span class=lnt> 42
+</span><span class=lnt> 43
+</span><span class=lnt> 44
+</span><span class=lnt> 45
+</span><span class=lnt> 46
+</span><span class=lnt> 47
+</span><span class=lnt> 48
+</span><span class=lnt> 49
+</span><span class=lnt> 50
+</span><span class=lnt> 51
+</span><span class=lnt> 52
+</span><span class=lnt> 53
+</span><span class=lnt> 54
+</span><span class=lnt> 55
+</span><span class=lnt> 56
+</span><span class=lnt> 57
+</span><span class=lnt> 58
+</span><span class=lnt> 59
+</span><span class=lnt> 60
+</span><span class=lnt> 61
+</span><span class=lnt> 62
+</span><span class=lnt> 63
+</span><span class=lnt> 64
+</span><span class=lnt> 65
+</span><span class=lnt> 66
+</span><span class=lnt> 67
+</span><span class=lnt> 68
+</span><span class=lnt> 69
+</span><span class=lnt> 70
+</span><span class=lnt> 71
+</span><span class=lnt> 72
+</span><span class=lnt> 73
+</span><span class=lnt> 74
+</span><span class=lnt> 75
+</span><span class=lnt> 76
+</span><span class=lnt> 77
+</span><span class=lnt> 78
+</span><span class=lnt> 79
+</span><span class=lnt> 80
+</span><span class=lnt> 81
+</span><span class=lnt> 82
+</span><span class=lnt> 83
+</span><span class=lnt> 84
+</span><span class=lnt> 85
+</span><span class=lnt> 86
+</span><span class=lnt> 87
+</span><span class=lnt> 88
+</span><span class=lnt> 89
+</span><span class=lnt> 90
+</span><span class=lnt> 91
+</span><span class=lnt> 92
+</span><span class=lnt> 93
+</span><span class=lnt> 94
+</span><span class=lnt> 95
+</span><span class=lnt> 96
+</span><span class=lnt> 97
+</span><span class=lnt> 98
+</span><span class=lnt> 99
+</span><span class=lnt>100
+</span><span class=lnt>101
+</span><span class=lnt>102
+</span><span class=lnt>103
+</span><span class=lnt>104
+</span><span class=lnt>105
+</span><span class=lnt>106
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                    TCP数据包到达                              │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  tcp_rcv_established() / tcp_v4_do_rcv()                     │
+</span></span><span class=line><span class=cl>│  - 处理TCP数据包                                              │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  tcp_data_queue(sk, skb)                                     │
+</span></span><span class=line><span class=cl>│  - 将数据加入接收队列                                         │
+</span></span><span class=line><span class=cl>│  - 顺序数据加入sk_receive_queue                               │
+</span></span><span class=line><span class=cl>│  - 乱序数据加入out_of_order_queue                             │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  tcp_data_ready(sk)                                          │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────────────────────────────────┐    │
+</span></span><span class=line><span class=cl>│  │ if (tcp_epollin_ready(sk, sk-&gt;sk_rcvlowat) ||      │    │
+</span></span><span class=line><span class=cl>│  │     sock_flag(sk, SOCK_DONE))                       │    │
+</span></span><span class=line><span class=cl>│  │     sk-&gt;sk_data_ready(sk);                          │    │
+</span></span><span class=line><span class=cl>│  └─────────────────────────────────────────────────────┘    │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  tcp_epollin_ready(sk, target)                               │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────────────────────────────────┐    │
+</span></span><span class=line><span class=cl>│  │ avail = rcv_nxt - copied_seq                        │    │
+</span></span><span class=line><span class=cl>│  │ return (avail &gt;= target) ||                         │    │
+</span></span><span class=line><span class=cl>│  │        tcp_rmem_pressure(sk) ||                     │    │
+</span></span><span class=line><span class=cl>│  │        (rcv_window &lt;= mss)                          │    │
+</span></span><span class=line><span class=cl>│  └─────────────────────────────────────────────────────┘    │
+</span></span><span class=line><span class=cl>│  条件1: 数据量充足 (&gt;= sk_rcvlowat)                          │
+</span></span><span class=line><span class=cl>│  条件2: 内存压力                                              │
+</span></span><span class=line><span class=cl>│  条件3: 窗口限制                                              │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │ 满足条件
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  sk-&gt;sk_data_ready(sk)                                       │
+</span></span><span class=line><span class=cl>│  默认: sock_def_readable(sk)                                 │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────────────────────────────────┐    │
+</span></span><span class=line><span class=cl>│  │ wq = rcu_dereference(sk-&gt;sk_wq);                    │    │
+</span></span><span class=line><span class=cl>│  │ if (skwq_has_sleeper(wq))                           │    │
+</span></span><span class=line><span class=cl>│  │     wake_up_interruptible_sync_poll(&amp;wq-&gt;wait,      │    │
+</span></span><span class=line><span class=cl>│  │         EPOLLIN | EPOLLPRI | EPOLLRDNORM | ...);    │    │
+</span></span><span class=line><span class=cl>│  └─────────────────────────────────────────────────────┘    │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  wake_up_interruptible_sync_poll(&amp;wq-&gt;wait, events)         │
+</span></span><span class=line><span class=cl>│  - 遍历等待队列                                               │
+</span></span><span class=line><span class=cl>│  - 调用每个等待项的回调函数                                   │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  ep_poll_callback(wait, mode, sync, key)                    │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────────────────────────────────┐    │
+</span></span><span class=line><span class=cl>│  │ 1. 检查事件掩码匹配                                  │    │
+</span></span><span class=line><span class=cl>│  │ 2. 将epi加入就绪列表                                 │    │
+</span></span><span class=line><span class=cl>│  │    - 正常: rdllist                                   │    │
+</span></span><span class=line><span class=cl>│  │    - 扫描中: ovflist                                 │    │
+</span></span><span class=line><span class=cl>│  │ 3. 唤醒epoll_wait                                    │    │
+</span></span><span class=line><span class=cl>│  │    wake_up(&amp;ep-&gt;wq);                                 │    │
+</span></span><span class=line><span class=cl>│  │ 4. 处理嵌套epoll                                     │    │
+</span></span><span class=line><span class=cl>│  │    ep_poll_safewake(ep, epi);                        │    │
+</span></span><span class=line><span class=cl>│  └─────────────────────────────────────────────────────┘    │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  wake_up(&amp;ep-&gt;wq)                                            │
+</span></span><span class=line><span class=cl>│  - 唤醒epoll_wait中睡眠的进程                                 │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  ep_poll() 中的进程被唤醒                                     │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────────────────────────────────┐    │
+</span></span><span class=line><span class=cl>│  │ schedule_hrtimeout_range() 返回                      │    │
+</span></span><span class=line><span class=cl>│  │ __set_current_state(TASK_RUNNING)                    │    │
+</span></span><span class=line><span class=cl>│  │ 继续循环，调用 ep_send_events()                       │    │
+</span></span><span class=line><span class=cl>│  └─────────────────────────────────────────────────────┘    │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  ep_send_events(ep, events, maxevents)                       │
+</span></span><span class=line><span class=cl>│  - 扫描就绪列表                                               │
+</span></span><span class=line><span class=cl>│  - 将事件复制到用户空间                                       │
+</span></span><span class=line><span class=cl>└─────────────────────┬───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  用户空间应用程序                                             │
+</span></span><span class=line><span class=cl>│  epoll_wait() 返回                                           │
+</span></span><span class=line><span class=cl>│  - 获取就绪的文件描述符                                       │
+</span></span><span class=line><span class=cl>│  - 处理数据（read/recv）                                      │
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四关键数据结构>四、关键数据结构</h2><h3 id=41-struct-sock>4.1 struct sock</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>sock</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ... 其他字段 ...
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* 回调函数指针 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>sk_state_change</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>sk_data_ready</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>      <span class=c1>// 数据就绪回调
+</span></span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>sk_write_space</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>sk_error_report</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* 等待队列 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>socket_wq</span> <span class=n>__rcu</span> <span class=o>*</span><span class=n>sk_wq</span><span class=p>;</span>               <span class=c1>// socket等待队列
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* TCP相关 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>sk_rcvlowat</span><span class=p>;</span>                             <span class=c1>// 接收低水位标记
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// ... 其他字段 ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=42-struct-socket_wq>4.2 struct socket_wq</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>socket_wq</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>wait_queue_head_t</span> <span class=n>wait</span><span class=p>;</span>                      <span class=c1>// 等待队列头
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fasync_struct</span> <span class=o>*</span><span class=n>fasync_list</span><span class=p>;</span>           <span class=c1>// 异步通知列表
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>flags</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rcu_head</span> <span class=n>rcu</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span> <span class=n>____cacheline_aligned_in_smp</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=43-wait_queue_entry_t>4.3 wait_queue_entry_t</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>wait_queue_entry</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>flags</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=o>*</span><span class=n>private</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>wait_queue_func_t</span> <span class=n>func</span><span class=p>;</span>                      <span class=c1>// 唤醒回调函数
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span> <span class=n>entry</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p>对于epoll，<code>func</code>指向<code>ep_poll_callback</code>。</p><hr><h2 id=五回调函数注册流程>五、回调函数注册流程</h2><h3 id=51-socket初始化>5.1 socket初始化</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>socket() 系统调用
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock_create()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>__sock_create()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>pf-&gt;create()  // 例如：inet_create()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sk_alloc()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock_init_data(sock, sk)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sk-&gt;sk_data_ready = sock_def_readable  // 设置默认回调
+</span></span></code></pre></td></tr></table></div></div><h3 id=52-epoll回调注册>5.2 epoll回调注册</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>epoll_ctl(EPOLL_CTL_ADD)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>do_epoll_ctl()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>ep_insert()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>init_poll_funcptr(&amp;epq.pt, ep_ptable_queue_proc)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>ep_item_poll(epi, &amp;epq.pt, 1)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>vfs_poll(file, pt)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>file-&gt;f_op-&gt;poll(file, pt)  // 例如：tcp_poll()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock_poll_wait(file, whead, pt)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>poll_wait(file, whead, pt)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>pt-&gt;_qproc(file, whead, pt)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>ep_ptable_queue_proc()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>init_waitqueue_func_entry(&amp;pwq-&gt;wait, ep_poll_callback)
+</span></span><span class=line><span class=cl>add_wait_queue(whead, &amp;pwq-&gt;wait)
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键点</strong>:</p><ol><li>创建<code>eppoll_entry</code>结构</li><li>设置等待队列项的回调为<code>ep_poll_callback</code></li><li>将等待队列项添加到socket的等待队列</li></ol><hr><h2 id=六性能优化点>六、性能优化点</h2><h3 id=61-唤醒条件优化>6.1 唤醒条件优化</h3><p><strong>sk_rcvlowat</strong>:</p><ul><li>默认值为1字节</li><li>可通过<code>setsockopt(SO_RCVLOWAT)</code>设置</li><li>较大的值可以减少唤醒次数，提高批处理效率</li></ul><p><strong>内存压力检测</strong>:</p><ul><li>当接收缓冲区内存不足时，即使数据未达到<code>sk_rcvlowat</code>也会唤醒</li><li>避免因等待而导致的内存浪费</li></ul><p><strong>窗口限制</strong>:</p><ul><li>当接收窗口很小时提前唤醒</li><li>避免小窗口综合征，提高吞吐量</li></ul><h3 id=62-无锁操作>6.2 无锁操作</h3><p><strong>list_add_tail_lockless</strong>:</p><ul><li>使用原子操作添加到就绪列表</li><li>减少锁竞争</li><li>提高并发性能</li></ul><p><strong>READ_ONCE/WRITE_ONCE</strong>:</p><ul><li>避免编译器优化导致的问题</li><li>保证内存可见性</li></ul><h3 id=63-busy-poll>6.3 Busy Poll</h3><p><strong>ep_set_busy_poll_napi_id</strong>:</p><ul><li>记录网卡的NAPI ID</li><li>支持busy poll模式</li><li>减少延迟</li></ul><hr><h2 id=七特殊场景>七、特殊场景</h2><h3 id=71-嵌套epoll>7.1 嵌套epoll</h3><p>当一个epoll fd被添加到另一个epoll时：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>ep_poll_callback()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>if (waitqueue_active(&amp;ep-&gt;poll_wait))
+</span></span><span class=line><span class=cl>    pwake++;
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>ep_poll_safewake(ep, epi)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>wake_up_poll(&amp;ep-&gt;poll_wait, EPOLLIN)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>触发父epoll的ep_poll_callback()
+</span></span></code></pre></td></tr></table></div></div><p><strong>深度限制</strong>: 最多4层嵌套（<code>EP_MAX_NESTS</code>）</p><h3 id=72-epolloneshot模式>7.2 EPOLLONESHOT模式</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>epi</span><span class=o>-&gt;</span><span class=n>event</span><span class=p>.</span><span class=n>events</span> <span class=o>&amp;</span> <span class=o>~</span><span class=n>EP_PRIVATE_BITS</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>out_unlock</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>当设置了<code>EPOLLONESHOT</code>后：</p><ol><li>第一次触发后，事件掩码被清除</li><li><code>ep_poll_callback</code>检测到掩码为空，直接返回</li><li>需要通过<code>EPOLL_CTL_MOD</code>重新启用</li></ol><h3 id=73-epollexclusive模式>7.3 EPOLLEXCLUSIVE模式</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>((</span><span class=n>epi</span><span class=o>-&gt;</span><span class=n>event</span><span class=p>.</span><span class=n>events</span> <span class=o>&amp;</span> <span class=n>EPOLLEXCLUSIVE</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>            <span class=o>!</span><span class=p>(</span><span class=n>pollflags</span> <span class=o>&amp;</span> <span class=n>POLLFREE</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>switch</span> <span class=p>(</span><span class=n>pollflags</span> <span class=o>&amp;</span> <span class=n>EPOLLINOUT_BITS</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>case</span> <span class=nl>EPOLLIN</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>epi</span><span class=o>-&gt;</span><span class=n>event</span><span class=p>.</span><span class=n>events</span> <span class=o>&amp;</span> <span class=n>EPOLLIN</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=n>ewake</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>独占唤醒</strong>:</p><ul><li>只唤醒一个等待进程</li><li>避免惊群效应</li><li>提高多进程/多线程场景性能</li></ul><hr><h2 id=八调试技巧>八、调试技巧</h2><h3 id=81-追踪点>8.1 追踪点</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 追踪TCP数据接收</span>
+</span></span><span class=line><span class=cl>trace-cmd record -e tcp:tcp_probe
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 追踪epoll事件</span>
+</span></span><span class=line><span class=cl>trace-cmd record -e syscalls:sys_enter_epoll_wait <span class=se>\
+</span></span></span><span class=line><span class=cl>                 -e syscalls:sys_exit_epoll_wait
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 追踪唤醒事件</span>
+</span></span><span class=line><span class=cl>trace-cmd record -e sched:sched_wakeup
+</span></span></code></pre></td></tr></table></div></div><h3 id=82-内核参数>8.2 内核参数</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 查看接收缓冲区大小</span>
+</span></span><span class=line><span class=cl>cat /proc/sys/net/ipv4/tcp_rmem
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看接收低水位标记（通过getsockopt查看）</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=83-常用工具>8.3 常用工具</h3><ul><li><code>ss -tnp</code>: 查看TCP连接状态和接收队列</li><li><code>netstat -anp</code>: 查看网络统计</li><li><code>strace -e epoll_wait,read</code>: 追踪系统调用</li></ul><hr><h2 id=九总结>九、总结</h2><h3 id=91-关键流程>9.1 关键流程</h3><ol><li><strong>数据到达</strong>: TCP数据包到达，加入接收队列</li><li><strong>条件检查</strong>: <code>tcp_epollin_ready</code>检查是否满足唤醒条件</li><li><strong>回调触发</strong>: 调用<code>sk->sk_data_ready</code>（默认<code>sock_def_readable</code>）</li><li><strong>唤醒等待队列</strong>: <code>wake_up_interruptible_sync_poll</code>遍历等待队列</li><li><strong>epoll回调</strong>: <code>ep_poll_callback</code>将事件加入就绪列表</li><li><strong>唤醒进程</strong>: <code>wake_up(&amp;ep->wq)</code>唤醒<code>epoll_wait</code></li><li><strong>事件传输</strong>: <code>ep_send_events</code>将事件复制到用户空间</li></ol><h3 id=92-设计亮点>9.2 设计亮点</h3><ol><li><strong>回调机制</strong>: 灵活的函数指针设计，支持协议定制</li><li><strong>条件唤醒</strong>: 智能的唤醒条件，平衡响应性和效率</li><li><strong>无锁优化</strong>: 使用原子操作减少锁竞争</li><li><strong>嵌套支持</strong>: 支持epoll嵌套，适应复杂场景</li><li><strong>模式多样</strong>: 支持LT/ET、ONESHOT、EXCLUSIVE等多种模式</li></ol><h3 id=93-性能考虑>9.3 性能考虑</h3><ol><li><strong>批处理</strong>: 通过<code>sk_rcvlowat</code>控制唤醒粒度</li><li><strong>内存管理</strong>: 内存压力时及时唤醒，避免浪费</li><li><strong>并发控制</strong>: 读写锁+无锁操作，提高并发性</li><li><strong>Busy Poll</strong>: 支持低延迟场景</li></ol><hr><h2 id=十相关文件>十、相关文件</h2><ul><li><code>net/ipv4/tcp_input.c</code>: TCP输入处理和<code>tcp_data_ready</code></li><li><code>include/net/tcp.h</code>: <code>tcp_epollin_ready</code>定义</li><li><code>net/core/sock.c</code>: <code>sock_init_data</code>和<code>sock_def_readable</code></li><li><code>fs/eventpoll.c</code>: epoll实现和<code>ep_poll_callback</code></li><li><code>include/net/sock.h</code>: sock结构定义</li></ul><p>所有相关函数都已添加详细的中文注释。</p></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/epoll/>Epoll</a>
+<a href=/tags/sk_data_ready/>Sk_data_ready</a>
+<a href=/tags/tcp_data_queue/>Tcp_data_queue</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp-%E6%8E%A5%E6%94%B6%E8%B7%AF%E5%BE%84%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 接收路径深度分析</h2></div></a></article><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

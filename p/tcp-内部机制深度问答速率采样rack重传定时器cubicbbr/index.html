@@ -1,0 +1,329 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR 基于 Linux 5.15.78 内核源码的 Agent 对抗式深度分析。由两个独立 Agent 分别出题、答题、评判，交叉验证确保结论与源码一致。\n一、速率采样：tcp_rate_gen() 中 snd_us 与 ack_us 的计算 问题 在 tcp_rate_gen() 中，发送阶段时长 snd_us 与 ACK 阶段时长 ack_us 如何由已有字段算出来？为何最终将 rs->interval_us 取为 max(snd_us, ack_us) 而不是二者之和或平均值？\n源码路径 net/ipv4/tcp_rate.c → tcp_rate_gen() (L156–168)\n分析 两个阶段的计算来源 速率采样将数据传输建模为两阶段管线：\n发送阶段（send phase）：snd_us 直接取 rs->interval_us，该值在 tcp_rate_skb_delivered() 中已由发送时间戳差值算出： 1 2 3 4 // tcp_rate.c: tcp_rate_skb_delivered() L109-113 tp->first_tx_mstamp = tx_tstamp; rs->interval_us = tcp_stamp_us_delta(tp->first_tx_mstamp, scb->tx.first_tx_mstamp); 即"采样窗口内最后一个包的发送时刻"减去"第一个包的发送时刻"。\nACK 阶段（ack phase）：ack_us 用当前 ACK 处理时刻减去采样窗口起始时的 ACK 时间戳快照： 1 2 3 4 5 // tcp_rate.c: tcp_rate_gen() L161-163 snd_us = rs->interval_us; /* send phase */ ack_us = tcp_stamp_us_delta(tp->tcp_mstamp, rs->prior_mstamp); /* ack phase */ rs->interval_us = max(snd_us, ack_us); 为什么取 max 而不是和或平均 源码注释直接给出了原因：\n'><title>TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR</title><link rel=canonical href=https://1bit2.github.io/p/tcp-%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E9%97%AE%E7%AD%94%E9%80%9F%E7%8E%87%E9%87%87%E6%A0%B7rack%E9%87%8D%E4%BC%A0%E5%AE%9A%E6%97%B6%E5%99%A8cubicbbr/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR"><meta property='og:description' content='TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR 基于 Linux 5.15.78 内核源码的 Agent 对抗式深度分析。由两个独立 Agent 分别出题、答题、评判，交叉验证确保结论与源码一致。\n一、速率采样：tcp_rate_gen() 中 snd_us 与 ack_us 的计算 问题 在 tcp_rate_gen() 中，发送阶段时长 snd_us 与 ACK 阶段时长 ack_us 如何由已有字段算出来？为何最终将 rs->interval_us 取为 max(snd_us, ack_us) 而不是二者之和或平均值？\n源码路径 net/ipv4/tcp_rate.c → tcp_rate_gen() (L156–168)\n分析 两个阶段的计算来源 速率采样将数据传输建模为两阶段管线：\n发送阶段（send phase）：snd_us 直接取 rs->interval_us，该值在 tcp_rate_skb_delivered() 中已由发送时间戳差值算出： 1 2 3 4 // tcp_rate.c: tcp_rate_skb_delivered() L109-113 tp->first_tx_mstamp = tx_tstamp; rs->interval_us = tcp_stamp_us_delta(tp->first_tx_mstamp, scb->tx.first_tx_mstamp); 即"采样窗口内最后一个包的发送时刻"减去"第一个包的发送时刻"。\nACK 阶段（ack phase）：ack_us 用当前 ACK 处理时刻减去采样窗口起始时的 ACK 时间戳快照： 1 2 3 4 5 // tcp_rate.c: tcp_rate_gen() L161-163 snd_us = rs->interval_us; /* send phase */ ack_us = tcp_stamp_us_delta(tp->tcp_mstamp, rs->prior_mstamp); /* ack phase */ rs->interval_us = max(snd_us, ack_us); 为什么取 max 而不是和或平均 源码注释直接给出了原因：\n'><meta property='og:url' content='https://1bit2.github.io/p/tcp-%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E9%97%AE%E7%AD%94%E9%80%9F%E7%8E%87%E9%87%87%E6%A0%B7rack%E9%87%8D%E4%BC%A0%E5%AE%9A%E6%97%B6%E5%99%A8cubicbbr/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='tcp_rate'><meta property='article:tag' content='RACK'><meta property='article:tag' content='tcp_timer'><meta property='article:tag' content='CUBIC'><meta property='article:tag' content='BBR'><meta property='article:tag' content='源码分析'><meta property='article:published_time' content='2026-04-22T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-22T00:00:00+00:00'><meta name=twitter:title content="TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR"><meta name=twitter:description content='TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR 基于 Linux 5.15.78 内核源码的 Agent 对抗式深度分析。由两个独立 Agent 分别出题、答题、评判，交叉验证确保结论与源码一致。\n一、速率采样：tcp_rate_gen() 中 snd_us 与 ack_us 的计算 问题 在 tcp_rate_gen() 中，发送阶段时长 snd_us 与 ACK 阶段时长 ack_us 如何由已有字段算出来？为何最终将 rs->interval_us 取为 max(snd_us, ack_us) 而不是二者之和或平均值？\n源码路径 net/ipv4/tcp_rate.c → tcp_rate_gen() (L156–168)\n分析 两个阶段的计算来源 速率采样将数据传输建模为两阶段管线：\n发送阶段（send phase）：snd_us 直接取 rs->interval_us，该值在 tcp_rate_skb_delivered() 中已由发送时间戳差值算出： 1 2 3 4 // tcp_rate.c: tcp_rate_skb_delivered() L109-113 tp->first_tx_mstamp = tx_tstamp; rs->interval_us = tcp_stamp_us_delta(tp->first_tx_mstamp, scb->tx.first_tx_mstamp); 即"采样窗口内最后一个包的发送时刻"减去"第一个包的发送时刻"。\nACK 阶段（ack phase）：ack_us 用当前 ACK 处理时刻减去采样窗口起始时的 ACK 时间戳快照： 1 2 3 4 5 // tcp_rate.c: tcp_rate_gen() L161-163 snd_us = rs->interval_us; /* send phase */ ack_us = tcp_stamp_us_delta(tp->tcp_mstamp, rs->prior_mstamp); /* ack phase */ rs->interval_us = max(snd_us, ack_us); 为什么取 max 而不是和或平均 源码注释直接给出了原因：\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一速率采样tcp_rate_gen-中-snd_us-与-ack_us-的计算>一、速率采样：<code>tcp_rate_gen()</code> 中 <code>snd_us</code> 与 <code>ack_us</code> 的计算</a><ol><li><a href=#问题>问题</a></li><li><a href=#源码路径>源码路径</a></li><li><a href=#分析>分析</a><ol><li><a href=#两个阶段的计算来源>两个阶段的计算来源</a></li><li><a href=#为什么取-max-而不是和或平均>为什么取 max 而不是和或平均</a></li><li><a href=#数据流图>数据流图</a></li></ol></li></ol></li><li><a href=#二rack-丢包检测tcp_rack_advance-的重传二义性过滤>二、RACK 丢包检测：<code>tcp_rack_advance()</code> 的重传二义性过滤</a><ol><li><a href=#问题-1>问题</a></li><li><a href=#源码路径-1>源码路径</a></li><li><a href=#分析-1>分析</a><ol><li><a href=#早退条件>早退条件</a></li><li><a href=#对应的歧义>对应的歧义</a></li><li><a href=#正常更新路径>正常更新路径</a></li></ol></li></ol></li><li><a href=#三重传定时器零窗口分支的特殊行为>三、重传定时器：零窗口分支的特殊行为</a><ol><li><a href=#问题-2>问题</a></li><li><a href=#源码路径-2>源码路径</a></li><li><a href=#分析-2>分析</a><ol><li><a href=#零窗口分支的控制流>零窗口分支的控制流</a></li><li><a href=#out_reset_timer-处的定时器设置><code>out_reset_timer</code> 处的定时器设置</a></li><li><a href=#完整行为总结>完整行为总结</a></li></ol></li></ol></li><li><a href=#四cubic-epoch-初始化bic_k-与-bic_origin_point-的分支逻辑>四、CUBIC epoch 初始化：<code>bic_K</code> 与 <code>bic_origin_point</code> 的分支逻辑</a><ol><li><a href=#问题-3>问题</a></li><li><a href=#源码路径-3>源码路径</a></li><li><a href=#分析-3>分析</a><ol><li><a href=#两分支赋值>两分支赋值</a></li><li><a href=#几何形状解读>几何形状解读</a></li></ol></li></ol></li><li><a href=#五bbr-bbr_is_next_cycle_phase三种-pacing_gain-的切换条件>五、BBR <code>bbr_is_next_cycle_phase()</code>：三种 pacing_gain 的切换条件</a><ol><li><a href=#问题-4>问题</a></li><li><a href=#源码路径-4>源码路径</a></li><li><a href=#分析-4>分析</a><ol><li><a href=#公共时间条件>公共时间条件</a></li><li><a href=#三种-gain-的切换条件对比>三种 gain 的切换条件对比</a></li><li><a href=#探测阶段gain--1的额外条件>探测阶段（gain > 1）的额外条件</a></li><li><a href=#drain-段为何用-bbr_unit-而非-pacing_gain>drain 段为何用 <code>BBR_UNIT</code> 而非 <code>pacing_gain</code></a></li><li><a href=#逻辑运算符的对称设计>逻辑运算符的对称设计</a></li></ol></li></ol></li><li><a href=#六交叉验证总结>六、交叉验证总结</a><ol><li><a href=#评判结果>评判结果</a></li></ol></li><li><a href=#七源码文件快速索引>七、源码文件快速索引</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E9%97%AE%E7%AD%94%E9%80%9F%E7%8E%87%E9%87%87%E6%A0%B7rack%E9%87%8D%E4%BC%A0%E5%AE%9A%E6%97%B6%E5%99%A8cubicbbr/>TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 22, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>6 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp-内部机制深度问答速率采样rack重传定时器cubicbbr>TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR</h1><blockquote><p>基于 Linux 5.15.78 内核源码的 Agent 对抗式深度分析。由两个独立 Agent 分别出题、答题、评判，交叉验证确保结论与源码一致。</p></blockquote><hr><h2 id=一速率采样tcp_rate_gen-中-snd_us-与-ack_us-的计算>一、速率采样：<code>tcp_rate_gen()</code> 中 <code>snd_us</code> 与 <code>ack_us</code> 的计算</h2><h3 id=问题>问题</h3><p>在 <code>tcp_rate_gen()</code> 中，发送阶段时长 <code>snd_us</code> 与 ACK 阶段时长 <code>ack_us</code> 如何由已有字段算出来？为何最终将 <code>rs->interval_us</code> 取为 <code>max(snd_us, ack_us)</code> 而不是二者之和或平均值？</p><h3 id=源码路径>源码路径</h3><p><code>net/ipv4/tcp_rate.c</code> → <code>tcp_rate_gen()</code> (L156–168)</p><h3 id=分析>分析</h3><h4 id=两个阶段的计算来源>两个阶段的计算来源</h4><p>速率采样将数据传输建模为<strong>两阶段管线</strong>：</p><ol><li><strong>发送阶段（send phase）</strong>：<code>snd_us</code> 直接取 <code>rs->interval_us</code>，该值在 <code>tcp_rate_skb_delivered()</code> 中已由发送时间戳差值算出：</li></ol><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_rate.c: tcp_rate_skb_delivered() L109-113
+</span></span></span><span class=line><span class=cl><span class=n>tp</span><span class=o>-&gt;</span><span class=n>first_tx_mstamp</span>  <span class=o>=</span> <span class=n>tx_tstamp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=n>rs</span><span class=o>-&gt;</span><span class=n>interval_us</span> <span class=o>=</span> <span class=nf>tcp_stamp_us_delta</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>first_tx_mstamp</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                     <span class=n>scb</span><span class=o>-&gt;</span><span class=n>tx</span><span class=p>.</span><span class=n>first_tx_mstamp</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p>即"采样窗口内最后一个包的发送时刻"减去"第一个包的发送时刻"。</p><ol start=2><li><strong>ACK 阶段（ack phase）</strong>：<code>ack_us</code> 用当前 ACK 处理时刻减去采样窗口起始时的 ACK 时间戳快照：</li></ol><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_rate.c: tcp_rate_gen() L161-163
+</span></span></span><span class=line><span class=cl><span class=n>snd_us</span> <span class=o>=</span> <span class=n>rs</span><span class=o>-&gt;</span><span class=n>interval_us</span><span class=p>;</span>                          <span class=cm>/* send phase */</span>
+</span></span><span class=line><span class=cl><span class=n>ack_us</span> <span class=o>=</span> <span class=nf>tcp_stamp_us_delta</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_mstamp</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                            <span class=n>rs</span><span class=o>-&gt;</span><span class=n>prior_mstamp</span><span class=p>);</span>      <span class=cm>/* ack phase */</span>
+</span></span><span class=line><span class=cl><span class=n>rs</span><span class=o>-&gt;</span><span class=n>interval_us</span> <span class=o>=</span> <span class=nf>max</span><span class=p>(</span><span class=n>snd_us</span><span class=p>,</span> <span class=n>ack_us</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h4 id=为什么取-max-而不是和或平均>为什么取 max 而不是和或平均</h4><p>源码注释直接给出了原因：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=cm>/* Model sending data and receiving ACKs as separate pipeline phases
+</span></span></span><span class=line><span class=cl><span class=cm> * for a window. Usually the ACK phase is longer, but with ACK
+</span></span></span><span class=line><span class=cl><span class=cm> * compression the send phase can be longer. To be safe we use the
+</span></span></span><span class=line><span class=cl><span class=cm> * longer phase.
+</span></span></span><span class=line><span class=cl><span class=cm> */</span>
+</span></span></code></pre></td></tr></table></div></div><p>核心逻辑：</p><ul><li>投递速率 = <code>delivered / interval_us</code>。<code>interval_us</code> 是分母，分母越小则速率越大。</li><li><strong>ACK 压缩/聚合</strong>时，多个 ACK 合并到达，<code>ack_us</code> 被人为缩短——此时若用 <code>ack_us</code> 做分母，会<strong>高估</strong>带宽。</li><li><strong>发送被延迟</strong>（应用层写入间隔、pacing 等），<code>snd_us</code> 更大——此时 <code>snd_us</code> 才能反映真实间隔。</li><li>取 <code>max</code> 即<strong>取较长的阶段</strong>作为分母，是保守估计，避免任一阶段被"压缩"后导致带宽高估。</li><li>求和会重复计算时间序列重叠的两段，平均值在一侧被主导时无法取到保守的"有效瓶颈间隔"。</li></ul><h4 id=数据流图>数据流图</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>发送端                                           接收端
+</span></span><span class=line><span class=cl>  |------- snd_us -------|                          |
+</span></span><span class=line><span class=cl>  S1     S2     S3      S4  ──────────────────&gt;   ACK
+</span></span><span class=line><span class=cl>  |                      |                          |
+</span></span><span class=line><span class=cl>  |                      |&lt;──── ack_us ────&gt;        |
+</span></span><span class=line><span class=cl>  |                      prior_mstamp    tcp_mstamp |
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>interval_us = max(snd_us, ack_us)
+</span></span><span class=line><span class=cl>delivery_rate = delivered / interval_us
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=二rack-丢包检测tcp_rack_advance-的重传二义性过滤>二、RACK 丢包检测：<code>tcp_rack_advance()</code> 的重传二义性过滤</h2><h3 id=问题-1>问题</h3><p><code>tcp_rack_advance()</code> 在何种条件下会直接 <code>return</code>，不更新 RACK 的 <code>advanced</code> 标志位和参考点时间戳/序号？这对应哪种歧义？</p><h3 id=源码路径-1>源码路径</h3><p><code>net/ipv4/tcp_recovery.c</code> → <code>tcp_rack_advance()</code> (L195–212)</p><h3 id=分析-1>分析</h3><h4 id=早退条件>早退条件</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_recovery.c: tcp_rack_advance() L200-203
+</span></span></span><span class=line><span class=cl><span class=n>rtt_us</span> <span class=o>=</span> <span class=nf>tcp_stamp_us_delta</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_mstamp</span><span class=p>,</span> <span class=n>xmit_time</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>rtt_us</span> <span class=o>&lt;</span> <span class=nf>tcp_min_rtt</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=p>(</span><span class=n>sacked</span> <span class=o>&amp;</span> <span class=n>TCPCB_RETRANS</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>当且仅当<strong>两个条件同时满足</strong>时跳过更新：</p><div class=table-wrapper><table><thead><tr><th>条件</th><th>含义</th></tr></thead><tbody><tr><td><code>rtt_us &lt; tcp_min_rtt(tp)</code></td><td>本次测得的 RTT 小于连接观测到的最小 RTT</td></tr><tr><td><code>sacked & TCPCB_RETRANS</code></td><td>被确认的段是重传段</td></tr></tbody></table></div><h4 id=对应的歧义>对应的歧义</h4><p>这是经典的<strong>重传二义性（Retransmission Ambiguity）</strong>：</p><p>当发送端重传了一个包，随后收到对该序号的 ACK 时，<strong>无法区分是哪个副本被确认</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时间线：
+</span></span><span class=line><span class=cl>  t0: 发送原始包 P（seq=1000）
+</span></span><span class=line><span class=cl>  t1: 超时，重传包 P&#39;（seq=1000）
+</span></span><span class=line><span class=cl>  t2: 收到 ACK（seq=1001）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  可能情况 A：ACK 是对 P（原始包）的确认，RTT = t2-t0
+</span></span><span class=line><span class=cl>  可能情况 B：ACK 是对 P&#39;（重传包）的确认，RTT = t2-t1
+</span></span></code></pre></td></tr></table></div></div><p>RACK 利用 <code>xmit_time</code>（取重传时刻 t1）计算 <code>rtt_us = t2 - t1</code>。如果结果<strong>小于 <code>min_rtt</code></strong>，说明这个"RTT"不合理地短——很可能是情况 A（原始包被确认），而 RACK 误用了 t1 做起点。</p><p>若此时仍更新 RACK 参考点（<code>rack.mstamp</code>、<code>rack.end_seq</code>）和 <code>rack.rtt_us</code>，会导致：</p><ul><li>参考时间被错误推进到重传时刻</li><li>后续其他包被错误判定为"超过 RACK 参考点一个 reo_wnd"的丢包</li></ul><p>因此直接丢弃该样本，<strong>不设置 <code>tp->rack.advanced = 1</code></strong>。</p><h4 id=正常更新路径>正常更新路径</h4><p>通过过滤后，正常执行：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_recovery.c L204-211
+</span></span></span><span class=line><span class=cl><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rack</span><span class=p>.</span><span class=n>advanced</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rack</span><span class=p>.</span><span class=n>rtt_us</span> <span class=o>=</span> <span class=n>rtt_us</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>tcp_rack_sent_after</span><span class=p>(</span><span class=n>xmit_time</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rack</span><span class=p>.</span><span class=n>mstamp</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=n>end_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rack</span><span class=p>.</span><span class=n>end_seq</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rack</span><span class=p>.</span><span class=n>mstamp</span> <span class=o>=</span> <span class=n>xmit_time</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rack</span><span class=p>.</span><span class=n>end_seq</span> <span class=o>=</span> <span class=n>end_seq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>tcp_rack_sent_after()</code> 确保参考点在"时间+序号"上<strong>单调递进</strong>。</p><hr><h2 id=三重传定时器零窗口分支的特殊行为>三、重传定时器：零窗口分支的特殊行为</h2><h3 id=问题-2>问题</h3><p><code>tcp_retransmit_timer()</code> 在零窗口分支（<code>!tp->snd_wnd</code>）中，<code>goto out_reset_timer</code> 跳过了正常 RTO 路径。此时 <code>icsk->icsk_retransmits</code> 是否递增？<code>out_reset_timer</code> 处如何设置下一次重传定时器？</p><h3 id=源码路径-2>源码路径</h3><p><code>net/ipv4/tcp_timer.c</code> → <code>tcp_retransmit_timer()</code> (L481–595)</p><h3 id=分析-2>分析</h3><h4 id=零窗口分支的控制流>零窗口分支的控制流</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_timer.c L481-513
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_wnd</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=o>!</span><span class=p>((</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCPF_SYN_SENT</span> <span class=o>|</span> <span class=n>TCPF_SYN_RECV</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 对端恶意缩小窗口，重传变为零窗探测
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tcp_jiffies32</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_tstamp</span> <span class=o>&gt;</span> <span class=n>TCP_RTO_MAX</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_write_err</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>          <span class=c1>// 超过最大容忍时间，报错退出
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_enter_loss</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>             <span class=c1>// 进入 Loss 状态
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_retransmit_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=mi>1</span><span class=p>);</span> <span class=c1>// 重传（零窗探测）
+</span></span></span><span class=line><span class=cl>    <span class=nf>__sk_dst_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>out_reset_timer</span><span class=p>;</span>           <span class=c1>// ← 关键：跳过正常 RTO 路径
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>goto out_reset_timer</code> 直接跳过了以下代码：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_timer.c L542
+</span></span></span><span class=line><span class=cl><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span><span class=o>++</span><span class=p>;</span>   <span class=c1>// ← 被跳过：重传计数不递增
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// tcp_timer.c L568
+</span></span></span><span class=line><span class=cl><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_backoff</span><span class=o>++</span><span class=p>;</span>       <span class=c1>// ← 被跳过：退避指数不递增
+</span></span></span></code></pre></td></tr></table></div></div><h4 id=out_reset_timer-处的定时器设置><code>out_reset_timer</code> 处的定时器设置</h4><p><strong>关键发现</strong>：<code>out_reset_timer</code> 标签处仍然会更新 <code>icsk_rto</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_timer.c L570-591
+</span></span></span><span class=line><span class=cl><span class=nl>out_reset_timer</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_ESTABLISHED</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>thin_lto</span> <span class=o>||</span> <span class=p>...)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_stream_is_thin</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span> <span class=o>&lt;=</span> <span class=n>TCP_THIN_LINEAR_RETRIES</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_backoff</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_rto</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=nf>__tcp_set_rto</span><span class=p>(</span><span class=n>tp</span><span class=p>),</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=cm>/* Use normal (exponential) backoff */</span>
+</span></span><span class=line><span class=cl>        <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_rto</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_rto</span> <span class=o>&lt;&lt;</span> <span class=mi>1</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ICSK_TIME_RETRANS</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                              <span class=nf>tcp_clamp_rto_to_user_timeout</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h4 id=完整行为总结>完整行为总结</h4><div class=table-wrapper><table><thead><tr><th>属性</th><th>零窗口分支</th><th>正常 RTO 路径</th></tr></thead><tbody><tr><td><code>icsk_retransmits++</code></td><td><strong>不执行</strong></td><td>执行</td></tr><tr><td><code>icsk_backoff++</code></td><td><strong>不执行</strong></td><td>执行</td></tr><tr><td><code>icsk_rto &lt;&lt;= 1</code>（在 <code>out_reset_timer</code>）</td><td><strong>执行</strong>（非 thin 路径）</td><td>执行</td></tr><tr><td>定时器重武装</td><td>执行</td><td>执行</td></tr></tbody></table></div><p><strong>设计意图</strong>：零窗口探测不计入正式重传次数（<code>icsk_retransmits</code> 不增），避免在持续零窗口时因重传计数过高而提前报错杀连接。但 <code>icsk_rto</code> 仍在 <code>out_reset_timer</code> 中加倍，防止对零窗口对端的探测过于频繁。</p><blockquote><p><strong>交叉验证注</strong>：本结论在 Agent 对抗评判中被特别标注——出题方标准答案原认为"RTO 不加倍"，但答题方指出 <code>out_reset_timer</code> 中的 <code>icsk->icsk_rto &lt;&lt;= 1</code> 对所有经此出口的路径（含零窗口分支）均生效，<strong>以源码为准，RTO 仍会加倍</strong>。</p></blockquote><hr><h2 id=四cubic-epoch-初始化bic_k-与-bic_origin_point-的分支逻辑>四、CUBIC epoch 初始化：<code>bic_K</code> 与 <code>bic_origin_point</code> 的分支逻辑</h2><h3 id=问题-3>问题</h3><p>在 CUBIC 的 <code>bictcp_update()</code> 中，新 epoch 初始化时（<code>ca->epoch_start == 0</code>），<code>ca->last_max_cwnd &lt;= cwnd</code> 与 <code>ca->last_max_cwnd > cwnd</code> 两分支对 <code>bic_K</code>、<code>bic_origin_point</code> 的赋值分别是什么？CUBIC 曲线在 t=0 附近对应哪种几何形状？</p><h3 id=源码路径-3>源码路径</h3><p><code>net/ipv4/tcp_cubic.c</code> → <code>bictcp_update()</code> (L287–303)</p><h3 id=分析-3>分析</h3><h4 id=两分支赋值>两分支赋值</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_cubic.c L288-303
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>ca</span><span class=o>-&gt;</span><span class=n>epoch_start</span> <span class=o>==</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>ca</span><span class=o>-&gt;</span><span class=n>epoch_start</span> <span class=o>=</span> <span class=n>tcp_jiffies32</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>ca</span><span class=o>-&gt;</span><span class=n>ack_cnt</span> <span class=o>=</span> <span class=n>acked</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>ca</span><span class=o>-&gt;</span><span class=n>tcp_cwnd</span> <span class=o>=</span> <span class=n>cwnd</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>ca</span><span class=o>-&gt;</span><span class=n>last_max_cwnd</span> <span class=o>&lt;=</span> <span class=n>cwnd</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_K</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_origin_point</span> <span class=o>=</span> <span class=n>cwnd</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_K</span> <span class=o>=</span> <span class=nf>cubic_root</span><span class=p>(</span><span class=n>cube_factor</span>
+</span></span><span class=line><span class=cl>                               <span class=o>*</span> <span class=p>(</span><span class=n>ca</span><span class=o>-&gt;</span><span class=n>last_max_cwnd</span> <span class=o>-</span> <span class=n>cwnd</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>        <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_origin_point</span> <span class=o>=</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>last_max_cwnd</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>条件</th><th><code>bic_K</code></th><th><code>bic_origin_point</code></th><th>含义</th></tr></thead><tbody><tr><td><code>last_max_cwnd &lt;= cwnd</code></td><td>0</td><td>当前 <code>cwnd</code></td><td>cwnd 已达/超 Wmax，无需凹段回升</td></tr><tr><td><code>last_max_cwnd > cwnd</code></td><td><code>cubic_root(...)</code></td><td><code>last_max_cwnd</code></td><td>cwnd &lt; Wmax，需要凹段爬回</td></tr></tbody></table></div><h4 id=几何形状解读>几何形状解读</h4><p>CUBIC 的窗口函数为 <code>W(t) = C × (t - K)³ + origin_point</code>，实现中用 <code>|t-K|</code> 分凹/凸两段：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_cubic.c L313-323
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>t</span> <span class=o>&lt;</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_K</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>offs</span> <span class=o>=</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_K</span> <span class=o>-</span> <span class=n>t</span><span class=p>;</span>      <span class=c1>// 凹段
+</span></span></span><span class=line><span class=cl><span class=k>else</span>
+</span></span><span class=line><span class=cl>    <span class=n>offs</span> <span class=o>=</span> <span class=n>t</span> <span class=o>-</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_K</span><span class=p>;</span>      <span class=c1>// 凸段
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=n>delta</span> <span class=o>=</span> <span class=p>(</span><span class=n>cube_rtt_scale</span> <span class=o>*</span> <span class=n>offs</span> <span class=o>*</span> <span class=n>offs</span> <span class=o>*</span> <span class=n>offs</span><span class=p>)</span> <span class=o>&gt;&gt;</span> <span class=p>(</span><span class=mi>10</span><span class=o>+</span><span class=mi>3</span><span class=o>*</span><span class=n>BICTCP_HZ</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>t</span> <span class=o>&lt;</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_K</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>bic_target</span> <span class=o>=</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_origin_point</span> <span class=o>-</span> <span class=n>delta</span><span class=p>;</span>   <span class=c1>// 凹：从下往上趋近 Wmax
+</span></span></span><span class=line><span class=cl><span class=k>else</span>
+</span></span><span class=line><span class=cl>    <span class=n>bic_target</span> <span class=o>=</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>bic_origin_point</span> <span class=o>+</span> <span class=n>delta</span><span class=p>;</span>   <span class=c1>// 凸：超越 Wmax 探新带宽
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>情况一：K=0, origin=cwnd（cwnd ≥ Wmax）</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>W(t)
+</span></span><span class=line><span class=cl> ^
+</span></span><span class=line><span class=cl> |              ╱ (凸段探测)
+</span></span><span class=line><span class=cl> |           ╱
+</span></span><span class=line><span class=cl> |        ╱
+</span></span><span class=line><span class=cl> |------⨯-------- cwnd = origin_point
+</span></span><span class=line><span class=cl> |    t=0=K
+</span></span><span class=line><span class=cl> +─────────────────&gt; t
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>曲线从 cwnd 出发，立即进入凸段向上探测新带宽。
+</span></span><span class=line><span class=cl>K=0 使凹段长度为零，因为当前窗口已经不低于 Wmax，不需要&#34;回到&#34;任何目标。
+</span></span></code></pre></td></tr></table></div></div><p><strong>情况二：K>0, origin=Wmax（cwnd &lt; Wmax）</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>W(t)
+</span></span><span class=line><span class=cl> ^
+</span></span><span class=line><span class=cl> |              Wmax = origin_point
+</span></span><span class=line><span class=cl> |  ............⨯.................╱ (凸段探测)
+</span></span><span class=line><span class=cl> |  ╱(凹段回升)  |              ╱
+</span></span><span class=line><span class=cl> | ╱              |           ╱
+</span></span><span class=line><span class=cl> |⨯                |        ╱
+</span></span><span class=line><span class=cl> cwnd              t=K
+</span></span><span class=line><span class=cl> +─────────────────────────────&gt; t
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>曲线从 cwnd 出发，沿凹段上升，在 t=K 时回到 Wmax，之后进入凸段探新带宽。
+</span></span><span class=line><span class=cl>K = ∛(cube_factor × (Wmax - cwnd)) 精确控制回到 Wmax 的时间。
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=五bbr-bbr_is_next_cycle_phase三种-pacing_gain-的切换条件>五、BBR <code>bbr_is_next_cycle_phase()</code>：三种 pacing_gain 的切换条件</h2><h3 id=问题-4>问题</h3><p>在 BBR 的 <code>bbr_is_next_cycle_phase()</code> 中，三种 pacing_gain 值（<code>== BBR_UNIT</code>、<code>> BBR_UNIT</code>、<code>&lt; BBR_UNIT</code>）分别对应怎样的切换条件？drain 段为何用 <code>bbr_inflight(sk, bw, BBR_UNIT)</code> 而非当前 <code>pacing_gain</code>？</p><h3 id=源码路径-4>源码路径</h3><p><code>net/ipv4/tcp_bbr.c</code> → <code>bbr_is_next_cycle_phase()</code> (L1095–1143)</p><h3 id=分析-4>分析</h3><h4 id=公共时间条件>公共时间条件</h4><p>所有三种 gain 都依赖 <code>is_full_length</code>——当前 phase 已持续至少一个 <code>min_rtt_us</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_bbr.c L1103-1105
+</span></span></span><span class=line><span class=cl><span class=kt>bool</span> <span class=n>is_full_length</span> <span class=o>=</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_stamp_us_delta</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>delivered_mstamp</span><span class=p>,</span> <span class=n>bbr</span><span class=o>-&gt;</span><span class=n>cycle_mstamp</span><span class=p>)</span> <span class=o>&gt;</span>
+</span></span><span class=line><span class=cl>    <span class=n>bbr</span><span class=o>-&gt;</span><span class=n>min_rtt_us</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>用 <code>delivered_mstamp</code>（投递时间戳）而非挂钟，确保空闲期不被误计。</p><h4 id=三种-gain-的切换条件对比>三种 gain 的切换条件对比</h4><div class=table-wrapper><table><thead><tr><th>Phase</th><th>Gain</th><th>切换条件</th><th>设计意图</th></tr></thead><tbody><tr><td>2–7 (巡航)</td><td><code>== BBR_UNIT</code> (1.0)</td><td><code>is_full_length</code></td><td>纯时间驱动，不改变队列</td></tr><tr><td>0 (探测)</td><td><code>> BBR_UNIT</code> (5/4)</td><td><code>is_full_length && (losses || inflight >= 1.25×BDP)</code></td><td>确保数据真正"堆"进管道</td></tr><tr><td>1 (排空)</td><td><code>&lt; BBR_UNIT</code> (3/4)</td><td><code>is_full_length || inflight &lt;= 1×BDP</code></td><td>排空越快越好</td></tr></tbody></table></div><p>源码：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_bbr.c L1110-1142
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>bbr</span><span class=o>-&gt;</span><span class=n>pacing_gain</span> <span class=o>==</span> <span class=n>BBR_UNIT</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>is_full_length</span><span class=p>;</span>                           <span class=c1>// 巡航：纯时间
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>bbr</span><span class=o>-&gt;</span><span class=n>pacing_gain</span> <span class=o>&gt;</span> <span class=n>BBR_UNIT</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>is_full_length</span> <span class=o>&amp;&amp;</span>                         <span class=c1>// 探测：时间 AND
+</span></span></span><span class=line><span class=cl>        <span class=p>(</span><span class=n>rs</span><span class=o>-&gt;</span><span class=n>losses</span> <span class=o>||</span>                               <span class=c1>//   (丢包 OR
+</span></span></span><span class=line><span class=cl>         <span class=n>inflight</span> <span class=o>&gt;=</span> <span class=nf>bbr_inflight</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>bw</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                  <span class=n>bbr</span><span class=o>-&gt;</span><span class=n>pacing_gain</span><span class=p>));</span><span class=c1>//    inflight足够大)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>return</span> <span class=n>is_full_length</span> <span class=o>||</span>                             <span class=c1>// 排空：时间 OR
+</span></span></span><span class=line><span class=cl>    <span class=n>inflight</span> <span class=o>&lt;=</span> <span class=nf>bbr_inflight</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>bw</span><span class=p>,</span> <span class=n>BBR_UNIT</span><span class=p>);</span>      <span class=c1>//   inflight已够低
+</span></span></span></code></pre></td></tr></table></div></div><h4 id=探测阶段gain--1的额外条件>探测阶段（gain > 1）的额外条件</h4><p><code>rs->losses</code> 条件允许在<strong>浅缓冲链路</strong>上提前退出探测——如果已经发生丢包，说明缓冲已满，继续以 1.25× 速率注入只会增加丢失而无法探测更多带宽。</p><h4 id=drain-段为何用-bbr_unit-而非-pacing_gain>drain 段为何用 <code>BBR_UNIT</code> 而非 <code>pacing_gain</code></h4><p>drain 的 <code>pacing_gain = 3/4</code>，但退出判定用 <code>bbr_inflight(sk, bw, BBR_UNIT)</code> 即 <strong>1.0 × BDP</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>目标：将 inflight 降到&#34;管道恰好满、队列恰好空&#34;
+</span></span><span class=line><span class=cl>对应的 inflight = 1.0 × BDP（BBR_UNIT = 1.0）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>若用 pacing_gain(3/4)计算：
+</span></span><span class=line><span class=cl>  目标 inflight = 0.75 × BDP
+</span></span><span class=line><span class=cl>  → 管道只填了 75%，造成不必要的欠载
+</span></span><span class=line><span class=cl>  → 浪费 25% 的带宽直到巡航阶段恢复
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>所以用 BBR_UNIT(1.0)：排空到&#34;恰好填满管道&#34;就够了。
+</span></span></code></pre></td></tr></table></div></div><h4 id=逻辑运算符的对称设计>逻辑运算符的对称设计</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>探测：AND（保守——必须同时满足时间和数据量，确保探测有效）
+</span></span><span class=line><span class=cl>排空：OR （激进——任一满足即停，尽快恢复正常发送）
+</span></span><span class=line><span class=cl>巡航：仅时间（中性——稳态运行，不需额外判断）
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=六交叉验证总结>六、交叉验证总结</h2><p>本文的 5 个专题均经过以下流程验证：</p><ol><li><strong>Agent A（出题者）</strong> 深入阅读源码，提出需要理解代码逻辑才能回答的问题，并准备标准答案</li><li><strong>Agent B（答题者）</strong> 独立阅读源码回答，不可见标准答案</li><li><strong>Agent A（裁判）</strong> 对照源码逐题评判</li></ol><h3 id=评判结果>评判结果</h3><div class=table-wrapper><table><thead><tr><th>专题</th><th>评分</th><th>备注</th></tr></thead><tbody><tr><td>速率采样 <code>tcp_rate_gen()</code></td><td>正确</td><td>Agent B 准确描述了两阶段管线模型</td></tr><tr><td>RACK 重传二义性</td><td>正确</td><td>条件与歧义类型均准确</td></tr><tr><td>零窗口重传定时器</td><td>部分正确</td><td>Agent B 发现标准答案中关于 RTO 加倍的描述不够精确，<strong>以源码为准修正</strong></td></tr><tr><td>CUBIC epoch 初始化</td><td>正确</td><td>两分支赋值及几何意义均准确</td></tr><tr><td>BBR phase 切换条件</td><td>正确</td><td>三种 gain 的 AND/OR 逻辑均准确</td></tr></tbody></table></div><blockquote><p><strong>特别标注</strong>：第三题（零窗口重传定时器）中，答题方发现 <code>out_reset_timer</code> 处的 <code>icsk->icsk_rto &lt;&lt;= 1</code> 对零窗口分支同样生效，纠正了出题方标准答案中"RTO 不加倍"的表述。这体现了交叉验证对内核源码分析的价值。</p></blockquote><hr><h2 id=七源码文件快速索引>七、源码文件快速索引</h2><div class=table-wrapper><table><thead><tr><th>文件</th><th>核心函数</th><th>本文涉及专题</th></tr></thead><tbody><tr><td><code>net/ipv4/tcp_rate.c</code></td><td><code>tcp_rate_gen()</code>, <code>tcp_rate_skb_delivered()</code></td><td>§一 速率采样</td></tr><tr><td><code>net/ipv4/tcp_recovery.c</code></td><td><code>tcp_rack_advance()</code></td><td>§二 RACK 丢包检测</td></tr><tr><td><code>net/ipv4/tcp_timer.c</code></td><td><code>tcp_retransmit_timer()</code></td><td>§三 重传定时器</td></tr><tr><td><code>net/ipv4/tcp_cubic.c</code></td><td><code>bictcp_update()</code></td><td>§四 CUBIC epoch</td></tr><tr><td><code>net/ipv4/tcp_bbr.c</code></td><td><code>bbr_is_next_cycle_phase()</code></td><td>§五 BBR phase 切换</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/tcp_rate/>Tcp_rate</a>
+<a href=/tags/rack/>RACK</a>
+<a href=/tags/tcp_timer/>Tcp_timer</a>
+<a href=/tags/cubic/>CUBIC</a>
+<a href=/tags/bbr/>BBR</a>
+<a href=/tags/%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/>源码分析</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article><article><a href=/p/tcp-%E9%87%8D%E4%BC%A0%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 重传机制深度分析</h2></div></a></article><article><a href=/p/linux-5.15.78-tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E7%AE%97%E6%B3%95%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 5.15.78 TCP 拥塞控制算法实现原理分析</h2></div></a></article><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

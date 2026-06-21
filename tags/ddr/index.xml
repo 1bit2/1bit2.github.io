@@ -1,0 +1,1136 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>DDR on 深栈</title><link>https://1bit2.github.io/tags/ddr/</link><description>Recent content in DDR on 深栈</description><generator>Hugo -- gohugo.io</generator><language>en-us</language><lastBuildDate>Wed, 10 Jun 2026 00:00:00 +0000</lastBuildDate><atom:link href="https://1bit2.github.io/tags/ddr/index.xml" rel="self" type="application/rss+xml"/><item><title>CPU 访问内存的硬件路径——地址总线、数据总线与缓存行突发传输</title><link>https://1bit2.github.io/p/cpu-%E8%AE%BF%E9%97%AE%E5%86%85%E5%AD%98%E7%9A%84%E7%A1%AC%E4%BB%B6%E8%B7%AF%E5%BE%84%E5%9C%B0%E5%9D%80%E6%80%BB%E7%BA%BF%E6%95%B0%E6%8D%AE%E6%80%BB%E7%BA%BF%E4%B8%8E%E7%BC%93%E5%AD%98%E8%A1%8C%E7%AA%81%E5%8F%91%E4%BC%A0%E8%BE%93/</link><pubDate>Wed, 10 Jun 2026 00:00:00 +0000</pubDate><guid>https://1bit2.github.io/p/cpu-%E8%AE%BF%E9%97%AE%E5%86%85%E5%AD%98%E7%9A%84%E7%A1%AC%E4%BB%B6%E8%B7%AF%E5%BE%84%E5%9C%B0%E5%9D%80%E6%80%BB%E7%BA%BF%E6%95%B0%E6%8D%AE%E6%80%BB%E7%BA%BF%E4%B8%8E%E7%BC%93%E5%AD%98%E8%A1%8C%E7%AA%81%E5%8F%91%E4%BC%A0%E8%BE%93/</guid><description>&lt;h1 id="cpu-访问内存的硬件路径"&gt;CPU 访问内存的硬件路径
+&lt;/h1&gt;&lt;blockquote&gt;
+&lt;p&gt;基于 Linux 5.15.78 内核源码。
+本文从&lt;strong&gt;硬件物理路径&lt;/strong&gt;角度，解释 CPU 执行一条内存指令时，电信号如何在总线上传输、DRAM 如何响应、缓存行如何搬运。&lt;strong&gt;页表软件遍历、缺页处理、TLB 代际管理等软件路径已移至姊妹篇 §3–§8，本文不再重复。&lt;/strong&gt;
+姊妹篇：&lt;a class="link" href="CPU%e9%a1%b5%e8%a1%a8%e4%b8%8e%e7%bc%93%e5%ad%98%e6%9c%ba%e5%88%b6.md" &gt;CPU 页表与缓存机制&lt;/a&gt; — &lt;strong&gt;软件视角&lt;/strong&gt;：页表遍历、TLB、PCID、TLB Shootdown、MESI、Cache Miss 实战。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr&gt;
+&lt;h2 id="目录"&gt;目录
+&lt;/h2&gt;&lt;ul&gt;
+&lt;li&gt;&lt;a class="link" href="#1-%e6%a0%b8%e5%bf%83%e9%97%ae%e9%a2%9864-%e4%bd%8d%e7%b3%bb%e7%bb%9f%e6%af%8f%e6%ac%a1%e5%8f%96%e5%a4%9a%e5%b0%91%e6%95%b0%e6%8d%ae" &gt;1. 核心问题：64 位系统每次取多少数据？&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#2-cpu-%e4%b8%8e%e5%86%85%e5%ad%98%e7%9a%84%e7%89%a9%e7%90%86%e8%bf%9e%e6%8e%a5%e4%b8%89%e7%a7%8d%e6%80%bb%e7%ba%bf" &gt;2. CPU 与内存的物理连接：三种总线&lt;/a&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;a class="link" href="#21-%e5%9c%b0%e5%9d%80%e6%80%bb%e7%ba%bf%e8%83%bd%e6%89%be%e5%a4%9a%e8%bf%9c" &gt;2.1 地址总线——能找多远&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#22-%e6%95%b0%e6%8d%ae%e6%80%bb%e7%ba%bf%e4%b8%80%e6%ac%a1%e6%90%ac%e5%a4%9a%e5%ae%bd" &gt;2.2 数据总线——一次搬多宽&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#23-%e6%8e%a7%e5%88%b6%e6%80%bb%e7%ba%bf%e6%93%8d%e4%bd%9c%e5%91%bd%e4%bb%a4" &gt;2.3 控制总线——操作命令&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#3-%e7%bc%93%e5%ad%98%e8%a1%8ccpu-%e4%b8%8e%e5%86%85%e5%ad%98%e4%b9%8b%e9%97%b4%e7%9a%84%e6%90%ac%e8%bf%90%e5%8d%95%e4%bd%8d" &gt;3. 缓存行：CPU 与内存之间的搬运单位&lt;/a&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;a class="link" href="#31-%e4%b8%ba%e4%bb%80%e4%b9%88%e6%98%af-64-%e5%ad%97%e8%8a%82" &gt;3.1 为什么是 64 字节&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#32-%e5%86%85%e6%a0%b8%e6%ba%90%e7%a0%81%e4%b8%ad%e7%9a%84%e7%bc%93%e5%ad%98%e8%a1%8c%e5%ae%9a%e4%b9%89" &gt;3.2 内核源码中的缓存行定义&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#33-clflush_sizecpu-%e8%87%aa%e6%a3%80%e7%bc%93%e5%ad%98%e8%a1%8c%e5%a4%a7%e5%b0%8f" &gt;3.3 clflush_size：CPU 自检缓存行大小&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#4-ddr-%e7%aa%81%e5%8f%91%e4%bc%a0%e8%be%938-%e6%8b%8d--8-%e5%ad%97%e8%8a%82--64-%e5%ad%97%e8%8a%82" &gt;4. DDR 突发传输：8 拍 × 8 字节 = 64 字节&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#5-dram-%e5%86%85%e9%83%a8%e7%bb%93%e6%9e%84%e8%a1%8c%e5%88%97%e4%ba%8c%e7%bb%b4%e9%98%b5%e5%88%97" &gt;5. DRAM 内部结构：行列二维阵列&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#6-%e5%a4%9a%e7%ba%a7%e7%bc%93%e5%ad%98%e6%af%8f%e4%b8%80%e5%b1%82%e4%b9%8b%e9%97%b4%e9%83%bd%e6%90%ac-64-%e5%ad%97%e8%8a%82" &gt;6. 多级缓存：每一层之间都搬 64 字节&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#7-%e5%ae%8c%e6%95%b4%e8%b7%af%e5%be%84%e4%bb%8e-mov-rax-virtual_addr-%e5%88%b0%e8%af%bb%e5%87%ba%e6%95%b0%e6%8d%ae" &gt;7. 完整路径：从 mov rax, [virtual_addr] 到读出数据&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#8-%e5%86%85%e6%a0%b8%e4%b8%ad%e7%9a%84%e7%bc%93%e5%ad%98%e8%a1%8c%e6%93%8d%e4%bd%9c" &gt;8. 内核中的缓存行操作&lt;/a&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;a class="link" href="#81-prefetch%e9%a2%84%e5%8f%96%e7%bc%93%e5%ad%98%e8%a1%8c" &gt;8.1 prefetch——预取缓存行&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#82-clflush%e5%88%b7%e6%96%b0%e7%bc%93%e5%ad%98%e8%a1%8c" &gt;8.2 clflush——刷新缓存行&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#83-clflush_cache_range%e6%8c%89%e8%8c%83%e5%9b%b4%e5%88%b7%e7%bc%93%e5%ad%98%e8%a1%8c" &gt;8.3 clflush_cache_range——按范围刷缓存行&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;&lt;a class="link" href="#9-%e6%80%bb%e7%bb%93%e7%a1%ac%e4%bb%b6%e4%b8%8e%e8%bd%af%e4%bb%b6%e7%9a%84%e5%88%86%e5%b7%a5%e8%be%b9%e7%95%8c" &gt;9. 总结：硬件与软件的分工边界&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr&gt;
+&lt;h2 id="1-核心问题64-位系统每次取多少数据"&gt;1. 核心问题：64 位系统每次取多少数据？
+&lt;/h2&gt;&lt;p&gt;&lt;strong&gt;&amp;ldquo;64 位&amp;quot;指的是什么？&lt;/strong&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;CPU 通用寄存器宽度：64 位（rax, rbx, rcx&amp;hellip;）&lt;/li&gt;
+&lt;li&gt;虚拟地址宽度：48 位（x86-64 实际使用 48 位，高 16 位为符号扩展）&lt;/li&gt;
+&lt;li&gt;单条指令能处理的整数宽度：64 位&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;&amp;ldquo;64 位&amp;quot;不是指：&lt;/strong&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;不是每次从内存取 64 字节&lt;/li&gt;
+&lt;li&gt;不是数据总线宽度为 64 字节&lt;/li&gt;
+&lt;li&gt;不是缓存行大小为 64 字节（这只是巧合）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;实际上每次从内存搬运数据的最小单位是缓存行（Cache Line）。&lt;/strong&gt; 现代 x86 CPU（Intel Core、AMD Ryzen/EPYC）的缓存行恰好是 &lt;strong&gt;64 字节&lt;/strong&gt;，这是 CPU 微架构的设计选择，与&amp;quot;64 位&amp;quot;没有因果关系。&lt;/p&gt;
+&lt;p&gt;即使一条指令只需要读 1 个字节（&lt;code&gt;mov al, [addr]&lt;/code&gt;），CPU 也会从内存取回整个 64 字节缓存行——这是利用了空间局部性原理（程序接下来大概率访问相邻地址）。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="2-cpu-与内存的物理连接三种总线"&gt;2. CPU 与内存的物理连接：三种总线
+&lt;/h2&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;span class="lnt"&gt;21
+&lt;/span&gt;&lt;span class="lnt"&gt;22
+&lt;/span&gt;&lt;span class="lnt"&gt;23
+&lt;/span&gt;&lt;span class="lnt"&gt;24
+&lt;/span&gt;&lt;span class="lnt"&gt;25
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; CPU 芯片 DDR 内存条
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ┌─────────────────────┐ ┌─────────────────────┐
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ │ │ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 寄存器 + ALU │ │ 存储单元阵列 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ↕ │ │ (行×列 电容矩阵) │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ L1/L2/L3 Cache │ │ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ↕ │ │ 行地址锁存器 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ MMU + TLB │ │ 列地址锁存器 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ↕ │ │ 感应放大器 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 内存控制器(IMC) │ │ I/O 缓冲器 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ↕ │ │ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └───────┬─────────────┘ └──────────┬──────────┘
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ┌─────────────────────────────────────┐
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├──┤ 地址总线 (Address Bus) │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ │ 物理地址线: 40~52 根 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ │ (决定最大可访问物理内存) │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ├─────────────────────────────────────┤
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├──┤ 数据总线 (Data Bus) │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ │ 每通道 64 根数据线 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ │ DDR: 上升沿+下降沿各传一次 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ├─────────────────────────────────────┤
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └──┤ 控制总线 (Control Bus) │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ RAS/CAS/WE/CS/CKE/CLK │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └─────────────────────────────────────┘
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h3 id="21-地址总线能找多远"&gt;2.1 地址总线——能找多远
+&lt;/h3&gt;&lt;p&gt;地址总线的宽度决定了 CPU 能访问多大的物理内存空间。&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;架构&lt;/th&gt;
+&lt;th&gt;地址总线宽度&lt;/th&gt;
+&lt;th&gt;最大物理内存&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;x86-32&lt;/td&gt;
+&lt;td&gt;32 位 (36 位 PAE)&lt;/td&gt;
+&lt;td&gt;4 GB (64 GB PAE)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;x86-64&lt;/td&gt;
+&lt;td&gt;40~52 位&lt;/td&gt;
+&lt;td&gt;1 TB ~ 4 PB&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;实际主流芯片&lt;/td&gt;
+&lt;td&gt;39~46 位&lt;/td&gt;
+&lt;td&gt;512 GB ~ 64 TB&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;注意：&lt;/strong&gt; &amp;ldquo;64 位系统&amp;quot;的地址总线并非 64 根。x86-64 架构定义的物理地址最大 52 位（&lt;code&gt;MAXPHYADDR&lt;/code&gt;），实际芯片实现通常是 39~46 位。&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;内核源码验证：&lt;code&gt;arch/x86/include/asm/pgtable_64_types.h:67&lt;/code&gt; 定义 &lt;code&gt;MAX_POSSIBLE_PHYSMEM_BITS = 52&lt;/code&gt;。物理地址上限通过 CPUID 叶号 0x80000008 查询，结果存入 &lt;code&gt;boot_cpu_data.x86_phys_bits&lt;/code&gt;（&lt;code&gt;arch/x86/mm/physaddr.h:7&lt;/code&gt; 使用该值判断地址是否合法）。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;内核中与物理地址宽度相关的定义在 &lt;code&gt;arch/x86/include/asm/processor.h:126&lt;/code&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="n"&gt;u16&lt;/span&gt; &lt;span class="n"&gt;x86_clflush_size&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// CPU 自检的缓存行大小，见第3节
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;物理地址上限通过 &lt;code&gt;CPUID&lt;/code&gt; 指令查询（叶号 0x80000008 的 EAX[7:0]），内核启动时读取并存入 &lt;code&gt;boot_cpu_data.x86_phys_bits&lt;/code&gt;。&lt;/p&gt;
+&lt;h3 id="22-数据总线一次搬多宽"&gt;2.2 数据总线——一次搬多宽
+&lt;/h3&gt;&lt;p&gt;数据总线决定了一次总线事务能传输多少位数据。&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;内存类型&lt;/th&gt;
+&lt;th&gt;每通道数据总线宽度&lt;/th&gt;
+&lt;th&gt;说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;DDR3/DDR4/DDR5&lt;/td&gt;
+&lt;td&gt;64 位 (8 字节)&lt;/td&gt;
+&lt;td&gt;每通道 64 根数据线&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;DDR5 双通道&lt;/td&gt;
+&lt;td&gt;2 × 64 位 = 128 位&lt;/td&gt;
+&lt;td&gt;两个独立通道&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;关键概念：DDR（Double Data Rate）双沿传输&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;时钟信号: ──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └───┘ └───┘ └───┘ └───┘ └───┘ └──
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;传输时机: 上 下 上 下 上 下 上 下
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 升 降 升 降 升 降 升 降
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 沿 沿 沿 沿 沿 沿 沿 沿
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;每次传输: 8 字节 (64 位数据总线)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;DDR4-3200: 3200 MT/s × 8 字节 = 25.6 GB/s (单通道)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;双通道: 51.2 GB/s
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;一次时钟沿传输 8 字节，但 DRAM 不会只传一次就停下来——它用&lt;strong&gt;突发传输&lt;/strong&gt;连续传 8 拍，凑成一个完整的缓存行。&lt;/p&gt;
+&lt;h3 id="23-控制总线操作命令"&gt;2.3 控制总线——操作命令
+&lt;/h3&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;信号&lt;/th&gt;
+&lt;th&gt;含义&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;RAS# (Row Address Strobe)&lt;/td&gt;
+&lt;td&gt;行地址选通：锁存行地址&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;CAS# (Column Address Strobe)&lt;/td&gt;
+&lt;td&gt;列地址选通：锁存列地址&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;WE# (Write Enable)&lt;/td&gt;
+&lt;td&gt;写使能&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;CS# (Chip Select)&lt;/td&gt;
+&lt;td&gt;片选&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;CKE (Clock Enable)&lt;/td&gt;
+&lt;td&gt;时钟使能&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;这些控制信号配合地址总线，完成 DRAM 的读/写/预充电/刷新操作。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="3-缓存行cpu-与内存之间的搬运单位"&gt;3. 缓存行：CPU 与内存之间的搬运单位
+&lt;/h2&gt;&lt;h3 id="31-为什么是-64-字节"&gt;3.1 为什么是 64 字节
+&lt;/h3&gt;&lt;p&gt;缓存行大小是 CPU 设计时的微架构决策，需要平衡以下因素：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;因素&lt;/th&gt;
+&lt;th&gt;缓存行大 → 优势&lt;/th&gt;
+&lt;th&gt;缓存行大 → 劣势&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;空间局部性&lt;/td&gt;
+&lt;td&gt;相邻数据一次性取到，减少后续 miss&lt;/td&gt;
+&lt;td&gt;如果只访问 1 字节，浪费带宽&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Tag 存储开销&lt;/td&gt;
+&lt;td&gt;行数少 → Tag SRAM 面积小&lt;/td&gt;
+&lt;td&gt;—&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;缓存命中率&lt;/td&gt;
+&lt;td&gt;—&lt;/td&gt;
+&lt;td&gt;替换粒度粗，可能把有用的行换出&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;伪共享 (False Sharing)&lt;/td&gt;
+&lt;td&gt;—&lt;/td&gt;
+&lt;td&gt;多核共享同一行的概率增大&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;x86 的演进：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;CPU 代际&lt;/th&gt;
+&lt;th&gt;缓存行大小&lt;/th&gt;
+&lt;th&gt;说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;486&lt;/td&gt;
+&lt;td&gt;16 字节&lt;/td&gt;
+&lt;td&gt;行缓冲 (line fill buffer)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Pentium&lt;/td&gt;
+&lt;td&gt;32 字节&lt;/td&gt;
+&lt;td&gt;一级缓存首次引入&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Pentium III/II&lt;/td&gt;
+&lt;td&gt;32 字节&lt;/td&gt;
+&lt;td&gt;—&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Pentium 4&lt;/td&gt;
+&lt;td&gt;64~128 字节&lt;/td&gt;
+&lt;td&gt;L1=64B, L2=128B&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Core 2 至今&lt;/td&gt;
+&lt;td&gt;&lt;strong&gt;64 字节&lt;/strong&gt;&lt;/td&gt;
+&lt;td&gt;统一标准&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h3 id="32-内核源码中的缓存行定义"&gt;3.2 内核源码中的缓存行定义
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;arch/x86/include/asm/cache.h&lt;/code&gt;:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt;/* L1 cache line size */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#define L1_CACHE_SHIFT (CONFIG_X86_L1_CACHE_SHIFT) &lt;/span&gt;&lt;span class="c1"&gt;// 默认值 6
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#define L1_CACHE_BYTES (1 &amp;lt;&amp;lt; L1_CACHE_SHIFT) &lt;/span&gt;&lt;span class="c1"&gt;// = 64 字节
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;code&gt;CONFIG_X86_L1_CACHE_SHIFT&lt;/code&gt; 在 Kconfig 中按 CPU 型号设定默认值（&lt;code&gt;arch/x86/Kconfig.cpu:318&lt;/code&gt;）：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;span class="lnt"&gt;7
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;config X86_L1_CACHE_SHIFT
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; int
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; default &amp;#34;7&amp;#34; if MPENTIUM4 || MPSC // Pentium 4: 128 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; default &amp;#34;6&amp;#34; if MK7 || MK8 || MPENTIUMM ||
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; MCORE2 || MATOM || ... // 现代 CPU: 64 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; default &amp;#34;4&amp;#34; if MELAN || M486SX || M486 ... // 486: 16 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; default &amp;#34;5&amp;#34; if MWINCHIP3D || MCRUSOE || ... // Pentium: 32 字节
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;通用层封装（&lt;code&gt;include/linux/cache.h:85&lt;/code&gt;）：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#ifndef CONFIG_ARCH_HAS_CACHE_LINE_SIZE
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#define cache_line_size() L1_CACHE_BYTES &lt;/span&gt;&lt;span class="c1"&gt;// 64
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#endif
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h3 id="33-clflush_sizecpu-自检缓存行大小"&gt;3.3 clflush_size：CPU 自检缓存行大小
+&lt;/h3&gt;&lt;p&gt;CPU 通过 CPUID 指令自检缓存行大小，结果存在 &lt;code&gt;boot_cpu_data.x86_clflush_size&lt;/code&gt;（&lt;code&gt;arch/x86/include/asm/processor.h:126&lt;/code&gt;）：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="n"&gt;u16&lt;/span&gt; &lt;span class="n"&gt;x86_clflush_size&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// 由 CPUID 叶号 1 的 EBX[15:8] × 8 得到
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;CPUID 叶号 1，EBX 寄存器（来自 Intel/AMD CPUID 手册，非内核源码）：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;位 [15:8]：CLFLUSH line size，单位是 8 字节&lt;/li&gt;
+&lt;li&gt;现代 CPU 此字段 = 8 → &lt;code&gt;8 × 8 = 64&lt;/code&gt; 字节&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;内核在启动时调用 CPUID 读取该值，后续所有缓存行操作都以此为基准。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="4-ddr-突发传输8-拍--8-字节--64-字节"&gt;4. DDR 突发传输：8 拍 × 8 字节 = 64 字节
+&lt;/h2&gt;&lt;blockquote&gt;
+&lt;p&gt;本节内容来自 JEDEC DDR 标准规范，非内核源码。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;DDR 内存的突发传输（Burst Transfer）是理解&amp;quot;为什么一次取 64 字节&amp;quot;的关键。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;DDR4 突发传输 (Burst Length = 8):
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;内存控制器发出: 行地址 + RAS# → 激活行
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 列地址 + CAS# + READ
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;DRAM 连续输出 8 拍数据:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;时钟: ──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └──┘ └──┘ └──┘ └──┘ └──┘ └──┘ └──┘ └──┘ └──
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;数据: D0 D0 D1 D1 D2 D2 D3 D3 D4 D4 D5 D5 D6 D6 D7 D7
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑ ↑
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 上 下 上 下 上 下 上 下 上 下 上 下 上 下 上 下
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 升 降 升 降 升 降 升 降 升 降 升 降 升 降 升 降
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;每拍 = 1 个时钟沿 = 8 字节 (64 位数据总线)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;DDR: 上升沿 + 下降沿各 1 拍 → 每时钟周期 2 拍
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;BL=8: 共 8 拍 = 4 个时钟周期
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;总数据量: 8 拍 × 8 字节 = 64 字节 = 1 个缓存行
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;为什么 BL=8？&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;JEDEC 标准规定 DDR 的突发长度为 8，这是经过精确计算的：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;缓存行 64 字节 / 数据总线 8 字节 = 8 拍 → 恰好匹配&lt;/li&gt;
+&lt;li&gt;如果 BL=4（DDR1 早期），一次突发只有 32 字节，需要 2 次突发才能填满一个缓存行&lt;/li&gt;
+&lt;li&gt;BL=8 使一次突发恰好填满一个缓存行，最大化总线利用率&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;这就是&amp;quot;64 字节&amp;quot;的真正来源：&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;缓存行 = DDR 突发长度 × 数据总线宽度 = 8 × 8 = 64 字节
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;不是&amp;quot;64 位系统所以取 64 字节&amp;rdquo;，而是 CPU 缓存行设计、DRAM 突发长度、数据总线宽度三者协同优化的结果。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="5-dram-内部结构行列二维阵列"&gt;5. DRAM 内部结构：行列二维阵列
+&lt;/h2&gt;&lt;blockquote&gt;
+&lt;p&gt;本节内容来自 DRAM 硬件架构规范，非内核源码。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;DRAM（Dynamic RAM）的存储单元是按行列组织的二维电容矩阵：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;DRAM Bank 内部结构 (以 DDR4 8Gb 为例):
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 列地址 (10 位, 1024 列)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ┌────────────────────────────────────┐
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 行地址 │ [0,0] [0,1] [0,2] ... [0,1023] │ ← 一行 = 1024 × 8bit = 1KB
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; (16位 │ [1,0] [1,1] [1,2] ... [1,1023] │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 65536行) │ [2,0] [2,1] [2,2] ... [2,1023] │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ ... │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ [65535,0] ... ... ... [65535,1023]│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └────────────────────────────────────┘
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;读取过程:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 1. ACTIVATE: RAS# + 行地址 → 整行 (1KB) 读入行缓冲 (Sense Amp)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 2. READ: CAS# + 列地址 → 从行缓冲中选取 64 字节输出
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 3. PRECHARGE: 关闭当前行，准备下一次访问
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;关键洞察：&lt;/strong&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;打开一行（ACTIVATE）是最耗时的操作（~30ns）&lt;/li&gt;
+&lt;li&gt;同一行内的列访问很快（~5ns），因为数据已在行缓冲中&lt;/li&gt;
+&lt;li&gt;突发传输 64 字节只是行缓冲中 1KB 的一小段&lt;/li&gt;
+&lt;li&gt;如果下次访问命中同一行（行命中），不需要重新 ACTIVATE → 性能大幅提升&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;这就是空间局部性在硬件层面的体现：&lt;/strong&gt; 相邻地址大概率在同一行，连续访问时只需发 CAS#，不需要重复 RAS#。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="6-多级缓存每一层之间都搬-64-字节"&gt;6. 多级缓存：每一层之间都搬 64 字节
+&lt;/h2&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;CPU 核心 (寄存器: 每次 8 字节)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↕ 1~4 周期
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;L1 Cache (32~64 KB)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 缓存行 = 64 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 未命中时向 L2 请求一个缓存行
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↕ 4~12 周期
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;L2 Cache (256 KB ~ 1 MB)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 缓存行 = 64 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 未命中时向 L3 请求一个缓存行
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↕ 10~40 周期
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;L3 Cache (4~64 MB, LLC)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 缓存行 = 64 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 未命中时向内存控制器请求一个缓存行
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↕ 40~100 周期
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;内存控制器 (IMC)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ 发起 DDR 突发传输: 8 拍 × 8 字节 = 64 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↕ 100~300 周期
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;DRAM
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;每一级之间的数据传输单位都是 64 字节缓存行。&lt;/strong&gt; 不是只有 L1↔CPU 是 64 字节，而是整个层次结构中每一级间的搬运粒度都是缓存行。&lt;/p&gt;
+&lt;p&gt;Cache 容量对比：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;层级&lt;/th&gt;
+&lt;th&gt;可容纳缓存行数&lt;/th&gt;
+&lt;th&gt;说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;L1 32KB&lt;/td&gt;
+&lt;td&gt;512 行&lt;/td&gt;
+&lt;td&gt;32768 / 64&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;L1 64KB&lt;/td&gt;
+&lt;td&gt;1024 行&lt;/td&gt;
+&lt;td&gt;65536 / 64&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;L2 256KB&lt;/td&gt;
+&lt;td&gt;4096 行&lt;/td&gt;
+&lt;td&gt;262144 / 64&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;L2 1MB&lt;/td&gt;
+&lt;td&gt;16384 行&lt;/td&gt;
+&lt;td&gt;1048576 / 64&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;L3 32MB&lt;/td&gt;
+&lt;td&gt;524288 行&lt;/td&gt;
+&lt;td&gt;33554432 / 64&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;缓存替换的最小单位也是缓存行&lt;/strong&gt;：当缓存满了需要替换时，替换的是一整行 64 字节，不是一个字节。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="7-完整路径从-mov-rax-virtual_addr-到读出数据"&gt;7. 完整路径：从 mov rax, [virtual_addr] 到读出数据
+&lt;/h2&gt;&lt;p&gt;以 &lt;code&gt;mov rax, [0x7f3456967890]&lt;/code&gt; 为例，完整路径如下：&lt;/p&gt;
+&lt;h3 id="第一步虚拟地址--物理地址mmu-硬件页表遍历"&gt;第一步：虚拟地址 → 物理地址（MMU 硬件页表遍历）
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;虚拟地址: 0x7f3456967890
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;拆分 (48 位虚拟地址, 4 级页表):
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; [47:39] = 0x0FE = PGD 索引 254
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; [38:30] = 0x0D1 = PUD 索引 209
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; [29:21] = 0x0B4 = PMD 索引 180
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; [20:12] = 0x167 = PTE 索引 359
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; [11:0] = 0x890 = 页内偏移 2192
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; (为什么是 9-9-9-9-12 的拆分？详见 [CPU 页表与缓存机制 §2](CPU页表与缓存机制.md))
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;MMU 的 Page Table Walker 硬件自动遍历:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; CR3 寄存器 → PGD 表物理基址
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → PGD[254] → 取出 PUD 表物理基址
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → PUD[209] → 取出 PMD 表物理基址
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → PMD[180] → 取出 PTE 表物理基址
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → PTE[359] → 取出物理页帧号 (PFN)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;假设 PTE 内容: PFN = 0x0001_ABCD_EF80, Present=1
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;物理地址 = (PFN &amp;lt;&amp;lt; 12) | 偏移 = 0x1_ABCD_EF80_890
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;如果 PTE 的 Present=0，CPU 触发 #PF 异常，陷入内核（缺页处理的完整软件路径详见 &lt;a class="link" href="CPU%e9%a1%b5%e8%a1%a8%e4%b8%8e%e7%bc%93%e5%ad%98%e6%9c%ba%e5%88%b6.md" &gt;CPU 页表与缓存机制 §6&lt;/a&gt;）。&lt;/p&gt;
+&lt;h3 id="第二步物理地址--cache-查找"&gt;第二步：物理地址 → Cache 查找
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;物理地址: 0x1_ABCD_EF80_890
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;Cache 控制器用物理地址查缓存 (PIPT: Physically Indexed, Physically Tagged):
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 缓存行内偏移 = PA[5:0] = 0x10 (64 字节行中的第 16 字节)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; Set Index = PA[中间位] (取决于 Cache 路数和大小)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; Tag = PA[高位]
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;L1 Cache 查找:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 用 Set Index 定位到 Set
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 在 Set 内的多路 (Way) 中比较 Tag
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 匹配 + Valid=1 → 命中!
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 从 L1 SRAM 读出 8 字节 → 填入 rax 寄存器
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 延迟: 1~4 个时钟周期 (约 0.3~1 ns)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h3 id="第三步cache-miss--逐级回源"&gt;第三步：Cache Miss → 逐级回源
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;L1 Miss → 查 L2:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → L2 用同样的 Set Index + Tag 查找
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 命中: 取出 64 字节缓存行 → 填入 L1 → CPU 读 8 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 延迟: 4~12 周期 (约 1~3 ns)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;L2 Miss → 查 L3:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → L3 查找 (通常 16 路组相联，容量大，命中率高)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 命中: 取出 64 字节缓存行 → 填入 L2 → L1 → CPU
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 延迟: 10~40 周期 (约 3~10 ns)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;L3 Miss → 访问 DRAM:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 内存控制器将物理地址解码为 Bank/Row/Column
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → ACTIVATE: 发 RAS# + 行地址，打开行 (~30ns)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → READ: 发 CAS# + 列地址，从行缓冲读 (~5ns)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → DDR 突发传输: 8 拍 × 8 字节 = 64 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 64 字节沿数据总线返回 → 填入 L3 → L2 → L1 → CPU
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 延迟: 100~300 周期 (约 30~80 ns)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h3 id="第四步数据返回-cpu"&gt;第四步：数据返回 CPU
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;L1 命中后:
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 缓存行内的 64 字节数据已在 L1 SRAM 中
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; Cache 控制器按偏移 0x10 选出 8 字节
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 通过内部数据通路传送到 rax 寄存器
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 指令完成，流水线继续
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;hr&gt;
+&lt;h2 id="8-内核中的缓存行操作"&gt;8. 内核中的缓存行操作
+&lt;/h2&gt;&lt;blockquote&gt;
+&lt;p&gt;&lt;strong&gt;灾后重建说明&lt;/strong&gt;：本节内容根据内核源码重写（原 §8.1–§8.3 在编辑过程中被误删）。所有代码片段均直接取自 5.15.78 源码，已核对行号。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;内核提供两组缓存行级别的操作接口：&lt;strong&gt;预取&lt;/strong&gt;（&lt;code&gt;prefetch&lt;/code&gt;，把数据提前拉进 L1）和&lt;strong&gt;显式失效&lt;/strong&gt;（&lt;code&gt;clflush&lt;/code&gt;，把缓存行从 L1/L2/L3 写回并逐出）。前者是性能优化，后者是正确性保证（DMA 一致性、持久内存落盘、self-modifying code）。&lt;/p&gt;
+&lt;h3 id="81-prefetch预取缓存行"&gt;8.1 prefetch——预取缓存行
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;include/linux/prefetch.h&lt;/code&gt; 封装了三个宏：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;// include/linux/prefetch.h:40,44,48
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#ifndef ARCH_HAS_PREFETCH
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#define prefetch(x) __builtin_prefetch(x) &lt;/span&gt;&lt;span class="c1"&gt;// 读预取
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#endif
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#ifndef ARCH_HAS_PREFETCHW
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#define prefetchw(x) __builtin_prefetch(x,1) &lt;/span&gt;&lt;span class="c1"&gt;// 写预取
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#endif
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#ifndef ARCH_HAS_SPINLOCK_PREFETCH
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#define spin_lock_prefetch(x) prefetchw(x) &lt;/span&gt;&lt;span class="c1"&gt;// 预取锁
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#endif
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#ifndef PREFETCH_STRIDE
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#define PREFETCH_STRIDE (4*L1_CACHE_BYTES) &lt;/span&gt;&lt;span class="c1"&gt;// 预取步长：256 字节
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#endif
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;接口&lt;/th&gt;
+&lt;th&gt;x86 指令&lt;/th&gt;
+&lt;th&gt;Cache 状态变迁&lt;/th&gt;
+&lt;th&gt;典型场景&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;prefetch(x)&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;prefetchnta&lt;/code&gt; / &lt;code&gt;prefetcht2&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;Invalid/Shared → Shared&lt;/td&gt;
+&lt;td&gt;链表遍历下一个节点&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;prefetchw(x)&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;prefetchwt1&lt;/code&gt; / &lt;code&gt;prefetchw&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;Shared → &lt;strong&gt;Exclusive/Modified&lt;/strong&gt;&lt;/td&gt;
+&lt;td&gt;即将写某字段时（避免 RFO 延迟）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;spin_lock_prefetch(x)&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;同 &lt;code&gt;prefetchw&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;同上&lt;/td&gt;
+&lt;td&gt;抢锁前把 cacheline 拉到独占态&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;code&gt;prefetchw&lt;/code&gt; 的关键价值：MESI 协议下，写一个 Shared 态的 cacheline 会触发 &lt;strong&gt;RFO（Request For Ownership）&lt;/strong&gt;，需要广播 Invalidate 给所有共享核并等待 ACK，延迟几十到几百周期。提前 &lt;code&gt;prefetchw&lt;/code&gt; 把这个过程与计算并行掉。&lt;/p&gt;
+&lt;p&gt;批量预取封装：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;// include/linux/prefetch.h:55-64
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="kr"&gt;inline&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;prefetch_range&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;len&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#ifdef ARCH_HAS_PREFETCH
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;char&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;cp&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;char&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;end&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;addr&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;len&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;cp&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;cp&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="n"&gt;end&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;cp&lt;/span&gt; &lt;span class="o"&gt;+=&lt;/span&gt; &lt;span class="n"&gt;PREFETCH_STRIDE&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="c1"&gt;// 步长 256 字节
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;prefetch&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;cp&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cp"&gt;#endif
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;使用纪律&lt;/strong&gt;：prefetch 是 hint 不是命令，CPU 可以无视（地址非法、流水线满、带宽紧张都会丢弃）。&lt;code&gt;prefetch(0)&lt;/code&gt; 被明确允许，不触发 fault。滥用 prefetch 反而会污染 L1、挤掉有用数据——&lt;code&gt;perf stat -e cache-misses,cache-references&lt;/code&gt; 是验证手段。&lt;/p&gt;
+&lt;h3 id="82-clflush刷新缓存行"&gt;8.2 clflush——刷新缓存行
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;arch/x86/include/asm/special_insns.h:198-209&lt;/code&gt; 把 x86 的两条刷缓存行指令封装成 C：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;// arch/x86/include/asm/special_insns.h:198-209
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="kr"&gt;inline&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;clflush&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;volatile&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;__p&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;asm&lt;/span&gt; &lt;span class="k"&gt;volatile&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;#34;clflush %0&amp;#34;&lt;/span&gt; &lt;span class="o"&gt;:&lt;/span&gt; &lt;span class="s"&gt;&amp;#34;+m&amp;#34;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;volatile&lt;/span&gt; &lt;span class="kt"&gt;char&lt;/span&gt; &lt;span class="n"&gt;__force&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="n"&gt;__p&lt;/span&gt;&lt;span class="p"&gt;));&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="kr"&gt;inline&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;clflushopt&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;volatile&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;__p&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// CLFLUSHOPT 是弱排序版本，需要额外 fence
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;alternative_io&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;#34;.byte 0x3e; clflush %P0&amp;#34;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="c1"&gt;// 旧指令前缀：clflush
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="s"&gt;&amp;#34;.byte 0x66; clflush %P0&amp;#34;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="c1"&gt;// 0x66 前缀：clflushopt
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;X86_FEATURE_CLFLUSHOPT&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="s"&gt;&amp;#34;+m&amp;#34;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;volatile&lt;/span&gt; &lt;span class="kt"&gt;char&lt;/span&gt; &lt;span class="n"&gt;__force&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="n"&gt;__p&lt;/span&gt;&lt;span class="p"&gt;));&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;指令&lt;/th&gt;
+&lt;th&gt;排序性&lt;/th&gt;
+&lt;th&gt;吞吐量&lt;/th&gt;
+&lt;th&gt;行为&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;clflush&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;强排序（隐式 MFENCE 效果）&lt;/td&gt;
+&lt;td&gt;慢（约 100 周期 / 行）&lt;/td&gt;
+&lt;td&gt;把地址所在 cacheline 写回内存 + 从所有层级 Cache 逐出&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;clflushopt&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;&lt;strong&gt;弱排序&lt;/strong&gt;（需 &lt;code&gt;mfence&lt;/code&gt;/&lt;code&gt;sfence&lt;/code&gt; 包裹）&lt;/td&gt;
+&lt;td&gt;快（可流水线）&lt;/td&gt;
+&lt;td&gt;同上，但 CPU 可重排多个 clflushopt&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;clflush 的语义是&lt;strong&gt;物理地址粒度&lt;/strong&gt;的：同一虚拟地址在两个进程里映射到同一物理页时，任一进程执行 clflush 都会让两边同时失效（PIPT 架构下 cacheline 以物理地址为 key）。&lt;/p&gt;
+&lt;p&gt;适用场景：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;DMA 一致性&lt;/strong&gt;：CPU 写完数据后 clflush，外设从内存读时能看到最新值（非 coherent DMA 平台）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;持久内存（PMEM）&lt;/strong&gt;：写入 NVDIMM 必须 clflush/clflushopt + sfence 才能保证掉电持久&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Self-modifying code&lt;/strong&gt;：内核打补丁（&lt;code&gt;text_poke&lt;/code&gt;）后刷掉旧指令 cacheline，避免 CPU 取到旧指令&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3 id="83-clflush_cache_range按范围刷缓存行"&gt;8.3 clflush_cache_range——按范围刷缓存行
+&lt;/h3&gt;&lt;p&gt;单条 &lt;code&gt;clflush&lt;/code&gt; 只能刷一个 cacheline。要刷一段连续内存，内核提供 &lt;code&gt;clflush_cache_range()&lt;/code&gt;（&lt;code&gt;arch/x86/mm/pat/set_memory.c:314&lt;/code&gt;）：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;span class="lnt"&gt;21
+&lt;/span&gt;&lt;span class="lnt"&gt;22
+&lt;/span&gt;&lt;span class="lnt"&gt;23
+&lt;/span&gt;&lt;span class="lnt"&gt;24
+&lt;/span&gt;&lt;span class="lnt"&gt;25
+&lt;/span&gt;&lt;span class="lnt"&gt;26
+&lt;/span&gt;&lt;span class="lnt"&gt;27
+&lt;/span&gt;&lt;span class="lnt"&gt;28
+&lt;/span&gt;&lt;span class="lnt"&gt;29
+&lt;/span&gt;&lt;span class="lnt"&gt;30
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;// arch/x86/mm/pat/set_memory.c:293-320
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;clflush_cache_range_opt&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;vaddr&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;unsigned&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;size&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="kt"&gt;unsigned&lt;/span&gt; &lt;span class="kt"&gt;long&lt;/span&gt; &lt;span class="n"&gt;clflush_size&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;boot_cpu_data&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;x86_clflush_size&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="c1"&gt;// 通常 64
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// 把起始地址向下对齐到 cacheline 边界
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;p&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)((&lt;/span&gt;&lt;span class="kt"&gt;unsigned&lt;/span&gt; &lt;span class="kt"&gt;long&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="n"&gt;vaddr&lt;/span&gt; &lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="o"&gt;~&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;clflush_size&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;));&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;vend&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;vaddr&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;size&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;p&lt;/span&gt; &lt;span class="o"&gt;&amp;gt;=&lt;/span&gt; &lt;span class="n"&gt;vend&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(;&lt;/span&gt; &lt;span class="n"&gt;p&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="n"&gt;vend&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;p&lt;/span&gt; &lt;span class="o"&gt;+=&lt;/span&gt; &lt;span class="n"&gt;clflush_size&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;clflushopt&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;p&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt; &lt;span class="c1"&gt;// 用弱排序版本 + 循环
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt;/**
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * clflush_cache_range - flush a cache range with clflush
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * @vaddr: virtual start address
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * @size: number of bytes to flush
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; *
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * CLFLUSHOPT is an unordered instruction which needs fencing with
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * MFENCE or SFENCE to avoid ordering issues.
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;clflush_cache_range&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;vaddr&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;unsigned&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;size&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;mb&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt; &lt;span class="c1"&gt;// 前 fence：确保之前的写都已提交
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;clflush_cache_range_opt&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vaddr&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;size&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;mb&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt; &lt;span class="c1"&gt;// 后 fence：确保所有 clflushopt 完成
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="nf"&gt;EXPORT_SYMBOL_GPL&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;clflush_cache_range&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;设计要点&lt;/strong&gt;：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;地址对齐&lt;/strong&gt;：用户传入的 &lt;code&gt;vaddr&lt;/code&gt; 未必在 cacheline 边界，&lt;code&gt;opt&lt;/code&gt; 里先用 &lt;code&gt;&amp;amp; ~(clflush_size - 1)&lt;/code&gt; 对齐到 64 字节边界，否则会漏刷首条 line&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;循环刷&lt;/strong&gt;：从对齐后的起点每 64 字节 &lt;code&gt;clflushopt&lt;/code&gt; 一次，直到覆盖 &lt;code&gt;[vaddr, vaddr+size)&lt;/code&gt; 全部 cacheline&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;mb() 包裹&lt;/strong&gt;：&lt;code&gt;clflushopt&lt;/code&gt; 是弱排序，必须前后各一个 &lt;code&gt;mb()&lt;/code&gt;（x86 上等价于 &lt;code&gt;mfence&lt;/code&gt;）才能保证&amp;quot;调用返回时，所有 cacheline 都已写回内存&amp;rdquo;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;用 &lt;code&gt;clflushopt&lt;/code&gt; 而非 &lt;code&gt;clflush&lt;/code&gt;&lt;/strong&gt;：循环内大量刷写时弱排序版本的吞吐量优势显著；强排序的开销由外层一对 &lt;code&gt;mb()&lt;/code&gt; 承担&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;调用方：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;arch_invalidate_pmem()&lt;/code&gt;（持久内存 API，&lt;code&gt;CONFIG_ARCH_HAS_PMEM_API&lt;/code&gt;）&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;set_memory_np()&lt;/code&gt; / &lt;code&gt;set_memory_4k()&lt;/code&gt; 等页表属性切换（确保旧 PTE 的 cacheline 失效）&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;text_poke()&lt;/code&gt; 系列（热补丁后刷新指令 cacheline）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2 id="9-总结硬件与软件的分工边界"&gt;9. 总结：硬件与软件的分工边界
+&lt;/h2&gt;&lt;blockquote&gt;
+&lt;p&gt;&lt;strong&gt;关于页表遍历 / TLB / 缺页处理的软件路径&lt;/strong&gt;：本节只给出硬件与软件职责的高层分工图，详细源码分析（CR3、PTE 位、TLB 代际管理、&lt;code&gt;handle_mm_fault&lt;/code&gt;、&lt;code&gt;handle_pte_fault&lt;/code&gt; 等）已移至 &lt;a class="link" href="CPU%e9%a1%b5%e8%a1%a8%e4%b8%8e%e7%bc%93%e5%ad%98%e6%9c%ba%e5%88%b6.md" &gt;CPU 页表与缓存机制&lt;/a&gt; 第一部分（§3–§8），避免与本文硬件视角的内容重复。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;span class="lnt"&gt;21
+&lt;/span&gt;&lt;span class="lnt"&gt;22
+&lt;/span&gt;&lt;span class="lnt"&gt;23
+&lt;/span&gt;&lt;span class="lnt"&gt;24
+&lt;/span&gt;&lt;span class="lnt"&gt;25
+&lt;/span&gt;&lt;span class="lnt"&gt;26
+&lt;/span&gt;&lt;span class="lnt"&gt;27
+&lt;/span&gt;&lt;span class="lnt"&gt;28
+&lt;/span&gt;&lt;span class="lnt"&gt;29
+&lt;/span&gt;&lt;span class="lnt"&gt;30
+&lt;/span&gt;&lt;span class="lnt"&gt;31
+&lt;/span&gt;&lt;span class="lnt"&gt;32
+&lt;/span&gt;&lt;span class="lnt"&gt;33
+&lt;/span&gt;&lt;span class="lnt"&gt;34
+&lt;/span&gt;&lt;span class="lnt"&gt;35
+&lt;/span&gt;&lt;span class="lnt"&gt;36
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;┌─────────────────────────────────────────────────────┐
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ CPU 硬件自动完成 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 1. MMU 用 CR3 中的 PGD 物理地址遍历 4 级页表 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 2. 取出 PTE 中的物理页帧号，合成物理地址 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 3. 用物理地址查 TLB → 命中则直接返回 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 4. TLB Miss → Page Table Walker 自动查表 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 5. 得到物理地址后查 Cache（L1→L2→L3） │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 6. Cache Miss → 内存控制器发起 DDR 突发传输 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 7. 8 拍 × 8 字节 = 64 字节缓存行填入 Cache │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 8. CPU 从 Cache 读出需要的字节到寄存器 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 前提：所有页表项 Present=1，权限足够 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 延迟：TLB 命中 ~1ns，全 Miss ~60-100ns │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;└────────────────────┬────────────────────────────────┘
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ PTE Present=0 或权限不足
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↓
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;┌─────────────────────────────────────────────────────┐
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 内核软件处理 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 1. CPU 触发 #PF 异常，陷入内核态 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 2. do_user_addr_fault() 解析 error_code │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 3. handle_mm_fault() → __handle_mm_fault() │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 4. 软件遍历页表，分配缺失的页表页 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 5. handle_pte_fault() 根据 PTE 状态分派: │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ → do_anonymous_page: 分配零页 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ → do_read_fault: 从文件/缓存读取 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ → do_cow_fault: COW 写时复制 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ → do_swap_page: 从 swap 换入 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 6. 填写 PTE（设置 Present=1 + 权限位） │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 7. 刷新 TLB（invlpg 或全量刷新） │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 8. 返回用户态，重新执行触发缺页的指令 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 延迟：~1μs（minor fault）到 ~10ms（major fault+磁盘）│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;└─────────────────────────────────────────────────────┘
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;关键数据对照：&lt;/strong&gt;&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;项目&lt;/th&gt;
+&lt;th&gt;值&lt;/th&gt;
+&lt;th&gt;来源&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;虚拟地址宽度&lt;/td&gt;
+&lt;td&gt;48 位&lt;/td&gt;
+&lt;td&gt;x86-64 架构规范&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;物理地址宽度&lt;/td&gt;
+&lt;td&gt;39~52 位&lt;/td&gt;
+&lt;td&gt;CPUID 叶号 0x80000008&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;页大小&lt;/td&gt;
+&lt;td&gt;4 KB (2^12)&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;PAGE_SHIFT=12&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;每级页表项数&lt;/td&gt;
+&lt;td&gt;512&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;PTRS_PER_xxx=512&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;PTE 物理帧号位&lt;/td&gt;
+&lt;td&gt;40 位 (位 12~51)&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;pgtable_types.h&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;最大物理内存&lt;/td&gt;
+&lt;td&gt;4 PB (2^52)&lt;/td&gt;
+&lt;td&gt;52 位物理地址&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;缓存行大小&lt;/td&gt;
+&lt;td&gt;64 字节&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;L1_CACHE_BYTES&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;DDR 突发长度&lt;/td&gt;
+&lt;td&gt;8 拍&lt;/td&gt;
+&lt;td&gt;JEDEC DDR 标准&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;DDR 数据总线宽度&lt;/td&gt;
+&lt;td&gt;64 位 (8 字节)&lt;/td&gt;
+&lt;td&gt;每通道&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;一次突发传输量&lt;/td&gt;
+&lt;td&gt;8 × 8 = 64 字节 = 1 缓存行&lt;/td&gt;
+&lt;td&gt;设计匹配&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;L1 访问延迟&lt;/td&gt;
+&lt;td&gt;~1 ns&lt;/td&gt;
+&lt;td&gt;1~4 周期&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;L3 访问延迟&lt;/td&gt;
+&lt;td&gt;~10 ns&lt;/td&gt;
+&lt;td&gt;10~40 周期&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;DRAM 访问延迟&lt;/td&gt;
+&lt;td&gt;~60 ns&lt;/td&gt;
+&lt;td&gt;100~300 周期&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Minor Page Fault&lt;/td&gt;
+&lt;td&gt;~1 μs&lt;/td&gt;
+&lt;td&gt;软件处理&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Major Page Fault&lt;/td&gt;
+&lt;td&gt;~10 ms&lt;/td&gt;
+&lt;td&gt;含磁盘 I/O&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;</description></item></channel></rss>

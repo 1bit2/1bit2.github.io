@@ -1,0 +1,1033 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="TCP 接收路径深度分析 本文基于 Linux 5.15.78 本仓库源码，梳理 ESTABLISHED 状态下数据段从 IP 层投递到应用唤醒的完整路径，重点说明 Header Prediction（快路径）、慢路径与 tcp_validate_incoming()、tcp_data_queue() 与乱序红黑树、延迟/压缩 ACK、tcp_data_ready / epoll 就绪判断，以及 GRO 与常规 tcp_v4_rcv 的衔接。文中所有函数、结构体与行号均以当前树中文件为准。\n一、全景调用链 1.1 IPv4 入口与 socket 分发 tcp_v4_rcv() 在完成查找 socket、tcp_v4_fill_cb() 填充 TCP_SKB_CB 等前置步骤后，对 已建立连接 的 socket 在 软中断 / NAPI 上下文 中加 socket 底半部锁 bh_lock_sock_nested()，再根据 sock_owned_by_user() 决定是 直接处理 还是 入 backlog。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 // net/ipv4/tcp_ipv4.c:2829-2846 bh_lock_sock_nested(sk); tcp_segs_in(tcp_sk(sk), skb); ret = 0; if (!sock_owned_by_user(sk)) { skb_to_free = sk->sk_rx_skb_cache; sk->sk_rx_skb_cache = NULL; ret = tcp_v4_do_rcv(sk, skb); } else { if (tcp_add_backlog(sk, skb)) goto discard_and_relse; skb_to_free = NULL; } bh_unlock_sock(sk); 要点：\n"><title>TCP 接收路径深度分析</title><link rel=canonical href=https://1bit2.github.io/p/tcp-%E6%8E%A5%E6%94%B6%E8%B7%AF%E5%BE%84%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP 接收路径深度分析"><meta property='og:description' content="TCP 接收路径深度分析 本文基于 Linux 5.15.78 本仓库源码，梳理 ESTABLISHED 状态下数据段从 IP 层投递到应用唤醒的完整路径，重点说明 Header Prediction（快路径）、慢路径与 tcp_validate_incoming()、tcp_data_queue() 与乱序红黑树、延迟/压缩 ACK、tcp_data_ready / epoll 就绪判断，以及 GRO 与常规 tcp_v4_rcv 的衔接。文中所有函数、结构体与行号均以当前树中文件为准。\n一、全景调用链 1.1 IPv4 入口与 socket 分发 tcp_v4_rcv() 在完成查找 socket、tcp_v4_fill_cb() 填充 TCP_SKB_CB 等前置步骤后，对 已建立连接 的 socket 在 软中断 / NAPI 上下文 中加 socket 底半部锁 bh_lock_sock_nested()，再根据 sock_owned_by_user() 决定是 直接处理 还是 入 backlog。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 // net/ipv4/tcp_ipv4.c:2829-2846 bh_lock_sock_nested(sk); tcp_segs_in(tcp_sk(sk), skb); ret = 0; if (!sock_owned_by_user(sk)) { skb_to_free = sk->sk_rx_skb_cache; sk->sk_rx_skb_cache = NULL; ret = tcp_v4_do_rcv(sk, skb); } else { if (tcp_add_backlog(sk, skb)) goto discard_and_relse; skb_to_free = NULL; } bh_unlock_sock(sk); 要点：\n"><meta property='og:url' content='https://1bit2.github.io/p/tcp-%E6%8E%A5%E6%94%B6%E8%B7%AF%E5%BE%84%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='tcp_rcv_established'><meta property='article:tag' content='tcp_data_queue'><meta property='article:tag' content='快路径'><meta property='article:tag' content='慢路径'><meta property='article:tag' content='乱序队列'><meta property='article:tag' content='D-SACK'><meta property='article:tag' content='GRO'><meta property='article:tag' content='pred_flags'><meta property='article:published_time' content='2026-04-29T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-29T00:00:00+00:00'><meta name=twitter:title content="TCP 接收路径深度分析"><meta name=twitter:description content="TCP 接收路径深度分析 本文基于 Linux 5.15.78 本仓库源码，梳理 ESTABLISHED 状态下数据段从 IP 层投递到应用唤醒的完整路径，重点说明 Header Prediction（快路径）、慢路径与 tcp_validate_incoming()、tcp_data_queue() 与乱序红黑树、延迟/压缩 ACK、tcp_data_ready / epoll 就绪判断，以及 GRO 与常规 tcp_v4_rcv 的衔接。文中所有函数、结构体与行号均以当前树中文件为准。\n一、全景调用链 1.1 IPv4 入口与 socket 分发 tcp_v4_rcv() 在完成查找 socket、tcp_v4_fill_cb() 填充 TCP_SKB_CB 等前置步骤后，对 已建立连接 的 socket 在 软中断 / NAPI 上下文 中加 socket 底半部锁 bh_lock_sock_nested()，再根据 sock_owned_by_user() 决定是 直接处理 还是 入 backlog。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 // net/ipv4/tcp_ipv4.c:2829-2846 bh_lock_sock_nested(sk); tcp_segs_in(tcp_sk(sk), skb); ret = 0; if (!sock_owned_by_user(sk)) { skb_to_free = sk->sk_rx_skb_cache; sk->sk_rx_skb_cache = NULL; ret = tcp_v4_do_rcv(sk, skb); } else { if (tcp_add_backlog(sk, skb)) goto discard_and_relse; skb_to_free = NULL; } bh_unlock_sock(sk); 要点：\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一全景调用链>一、全景调用链</a><ol><li><a href=#11-ipv4-入口与-socket-分发>1.1 IPv4 入口与 socket 分发</a></li><li><a href=#12-established-快速进入-tcp_rcv_established>1.2 ESTABLISHED 快速进入 <code>tcp_rcv_established()</code></a></li><li><a href=#13-backlog-的消化路径>1.3 backlog 的消化路径</a></li><li><a href=#14-小结图示>1.4 小结图示</a></li></ol></li><li><a href=#二header-prediction-与快路径>二、Header Prediction 与快路径</a><ol><li><a href=#21-pred_flags-的构成>2.1 <code>pred_flags</code> 的构成</a></li><li><a href=#22-tcp_hp_bits哪些标志参与预测比较>2.2 <code>TCP_HP_BITS</code>：哪些标志参与预测比较</a></li><li><a href=#23-快路径的三类门闩与时间戳子检查>2.3 快路径的三类门闩与时间戳子检查</a></li></ol></li><li><a href=#三快路径处理>三、快路径处理</a><ol><li><a href=#31-纯-ack-包len--tcp_header_len>3.1 纯 ACK 包（<code>len == tcp_header_len</code>）</a></li><li><a href=#32-数据包快路径>3.2 数据包快路径</a></li></ol></li><li><a href=#四慢路径处理>四、慢路径处理</a><ol><li><a href=#41-进入慢路径的入口>4.1 进入慢路径的入口</a></li><li><a href=#42-tcp_validate_incomingpaws序列窗口rstsyn>4.2 <code>tcp_validate_incoming()</code>：PAWS、序列窗口、RST、SYN</a></li><li><a href=#43-慢路径-ackurg-与数据排队>4.3 慢路径 ACK、URG 与数据排队</a></li></ol></li><li><a href=#五tcp_data_queue-数据排队>五、<code>tcp_data_queue()</code> 数据排队</a><ol><li><a href=#51-按序到达seq--rcv_nxt>5.1 按序到达（<code>seq == rcv_nxt</code>）</a></li><li><a href=#52-tcp_ofo_queuegap-填平后从红黑树并入接收队列>5.2 <code>tcp_ofo_queue()</code>：gap 填平后从红黑树并入接收队列</a></li><li><a href=#53-完全重复end_seq--rcv_nxt>5.3 完全重复（<code>end_seq &lt;= rcv_nxt</code>）</a></li><li><a href=#54-部分重叠seq--rcv_nxt--end_seq>5.4 部分重叠（<code>seq &lt; rcv_nxt &lt; end_seq</code>）</a></li><li><a href=#55-乱序seq--rcv_nxt-tcp_data_queue_ofo>5.5 乱序（<code>seq > rcv_nxt</code>）— <code>tcp_data_queue_ofo()</code></a></li></ol></li><li><a href=#六延迟-ack-决策>六、延迟 ACK 决策</a></li><li><a href=#七数据就绪与唤醒>七、数据就绪与唤醒</a><ol><li><a href=#71-tcp_data_ready>7.1 <code>tcp_data_ready()</code></a></li><li><a href=#72-tcp_epollin_ready可读字节与压力例外>7.2 <code>tcp_epollin_ready()</code>：可读字节与压力例外</a></li><li><a href=#73-sock_def_readableepollpoll-唤醒掩码>7.3 <code>sock_def_readable()</code>：epoll/<code>poll</code> 唤醒掩码</a></li></ol></li><li><a href=#八gro-与-tcp-接收的交互>八、GRO 与 TCP 接收的交互</a><ol><li><a href=#81-驱动到-napi_gro_receive>8.1 驱动到 <code>napi_gro_receive()</code></a></li><li><a href=#82-tcp4_gro_receive校验和与委托>8.2 <code>tcp4_gro_receive()</code>：校验和与委托</a></li><li><a href=#83-tcp_gro_receive同流ackseq-连续选项一致>8.3 <code>tcp_gro_receive()</code>：同流、ACK、<code>seq</code> 连续、选项一致</a></li><li><a href=#84-与-tcp_v4_rcv-的关系>8.4 与 <code>tcp_v4_rcv()</code> 的关系</a></li></ol></li><li><a href=#附录关键符号索引本树路径>附录：关键符号索引（本树路径）</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-%E6%8E%A5%E6%94%B6%E8%B7%AF%E5%BE%84%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/>TCP 接收路径深度分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 29, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>12 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp-接收路径深度分析>TCP 接收路径深度分析</h1><p>本文基于 <strong>Linux 5.15.78</strong> 本仓库源码，梳理 <strong>ESTABLISHED</strong> 状态下数据段从 IP 层投递到应用唤醒的完整路径，重点说明 <strong>Header Prediction（快路径）</strong>、<strong>慢路径与 <code>tcp_validate_incoming()</code></strong>、<strong><code>tcp_data_queue()</code> 与乱序红黑树</strong>、<strong>延迟/压缩 ACK</strong>、<strong><code>tcp_data_ready</code> / epoll 就绪判断</strong>，以及 <strong>GRO 与常规 <code>tcp_v4_rcv</code> 的衔接</strong>。文中所有函数、结构体与行号均以当前树中文件为准。</p><hr><h2 id=一全景调用链>一、全景调用链</h2><h3 id=11-ipv4-入口与-socket-分发>1.1 IPv4 入口与 socket 分发</h3><p><code>tcp_v4_rcv()</code> 在完成查找 socket、<code>tcp_v4_fill_cb()</code> 填充 <code>TCP_SKB_CB</code> 等前置步骤后，对 <strong>已建立连接</strong> 的 socket 在 <strong>软中断 / NAPI 上下文</strong> 中加 <strong>socket 底半部锁</strong> <code>bh_lock_sock_nested()</code>，再根据 <strong><code>sock_owned_by_user()</code></strong> 决定是 <strong>直接处理</strong> 还是 <strong>入 backlog</strong>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:2829-2846
+</span></span></span><span class=line><span class=cl><span class=nf>bh_lock_sock_nested</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nf>tcp_segs_in</span><span class=p>(</span><span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=n>ret</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>sock_owned_by_user</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=n>skb_to_free</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_rx_skb_cache</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_rx_skb_cache</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>ret</span> <span class=o>=</span> <span class=nf>tcp_v4_do_rcv</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_add_backlog</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>discard_and_relse</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>skb_to_free</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=nf>bh_unlock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p>要点：</p><ul><li><strong><code>sock_owned_by_user(sk)</code> 为真</strong>：表示用户态正持有 <code>sk_lock</code>（例如阻塞在 <code>recvmsg()</code> 等路径），软中断侧 <strong>不能</strong> 在持锁用户上下文中间插入协议处理，因此把 skb <strong>挂到 <code>sk->sk_backlog</code></strong>。</li><li><strong><code>tcp_add_backlog()</code></strong>：完成校验和、尝试与 backlog 尾包合并、<code>sk_add_backlog()</code> 入队；失败则丢包统计（见 <code>net/ipv4/tcp_ipv4.c:2415-2562</code>）。</li></ul><h3 id=12-established-快速进入-tcp_rcv_established>1.2 ESTABLISHED 快速进入 <code>tcp_rcv_established()</code></h3><p><code>tcp_v4_do_rcv()</code> 在 <code>TCP_ESTABLISHED</code> 分支直接调用 <code>tcp_rcv_established()</code>（监听与其它状态走不同分支）。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:2260-2285
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_ESTABLISHED</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_rcv_established</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=13-backlog-的消化路径>1.3 backlog 的消化路径</h3><p>TCP socket 的 <strong><code>sk_backlog_rcv</code></strong> 在 <code>struct proto tcp_prot</code> 上指向 <strong><code>tcp_v4_do_rcv</code></strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:3854
+</span></span></span><span class=line><span class=cl><span class=p>.</span><span class=n>backlog_rcv</span>		<span class=o>=</span> <span class=n>tcp_v4_do_rcv</span><span class=p>,</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>release_sock()</code> 在用户路径释放 socket 锁时，若存在积压则调用 <code>__release_sock()</code>，遍历链表并对每个 skb 调用 <strong><code>sk_backlog_rcv()</code></strong>（对 TCP 即再次进入 <code>tcp_v4_do_rcv()</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/core/sock.c:2698-2721
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>__release_sock</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>,</span> <span class=o>*</span><span class=n>next</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>while</span> <span class=p>((</span><span class=n>skb</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_backlog</span><span class=p>.</span><span class=n>head</span><span class=p>)</span> <span class=o>!=</span> <span class=nb>NULL</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_backlog</span><span class=p>.</span><span class=n>head</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_backlog</span><span class=p>.</span><span class=n>tail</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>spin_unlock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_lock</span><span class=p>.</span><span class=n>slock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>do</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=n>next</span> <span class=o>=</span> <span class=n>skb</span><span class=o>-&gt;</span><span class=n>next</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>			<span class=p>...</span>
+</span></span><span class=line><span class=cl>			<span class=nf>sk_backlog_rcv</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=p>...</span>
+</span></span><span class=line><span class=cl>			<span class=n>skb</span> <span class=o>=</span> <span class=n>next</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span> <span class=k>while</span> <span class=p>(</span><span class=n>skb</span> <span class=o>!=</span> <span class=nb>NULL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>spin_lock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_lock</span><span class=p>.</span><span class=n>slock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_backlog</span><span class=p>.</span><span class=n>len</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/core/sock.c:3289-3304
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>release_sock</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>spin_lock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_lock</span><span class=p>.</span><span class=n>slock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_backlog</span><span class=p>.</span><span class=n>tail</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__release_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_release_ownership</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=14-小结图示>1.4 小结图示</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>flowchart TB
+</span></span><span class=line><span class=cl> subgraph 软中断
+</span></span><span class=line><span class=cl>  A[tcp_v4_rcv] --&gt; B{bh_lock_sock_nested}
+</span></span><span class=line><span class=cl>  B --&gt; C{sock_owned_by_user?}
+</span></span><span class=line><span class=cl>  C --&gt;|否| D[tcp_v4_do_rcv]
+</span></span><span class=line><span class=cl>  C --&gt;|是| E[tcp_add_backlog]
+</span></span><span class=line><span class=cl>  D --&gt; F[tcp_rcv_established]
+</span></span><span class=line><span class=cl> end
+</span></span><span class=line><span class=cl> subgraph 用户态
+</span></span><span class=line><span class=cl>  G[release_sock] --&gt; H[__release_sock]
+</span></span><span class=line><span class=cl>  H --&gt; I[sk_backlog_rcv = tcp_v4_do_rcv]
+</span></span><span class=line><span class=cl>  I --&gt; F
+</span></span><span class=line><span class=cl> end
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=二header-prediction-与快路径>二、Header Prediction 与快路径</h2><h3 id=21-pred_flags-的构成>2.1 <code>pred_flags</code> 的构成</h3><p><code>pred_flags</code> 在 <strong><code>__tcp_fast_path_on()</code></strong> 中写入：将 <strong><code>tcp_header_len</code> 左移 26 位</strong>、与 <strong>ACK 标志位（经 <code>ntohl(TCP_FLAG_ACK)</code>）</strong> 以及 <strong>对端通告窗口 <code>snd_wnd</code>（已按 <code>rx_opt.snd_wscale</code> 缩放）</strong> 组合为网络序字，供后续与 <strong><code>tcp_flag_word(th)</code></strong> 的快速比较使用。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h:680-694
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>__tcp_fast_path_on</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>,</span> <span class=n>u32</span> <span class=n>snd_wnd</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>sk_is_mptcp</span><span class=p>((</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tp</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>tp</span><span class=o>-&gt;</span><span class=n>pred_flags</span> <span class=o>=</span> <span class=nf>htonl</span><span class=p>((</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_header_len</span> <span class=o>&lt;&lt;</span> <span class=mi>26</span><span class=p>)</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>			       <span class=nf>ntohl</span><span class=p>(</span><span class=n>TCP_FLAG_ACK</span><span class=p>)</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>			       <span class=n>snd_wnd</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>tcp_fast_path_on</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>__tcp_fast_path_on</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_wnd</span> <span class=o>&gt;&gt;</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>snd_wscale</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong><code>tcp_fast_path_check()</code></strong>：仅在 <strong>乱序队列为空</strong>、<strong><code>rcv_wnd</code> 非 0</strong>、<strong>接收缓存未顶满</strong>、<strong>无 urg 待处理</strong> 时重新打开快路径。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h:696-705
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>tcp_fast_path_check</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>RB_EMPTY_ROOT</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_wnd</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=nf>atomic_read</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_rmem_alloc</span><span class=p>)</span> <span class=o>&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_rcvbuf</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>urg_data</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_fast_path_on</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=22-tcp_hp_bits哪些标志参与预测比较>2.2 <code>TCP_HP_BITS</code>：哪些标志参与预测比较</h3><p>快路径比较使用 <strong><code>TCP_HP_BITS</code></strong>，其定义为 <strong>保留位与 PSH 从比较中剔除</strong>（PSH 对协议机语义不重要，可忽略以扩大快路径命中率）。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:204-205
+</span></span></span><span class=line><span class=cl><span class=cp>#define TCP_REMNANT (TCP_FLAG_FIN|TCP_FLAG_URG|TCP_FLAG_SYN|TCP_FLAG_PSH)
+</span></span></span><span class=line><span class=cl><span class=cp>#define TCP_HP_BITS (~(TCP_RESERVED_BITS|TCP_FLAG_PSH))
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=23-快路径的三类门闩与时间戳子检查>2.3 快路径的三类门闩与时间戳子检查</h3><p><code>tcp_rcv_established()</code> 在刷新 <code>tcp_mstamp</code>、可选设置 <code>sk_rx_dst</code> 后，先清 <code>rx_opt.saw_tstamp</code>，再判断是否进入快路径。</p><p><strong>主门闩（三条件）：</strong></p><ol><li><strong><code>(tcp_flag_word(th) & TCP_HP_BITS) == tp->pred_flags</code></strong>：当前段 TCP 头标志（除保留位/PSH 外）与 <strong>缓存的期望头模板</strong> 一致；结合 <code>pred_flags</code> 中高位的 <strong><code>tcp_header_len</code></strong>，等价于 <strong>头长与 flags 组合未意外变化</strong>。</li><li><strong><code>TCP_SKB_CB(skb)->seq == tp->rcv_nxt</code></strong>：按序到达。</li><li><strong><code>!after(TCP_SKB_CB(skb)->ack_seq, tp->snd_nxt)</code></strong>：确认序号不超过本端发送窗口前沿（有效 ACK）。</li></ol><p><strong>时间戳子检查</strong>（当头长表明带对齐时间戳选项时）：</p><ul><li>调用 <strong><code>tcp_parse_aligned_timestamp()</code></strong>，失败转慢路径。</li><li><strong><code>(s32)(tp->rx_opt.rcv_tsval - tp->rx_opt.ts_recent) &lt; 0</code></strong> 转慢路径（避免在快路径错误确认 <strong>PAWS</strong> 意义下的时戳单调性）；快路径上 <strong>不</strong> 在此处更新 <code>ts_recent</code>，注释说明是为防止 <strong>校验和损坏误更新 <code>ts_recent</code> 导致连接“僵死”</strong>。</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6951-6974
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>((</span><span class=nf>tcp_flag_word</span><span class=p>(</span><span class=n>th</span><span class=p>)</span> <span class=o>&amp;</span> <span class=n>TCP_HP_BITS</span><span class=p>)</span> <span class=o>==</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>pred_flags</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span> <span class=o>==</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=o>!</span><span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ack_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_nxt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>tcp_header_len</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_header_len</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tcp_header_len</span> <span class=o>==</span> <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcphdr</span><span class=p>)</span> <span class=o>+</span> <span class=n>TCPOLEN_TSTAMP_ALIGNED</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_parse_aligned_timestamp</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>th</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=k>goto</span> <span class=n>slow_path</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>((</span><span class=n>s32</span><span class=p>)(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsval</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>ts_recent</span><span class=p>)</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=k>goto</span> <span class=n>slow_path</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>内核注释归纳的 <strong>快路径被禁用</strong> 条件（与 <code>pred_flags</code> / 队列 / 缓冲等有关）见 <code>tcp_rcv_established()</code> 文件头注释 <strong><code>net/ipv4/tcp_input.c:6871-6892</code></strong>。</p><hr><h2 id=三快路径处理>三、快路径处理</h2><h3 id=31-纯-ack-包len--tcp_header_len>3.1 纯 ACK 包（<code>len == tcp_header_len</code>）</h3><p>无负载时，若携带对齐时间戳且 <strong><code>rcv_nxt == rcv_wup</code></strong>，调用 <strong><code>tcp_store_ts_recent()</code></strong> 更新 <strong>RFC 7323</strong> 的 <strong><code>ts_recent</code></strong>。随后 <strong><code>tcp_ack(sk, skb, 0)</code></strong> 处理对端 ACK，释放 skb，<strong><code>tcp_data_snd_check()</code></strong> 推动待发数据。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6977-6993
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>len</span> <span class=o>&lt;=</span> <span class=n>tcp_header_len</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>len</span> <span class=o>==</span> <span class=n>tcp_header_len</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>tcp_header_len</span> <span class=o>==</span>
+</span></span><span class=line><span class=cl>		    <span class=p>(</span><span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcphdr</span><span class=p>)</span> <span class=o>+</span> <span class=n>TCPOLEN_TSTAMP_ALIGNED</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>		    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span> <span class=o>==</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_wup</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_store_ts_recent</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__kfree_skb</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_data_snd_check</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_rtt_last_tsecr</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>TCP_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>TCP_MIB_INERRS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong><code>tcp_data_snd_check()</code></strong> 内联为 <strong><code>tcp_push_pending_frames()</code></strong> + <strong><code>tcp_check_space()</code></strong>（发送侧检查，与 ACK 处理衔接）。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6562-6566
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>tcp_data_snd_check</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_push_pending_frames</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_check_space</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=32-数据包快路径>3.2 数据包快路径</h3><ol><li><strong><code>tcp_checksum_complete(skb)</code></strong>：失败走 <code>csum_error</code>。</li><li><strong><code>skb->truesize > sk->sk_forward_alloc</code></strong>：走 <strong><code>step5</code></strong> 慢路径（内存预分配不足时避免在快路径硬塞）。</li><li>时间戳存储与 <strong><code>tcp_rcv_rtt_measure_ts()</code></strong>。</li><li><strong><code>__skb_pull(skb, tcp_header_len)</code></strong> 后 <strong><code>tcp_queue_rcv()</code></strong> 入 <strong><code>sk_receive_queue</code></strong> 并推进 <strong><code>rcv_nxt</code></strong>。</li><li><strong><code>tcp_event_data_recv()</code></strong> 更新接收侧度量。</li><li>若 <strong><code>ack_seq != snd_una</code></strong>：<strong><code>tcp_ack(sk, skb, FLAG_DATA)</code></strong> + <strong><code>tcp_data_snd_check()</code></strong>；若此后不再调度 ACK，则跳到 <strong><code>no_ack</code></strong>。否则仅 <strong><code>tcp_update_wl()</code></strong> 更新窗口左边界相关状态。</li><li><strong><code>__tcp_ack_snd_check(sk, 0)</code></strong>：<code>ofo_possible=0</code> 表示快路径上 <strong>不</strong> 把乱序队列纳入“可延迟 ACK”压缩逻辑（与慢路径 <code>tcp_ack_snd_check(sk)</code> 默认传 1 不同）。</li><li><strong><code>tcp_data_ready(sk)</code></strong> 唤醒读端。</li></ol><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6999-7051
+</span></span></span><span class=line><span class=cl><span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>eaten</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>bool</span> <span class=n>fragstolen</span> <span class=o>=</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_checksum_complete</span><span class=p>(</span><span class=n>skb</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>csum_error</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>((</span><span class=kt>int</span><span class=p>)</span><span class=n>skb</span><span class=o>-&gt;</span><span class=n>truesize</span> <span class=o>&gt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_forward_alloc</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>step5</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tcp_header_len</span> <span class=o>==</span>
+</span></span><span class=line><span class=cl>	    <span class=p>(</span><span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcphdr</span><span class=p>)</span> <span class=o>+</span> <span class=n>TCPOLEN_TSTAMP_ALIGNED</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span> <span class=o>==</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_wup</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_store_ts_recent</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_rcv_rtt_measure_ts</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_TCPHPHITS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>__skb_pull</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>tcp_header_len</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=n>eaten</span> <span class=o>=</span> <span class=nf>tcp_queue_rcv</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fragstolen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_event_data_recv</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ack_seq</span> <span class=o>!=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_una</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>FLAG_DATA</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_data_snd_check</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>inet_csk_ack_scheduled</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=k>goto</span> <span class=n>no_ack</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_update_wl</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>__tcp_ack_snd_check</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>no_ack</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>eaten</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>kfree_skb_partial</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>fragstolen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_data_ready</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四慢路径处理>四、慢路径处理</h2><h3 id=41-进入慢路径的入口>4.1 进入慢路径的入口</h3><p>快路径主条件不满足、时间戳子检查失败、或快路径数据包 <strong>forward_alloc</strong> 不足 <strong><code>goto step5</code></strong>，均落到 <strong><code>slow_path:</code></strong>。慢路径首先校验 <strong>最小头长与整包校验和</strong>，且必须 <strong>至少含 ACK/RST/SYN 之一</strong>。</p><h3 id=42-tcp_validate_incomingpaws序列窗口rstsyn>4.2 <code>tcp_validate_incoming()</code>：PAWS、序列窗口、RST、SYN</h3><p>该函数失败时 <strong>丢弃 skb 并返回 false</strong>；成功返回 true。</p><p>主要阶段（源码注释已用中文概括）：</p><ol><li><strong>PAWS</strong>：<code>tcp_fast_parse_options()</code> + <code>tcp_paws_discard()</code>；非 RST 时可能 <strong><code>tcp_send_dupack()</code></strong> 后丢弃。</li><li><strong><code>tcp_sequence()</code></strong>：判断 <strong><code>seq/end_seq</code> 与接收窗口</strong> 关系；窗外非 RST 可能 <strong><code>tcp_send_dupack()</code></strong>；RST 在 <strong><code>tcp_reset_check()</code></strong> 等条件下 <strong><code>tcp_reset()</code></strong>。</li><li><strong>RST</strong>：按 <strong>RFC 5961</strong> 做序列号匹配，否则 <strong><code>tcp_send_challenge_ack()</code></strong>。</li><li><strong>SYN</strong>：<strong>Challenge ACK</strong> 路径。</li><li><strong><code>bpf_skops_parse_hdr()</code></strong> BPF 钩子。</li></ol><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6761-6868
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>bool</span> <span class=nf>tcp_validate_incoming</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				  <span class=k>const</span> <span class=k>struct</span> <span class=n>tcphdr</span> <span class=o>*</span><span class=n>th</span><span class=p>,</span> <span class=kt>int</span> <span class=n>syn_inerr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_fast_parse_options</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>skb</span><span class=p>,</span> <span class=n>th</span><span class=p>,</span> <span class=n>tp</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>saw_tstamp</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=nf>tcp_paws_discard</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_sequence</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>rst</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>syn</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl><span class=nl>syn_challenge</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_challenge_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=nf>bpf_skops_parse_hdr</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=nb>true</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=nl>discard</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_drop</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=43-慢路径-ackurg-与数据排队>4.3 慢路径 ACK、URG 与数据排队</h3><p>通过校验后：</p><ul><li><strong><code>tcp_ack(sk, skb, FLAG_SLOWPATH | FLAG_UPDATE_TS_RECENT)</code></strong>：慢路径允许 <strong><code>FLAG_UPDATE_TS_RECENT</code></strong> 语义（与快路径刻意延迟更新 <code>ts_recent</code> 对比）。</li><li><strong><code>tcp_urg()</code></strong>：urg 处理，其中 <strong><code>tcp_check_urg()</code></strong> 在 <strong><code>tp->pred_flags = 0</code></strong> 显式关闭快路径。</li><li><strong><code>tcp_data_queue(sk, skb)</code></strong>：数据段入接收队列或 OFO。</li><li><strong><code>tcp_data_snd_check()</code></strong> + <strong><code>tcp_ack_snd_check()</code></strong>（后者内部 <strong><code>__tcp_ack_snd_check(sk, 1)</code></strong>，允许 <strong>OFO 下的压缩 ACK</strong> 逻辑）。</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:7055-7088
+</span></span></span><span class=line><span class=cl><span class=nl>slow_path</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>len</span> <span class=o>&lt;</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>doff</span> <span class=o>&lt;&lt;</span> <span class=mi>2</span><span class=p>)</span> <span class=o>||</span> <span class=nf>tcp_checksum_complete</span><span class=p>(</span><span class=n>skb</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>csum_error</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>ack</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>rst</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>syn</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_validate_incoming</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>th</span><span class=p>,</span> <span class=mi>1</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>step5</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>FLAG_SLOWPATH</span> <span class=o>|</span> <span class=n>FLAG_UPDATE_TS_RECENT</span><span class=p>)</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_rcv_rtt_measure_ts</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_urg</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>th</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_data_queue</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_data_snd_check</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_ack_snd_check</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=五tcp_data_queue-数据排队>五、<code>tcp_data_queue()</code> 数据排队</h2><h3 id=51-按序到达seq--rcv_nxt>5.1 按序到达（<code>seq == rcv_nxt</code>）</h3><p><code>tcp_data_queue()</code> 在 MPTCP 分支、空段、<code>__skb_pull</code> 去掉 TCP 头后，若 <strong><code>TCP_SKB_CB(skb)->seq == tp->rcv_nxt</code></strong> 且 <strong>接收窗口非 0</strong>，进入 <strong><code>queue_and_out:</code></strong>：内存调度后 <strong><code>tcp_queue_rcv()</code></strong>。</p><p><strong><code>tcp_queue_rcv()</code></strong> 尝试 <strong><code>tcp_try_coalesce()</code></strong> 把新段并入 <strong><code>sk_receive_queue</code></strong> 尾部 skb；无论如何调用 <strong><code>tcp_rcv_nxt_update()</code></strong> 推进 <strong><code>rcv_nxt</code></strong>；若未合并则 <strong><code>__skb_queue_tail()</code></strong> 并 <strong><code>skb_set_owner_r()</code></strong>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:5921-5944
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=n>__must_check</span> <span class=nf>tcp_queue_rcv</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				      <span class=kt>bool</span> <span class=o>*</span><span class=n>fragstolen</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>eaten</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>tail</span> <span class=o>=</span> <span class=nf>skb_peek_tail</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_receive_queue</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>eaten</span> <span class=o>=</span> <span class=p>(</span><span class=n>tail</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>		 <span class=nf>tcp_try_coalesce</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>tail</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				  <span class=n>skb</span><span class=p>,</span> <span class=n>fragstolen</span><span class=p>))</span> <span class=o>?</span> <span class=mi>1</span> <span class=o>:</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_rcv_nxt_update</span><span class=p>(</span><span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>eaten</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__skb_queue_tail</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_receive_queue</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>skb_set_owner_r</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>eaten</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>按序路径上随后：<strong><code>tcp_event_data_recv()</code></strong>、<strong>FIN → <code>tcp_fin()</code></strong>、若 OFO 非空则 <strong><code>tcp_ofo_queue()</code></strong> Drain、<strong><code>tcp_sack_remove()</code></strong>、<strong><code>tcp_fast_path_check(sk)</code></strong>、合并成功则 <strong><code>kfree_skb_partial()</code></strong>，最后 <strong><code>tcp_data_ready(sk)</code></strong>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6064-6122
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span> <span class=o>==</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_receive_window</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>==</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_TCPZEROWINDOWDROP</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out_of_window</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=nl>queue_and_out</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=n>eaten</span> <span class=o>=</span> <span class=nf>tcp_queue_rcv</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fragstolen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>skb</span><span class=o>-&gt;</span><span class=n>len</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_event_data_recv</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>tcp_flags</span> <span class=o>&amp;</span> <span class=n>TCPHDR_FIN</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_fin</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>RB_EMPTY_ROOT</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_ofo_queue</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>RB_EMPTY_ROOT</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>|=</span> <span class=n>ICSK_ACK_NOW</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>num_sacks</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_sack_remove</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_fast_path_check</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>eaten</span> <span class=o>&gt;</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>kfree_skb_partial</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>fragstolen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_data_ready</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=52-tcp_ofo_queuegap-填平后从红黑树并入接收队列>5.2 <code>tcp_ofo_queue()</code>：gap 填平后从红黑树并入接收队列</h3><p>从左端开始，若 <strong><code>seq > rcv_nxt</code></strong> 则终止；否则处理 <strong>D-SACK 扩展</strong>、从树摘除；若 <strong><code>end_seq &lt;= rcv_nxt</code></strong> 为完全重复则 <strong><code>tcp_drop()</code></strong>；否则尝试 <strong>coalesce 入接收队列</strong> 并 <strong><code>tcp_rcv_nxt_update()</code></strong>；遇 <strong>FIN</strong> 则 <strong><code>tcp_fin()</code></strong> 并 break。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:5651-5705
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_ofo_queue</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=n>p</span> <span class=o>=</span> <span class=nf>rb_first</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>while</span> <span class=p>(</span><span class=n>p</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>skb</span> <span class=o>=</span> <span class=nf>rb_to_skb</span><span class=p>(</span><span class=n>p</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>		<span class=n>p</span> <span class=o>=</span> <span class=nf>rb_next</span><span class=p>(</span><span class=n>p</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>rb_erase</span><span class=p>(</span><span class=o>&amp;</span><span class=n>skb</span><span class=o>-&gt;</span><span class=n>rbnode</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=o>!</span><span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_drop</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=k>continue</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>		<span class=n>tail</span> <span class=o>=</span> <span class=nf>skb_peek_tail</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_receive_queue</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>eaten</span> <span class=o>=</span> <span class=n>tail</span> <span class=o>&amp;&amp;</span> <span class=nf>tcp_try_coalesce</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>tail</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fragstolen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_rcv_nxt_update</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>fin</span> <span class=o>=</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>tcp_flags</span> <span class=o>&amp;</span> <span class=n>TCPHDR_FIN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>eaten</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=nf>__skb_queue_tail</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_receive_queue</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>else</span>
+</span></span><span class=line><span class=cl>			<span class=nf>kfree_skb_partial</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>fragstolen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=n>fin</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_fin</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=53-完全重复end_seq--rcv_nxt>5.3 完全重复（<code>end_seq &lt;= rcv_nxt</code>）</h3><p><strong><code>tcp_rcv_spurious_retrans()</code></strong>、统计 <strong><code>DELAYEDACKLOST</code></strong>、<strong><code>tcp_dsack_set()</code></strong> 标注重传/重复范围（若启用 SACK+sysctl）、<strong><code>tcp_enter_quickack_mode()</code></strong> + <strong><code>inet_csk_schedule_ack()</code></strong>，最后 <strong><code>tcp_drop()</code></strong>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6126-6142
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_rcv_spurious_retrans</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>INSIDE_NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_DELAYEDACKLOST</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_dsack_set</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>out_of_window</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_enter_quickack_mode</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_MAX_QUICKACKS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_csk_schedule_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>drop</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_drop</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong><code>tcp_dsack_set()</code></strong> 在 <strong>TCP 支持 SACK 且 <code>sysctl_tcp_dsack</code></strong> 时写入 <strong><code>tp->duplicate_sack[]</code></strong> 并置 <strong><code>rx_opt.dsack</code></strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:5359-5377
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_dsack_set</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u32</span> <span class=n>seq</span><span class=p>,</span> <span class=n>u32</span> <span class=n>end_seq</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_is_sack</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_dsack</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>		<span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>dsack</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>tp</span><span class=o>-&gt;</span><span class=n>duplicate_sack</span><span class=p>[</span><span class=mi>0</span><span class=p>].</span><span class=n>start_seq</span> <span class=o>=</span> <span class=n>seq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>tp</span><span class=o>-&gt;</span><span class=n>duplicate_sack</span><span class=p>[</span><span class=mi>0</span><span class=p>].</span><span class=n>end_seq</span> <span class=o>=</span> <span class=n>end_seq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=54-部分重叠seq--rcv_nxt--end_seq>5.4 部分重叠（<code>seq &lt; rcv_nxt &lt; end_seq</code>）</h3><p><strong><code>tcp_dsack_set(sk, seq, rcv_nxt)</code></strong> 标记与已接收区重叠部分；若窗口为 0 走 <strong><code>out_of_window</code></strong>；否则 <strong><code>goto queue_and_out</code></strong>（剩余新数据在后续路径由合并/队列逻辑消纳）。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6150-6162
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>before</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_dsack_set</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_receive_window</span><span class=p>(</span><span class=n>tp</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_TCPZEROWINDOWDROP</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out_of_window</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>goto</span> <span class=n>queue_and_out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=55-乱序seq--rcv_nxt-tcp_data_queue_ofo>5.5 乱序（<code>seq > rcv_nxt</code>）— <code>tcp_data_queue_ofo()</code></h3><ul><li><strong><code>tcp_try_rmem_schedule()</code></strong> 失败：统计 <strong><code>TCPOFODROP</code></strong>，<strong><code>sk->sk_data_ready</code></strong> 触发后 <strong><code>tcp_drop()</code></strong>。</li><li><strong><code>tp->pred_flags = 0</code></strong>：<strong>关闭快路径</strong>。</li><li><strong><code>inet_csk_schedule_ack(sk)</code></strong>：驱动 ACK/DupACK 路径。</li><li>红黑树插入：<strong><code>ooo_last_skb</code> 快路径</strong>、<strong><code>tcp_ooo_try_coalesce()</code></strong>、完整 <strong><code>while (*p)</code></strong> 重叠检测（全包含则 <strong><code>tcp_dsack_set()</code></strong> 后丢包；部分重叠 <strong><code>tcp_dsack_set()</code></strong>；可 <strong><code>rb_replace_node()</code></strong> + <strong><code>tcp_dsack_extend()</code></strong> 等）。</li><li><strong><code>merge_right</code></strong> 循环删除被覆盖节点并 <strong><code>tcp_dsack_extend()</code></strong>。</li><li><strong><code>tcp_sack_new_ofo_skb()</code></strong> 维护 SACK 块（SACK 开启时）。</li></ul><p>核心片段：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:5757-5905
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_data_queue_ofo</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=nf>tcp_try_rmem_schedule</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>skb</span><span class=o>-&gt;</span><span class=n>truesize</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_TCPOFODROP</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=nf>sk_data_ready</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_drop</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=n>tp</span><span class=o>-&gt;</span><span class=n>pred_flags</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_csk_schedule_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_ooo_try_coalesce</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>ooo_last_skb</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fragstolen</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl><span class=nl>coalesce_done</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>		<span class=nf>kfree_skb_partial</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>fragstolen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>skb</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>add_sack</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=k>while</span> <span class=p>(</span><span class=o>*</span><span class=n>p</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>parent</span> <span class=o>=</span> <span class=o>*</span><span class=n>p</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>skb1</span> <span class=o>=</span> <span class=nf>rb_to_skb</span><span class=p>(</span><span class=n>parent</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>before</span><span class=p>(</span><span class=n>seq</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb1</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>after</span><span class=p>(</span><span class=n>end_seq</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb1</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>				<span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>					      <span class=n>LINUX_MIB_TCPOFOMERGE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>				<span class=nf>tcp_drop</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>				<span class=n>skb</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>				<span class=nf>tcp_dsack_set</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>seq</span><span class=p>,</span> <span class=n>end_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>				<span class=k>goto</span> <span class=n>add_sack</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>			<span class=p>}</span>
+</span></span><span class=line><span class=cl>			<span class=k>if</span> <span class=p>(</span><span class=nf>after</span><span class=p>(</span><span class=n>seq</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb1</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>				<span class=nf>tcp_dsack_set</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>seq</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb1</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>				<span class=nf>rb_replace_node</span><span class=p>(</span><span class=o>&amp;</span><span class=n>skb1</span><span class=o>-&gt;</span><span class=n>rbnode</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>skb</span><span class=o>-&gt;</span><span class=n>rbnode</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>						<span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>				<span class=nf>tcp_dsack_extend</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>						 <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb1</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>						 <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb1</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>				<span class=p>...</span>
+</span></span><span class=line><span class=cl>				<span class=nf>tcp_drop</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>				<span class=k>goto</span> <span class=n>merge_right</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>			<span class=p>}</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_ooo_try_coalesce</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb1</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fragstolen</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=k>goto</span> <span class=n>coalesce_done</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>		<span class=n>p</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>parent</span><span class=o>-&gt;</span><span class=n>rb_right</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=nl>merge_right</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>while</span> <span class=p>((</span><span class=n>skb1</span> <span class=o>=</span> <span class=nf>skb_rb_next</span><span class=p>(</span><span class=n>skb</span><span class=p>))</span> <span class=o>!=</span> <span class=nb>NULL</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=nl>add_sack</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_is_sack</span><span class=p>(</span><span class=n>tp</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_sack_new_ofo_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>seq</span><span class=p>,</span> <span class=n>end_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>end</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=六延迟-ack-决策>六、延迟 ACK 决策</h2><p><strong><code>__tcp_ack_snd_check(sk, ofo_possible)</code></strong> 逻辑要点：</p><ol><li><strong>立即发送 ACK</strong>（<code>tcp_send_ack</code>）若：<ul><li><strong>接收序号推进超过 <code>rcv_mss</code></strong>，且 <strong>（未达 <code>sk_rcvlowat</code> 或 选中窗口 <code>>= rcv_wnd</code>）</strong>；</li><li>或 <strong><code>tcp_in_quickack_mode()</code></strong>；</li><li>或 <strong><code>ICSK_ACK_NOW</code></strong>。</li></ul></li><li>若 <strong><code>!ofo_possible</code> 或 OFO 为空</strong>：<strong><code>tcp_send_delayed_ack()</code></strong>。</li><li>否则进入 <strong>压缩 ACK</strong>：若 SACK 能力 <strong><code>tcp_is_sack(tp)</code></strong> 且 <strong><code>compressed_ack</code></strong> 未超 <strong><code>sysctl_tcp_comp_sack_nr</code></strong>，在 <strong>DupACK 计数越过快速重传阈值</strong> 后递增 <strong><code>compressed_ack</code></strong>，并用 <strong><code>hrtimer_start_range_ns()</code></strong> 启动 <strong><code>compressed_ack_timer</code></strong>，延迟取 <strong><code>min(sysctl_tcp_comp_sack_delay_ns, rtt/20)</code></strong> 量级。</li></ol><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6571-6627
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>__tcp_ack_snd_check</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>ofo_possible</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>rtt</span><span class=p>,</span> <span class=n>delay</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(((</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_wup</span><span class=p>)</span> <span class=o>&gt;</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>rcv_mss</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>copied_seq</span> <span class=o>&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_rcvlowat</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	     <span class=nf>__tcp_select_window</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>&gt;=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_wnd</span><span class=p>))</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=nf>tcp_in_quickack_mode</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>&amp;</span> <span class=n>ICSK_ACK_NOW</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl><span class=nl>send_now</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>ofo_possible</span> <span class=o>||</span> <span class=nf>RB_EMPTY_ROOT</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_delayed_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_is_sack</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack</span> <span class=o>&gt;=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_nr</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>send_now</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=n>delay</span> <span class=o>=</span> <span class=kt>min_t</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>		      <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_delay_ns</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>		      <span class=n>rtt</span> <span class=o>*</span> <span class=p>(</span><span class=n>NSEC_PER_USEC</span> <span class=o>&gt;&gt;</span> <span class=mi>3</span><span class=p>)</span><span class=o>/</span><span class=mi>20</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_hold</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>hrtimer_start_range_ns</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack_timer</span><span class=p>,</span> <span class=nf>ns_to_ktime</span><span class=p>(</span><span class=n>delay</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>			       <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_slack_ns</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>			       <span class=n>HRTIMER_MODE_REL_PINNED_SOFT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong><code>tcp_ack_snd_check()</code></strong> 仅在 <strong><code>inet_csk_ack_scheduled(sk)</code></strong> 为真时调用 <strong><code>__tcp_ack_snd_check(sk, 1)</code></strong>（<code>net/ipv4/tcp_input.c:6630-6636</code>）。</p><hr><h2 id=七数据就绪与唤醒>七、数据就绪与唤醒</h2><h3 id=71-tcp_data_ready>7.1 <code>tcp_data_ready()</code></h3><p>当 <strong><code>tcp_epollin_ready(sk, sk->sk_rcvlowat)</code></strong> 为真，或 <strong><code>SOCK_DONE</code></strong>（如半关闭读侧）时，调用 <strong><code>sk->sk_data_ready(sk)</code></strong>（默认 <strong><code>sock_def_readable</code></strong>）。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6005-6011
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_data_ready</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_epollin_ready</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_rcvlowat</span><span class=p>)</span> <span class=o>||</span> <span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DONE</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=nf>sk_data_ready</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=72-tcp_epollin_ready可读字节与压力例外>7.2 <code>tcp_epollin_ready()</code>：可读字节与压力例外</h3><p><strong><code>avail = rcv_nxt - copied_seq</code></strong>；<code>avail &lt;= 0</code> 不唤醒。否则 <strong><code>avail >= target</code></strong>、<strong><code>tcp_rmem_pressure()</code></strong> 或 <strong>接收窗口不大于 <code>rcv_mss</code></strong> 时返回 true。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h:1615-1633
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>tcp_epollin_ready</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>target</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>avail</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>)</span> <span class=o>-</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>copied_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>avail</span> <span class=o>&lt;=</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=p>(</span><span class=n>avail</span> <span class=o>&gt;=</span> <span class=n>target</span><span class=p>)</span> <span class=o>||</span> <span class=nf>tcp_rmem_pressure</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	       <span class=p>(</span><span class=nf>tcp_receive_window</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&lt;=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>rcv_mss</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=73-sock_def_readableepollpoll-唤醒掩码>7.3 <code>sock_def_readable()</code>：epoll/<code>poll</code> 唤醒掩码</h3><p><strong><code>wake_up_interruptible_sync_poll(..., EPOLLIN | EPOLLPRI | EPOLLRDNORM | EPOLLRDBAND)</code></strong>，并 <strong><code>sk_wake_async(..., POLL_IN)</code></strong>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/core/sock.c:3082-3102
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>sock_def_readable</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>socket_wq</span> <span class=o>*</span><span class=n>wq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>rcu_read_lock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>	<span class=n>wq</span> <span class=o>=</span> <span class=nf>rcu_dereference</span><span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_wq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>skwq_has_sleeper</span><span class=p>(</span><span class=n>wq</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=nf>wake_up_interruptible_sync_poll</span><span class=p>(</span><span class=o>&amp;</span><span class=n>wq</span><span class=o>-&gt;</span><span class=n>wait</span><span class=p>,</span> <span class=n>EPOLLIN</span> <span class=o>|</span> <span class=n>EPOLLPRI</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>						<span class=n>EPOLLRDNORM</span> <span class=o>|</span> <span class=n>EPOLLRDBAND</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_wake_async</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_WAKE_WAITD</span><span class=p>,</span> <span class=n>POLL_IN</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>rcu_read_unlock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=八gro-与-tcp-接收的交互>八、GRO 与 TCP 接收的交互</h2><h3 id=81-驱动到-napi_gro_receive>8.1 驱动到 <code>napi_gro_receive()</code></h3><p>驱动在 <strong><code>napi_poll</code></strong> 中对每个 skb 调用 <strong><code>napi_gro_receive()</code></strong>；其内 <strong><code>dev_gro_receive()</code></strong> → （IPv4）<strong><code>inet_gro_receive()</code></strong> → <strong><code>tcp4_gro_receive()</code></strong> → <strong><code>tcp_gro_receive()</code></strong>。入口注释与流程见 <strong><code>net/core/dev.c:6677-6708</code></strong>。</p><h3 id=82-tcp4_gro_receive校验和与委托>8.2 <code>tcp4_gro_receive()</code>：校验和与委托</h3><p>若当前包尚未被标记 flush，则 <strong><code>skb_gro_checksum_validate()</code></strong> 失败时 <strong><code>NAPI_GRO_CB(skb)->flush = 1</code></strong>，否则进入 <strong><code>tcp_gro_receive()</code></strong>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_offload.c:610-623
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=nf>tcp4_gro_receive</span><span class=p>(</span><span class=k>struct</span> <span class=n>list_head</span> <span class=o>*</span><span class=n>head</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>NAPI_GRO_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>flush</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=nf>skb_gro_checksum_validate</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>IPPROTO_TCP</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				      <span class=n>inet_gro_compute_pseudo</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>NAPI_GRO_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>flush</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=nf>tcp_gro_receive</span><span class=p>(</span><span class=n>head</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=83-tcp_gro_receive同流ackseq-连续选项一致>8.3 <code>tcp_gro_receive()</code>：同流、ACK、<code>seq</code> 连续、选项一致</h3><p>合并前在 GRO 链表上匹配 <strong><code>same_flow</code></strong> 且 <strong>四元组端口一致</strong> 的暂存包 <strong><code>p</code></strong>，然后累积 <strong><code>flush</code></strong> 条件：</p><ul><li>新包含 <strong>CWR</strong>；</li><li><strong>标志</strong> 与 <strong><code>p</code></strong> 在 <strong>除 CWR/FIN/PSH 外</strong> 必须一致；</li><li><strong><code>ack_seq</code> 相同</strong>；</li><li><strong>TCP 选项逐 4 字节比较相同</strong>（时间戳变化会导致不合并）；</li><li><strong>新包数据长度</strong> 不允许超过 <strong><code>p</code> 的 <code>gso_size</code></strong>；</li><li><strong><code>ntohl(th2->seq) + skb_gro_len(p) == ntohl(th->seq)</code></strong>（序号连续）。</li></ul><p><strong><code>flush</code> 上送触发</strong>（<code>out_check_final</code>）：<strong><code>len &lt; mss</code></strong>（短尾包）或 <strong>URG/PSH/RST/SYN/FIN</strong> 任一存在；或 <strong>同流匹配失败</strong> 时 flush 已暂存包 <strong><code>p</code></strong>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_offload.c:381-556
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=nf>tcp_gro_receive</span><span class=p>(</span><span class=k>struct</span> <span class=n>list_head</span> <span class=o>*</span><span class=n>head</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=n>flush</span> <span class=o>|=</span> <span class=p>(</span><span class=n>__force</span> <span class=kt>int</span><span class=p>)(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>TCP_FLAG_CWR</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=n>flush</span> <span class=o>|=</span> <span class=p>(</span><span class=n>__force</span> <span class=kt>int</span><span class=p>)((</span><span class=n>flags</span> <span class=o>^</span> <span class=nf>tcp_flag_word</span><span class=p>(</span><span class=n>th2</span><span class=p>))</span> <span class=o>&amp;</span>
+</span></span><span class=line><span class=cl>		  <span class=o>~</span><span class=p>(</span><span class=n>TCP_FLAG_CWR</span> <span class=o>|</span> <span class=n>TCP_FLAG_FIN</span> <span class=o>|</span> <span class=n>TCP_FLAG_PSH</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>	<span class=n>flush</span> <span class=o>|=</span> <span class=p>(</span><span class=n>__force</span> <span class=kt>int</span><span class=p>)(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>ack_seq</span> <span class=o>^</span> <span class=n>th2</span><span class=o>-&gt;</span><span class=n>ack_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>for</span> <span class=p>(</span><span class=n>i</span> <span class=o>=</span> <span class=k>sizeof</span><span class=p>(</span><span class=o>*</span><span class=n>th</span><span class=p>);</span> <span class=n>i</span> <span class=o>&lt;</span> <span class=n>thlen</span><span class=p>;</span> <span class=n>i</span> <span class=o>+=</span> <span class=mi>4</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=n>flush</span> <span class=o>|=</span> <span class=o>*</span><span class=p>(</span><span class=n>u32</span> <span class=o>*</span><span class=p>)((</span><span class=n>u8</span> <span class=o>*</span><span class=p>)</span><span class=n>th</span> <span class=o>+</span> <span class=n>i</span><span class=p>)</span> <span class=o>^</span>
+</span></span><span class=line><span class=cl>			 <span class=o>*</span><span class=p>(</span><span class=n>u32</span> <span class=o>*</span><span class=p>)((</span><span class=n>u8</span> <span class=o>*</span><span class=p>)</span><span class=n>th2</span> <span class=o>+</span> <span class=n>i</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=n>flush</span> <span class=o>|=</span> <span class=p>(</span><span class=n>len</span> <span class=o>-</span> <span class=mi>1</span><span class=p>)</span> <span class=o>&gt;=</span> <span class=n>mss</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>flush</span> <span class=o>|=</span> <span class=p>(</span><span class=nf>ntohl</span><span class=p>(</span><span class=n>th2</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>)</span> <span class=o>+</span> <span class=nf>skb_gro_len</span><span class=p>(</span><span class=n>p</span><span class=p>))</span> <span class=o>^</span> <span class=nf>ntohl</span><span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>...</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>flush</span> <span class=o>||</span> <span class=nf>skb_gro_receive</span><span class=p>(</span><span class=n>p</span><span class=p>,</span> <span class=n>skb</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>mss</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out_check_final</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_flag_word</span><span class=p>(</span><span class=n>th2</span><span class=p>)</span> <span class=o>|=</span> <span class=n>flags</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCP_FLAG_FIN</span> <span class=o>|</span> <span class=n>TCP_FLAG_PSH</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>out_check_final</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=n>flush</span> <span class=o>=</span> <span class=n>len</span> <span class=o>&lt;</span> <span class=n>mss</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>flush</span> <span class=o>|=</span> <span class=p>(</span><span class=n>__force</span> <span class=kt>int</span><span class=p>)(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCP_FLAG_URG</span> <span class=o>|</span> <span class=n>TCP_FLAG_PSH</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>					<span class=n>TCP_FLAG_RST</span> <span class=o>|</span> <span class=n>TCP_FLAG_SYN</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>					<span class=n>TCP_FLAG_FIN</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>p</span> <span class=o>&amp;&amp;</span> <span class=p>(</span><span class=o>!</span><span class=nf>NAPI_GRO_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>same_flow</span> <span class=o>||</span> <span class=n>flush</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=n>pp</span> <span class=o>=</span> <span class=n>p</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=nl>out</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>NAPI_GRO_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>flush</span> <span class=o>|=</span> <span class=p>(</span><span class=n>flush</span> <span class=o>!=</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>pp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=84-与-tcp_v4_rcv-的关系>8.4 与 <code>tcp_v4_rcv()</code> 的关系</h3><p>GRO <strong>合并或 flush</strong> 后的 skb 仍作为 <strong>单层 TCP 段</strong> 进入常规 IP 本地投递路径，最终由 <strong><code>tcp_v4_rcv()</code></strong> → <strong><code>tcp_v4_do_rcv()</code></strong> → <strong><code>tcp_rcv_established()</code></strong> 处理。合并大包带 <strong><code>gso_segs</code></strong> 等元数据（<strong><code>tcp_gro_complete()</code></strong>，<code>net/ipv4/tcp_offload.c:572-593</code>），接收端可在单次处理中覆盖多段逻辑长度，但 <strong>状态机与 ACK 行为仍遵循</strong> <code>tcp_rcv_established()</code> / <code>tcp_data_queue()</code> 的语义。</p><hr><h2 id=附录关键符号索引本树路径>附录：关键符号索引（本树路径）</h2><div class=table-wrapper><table><thead><tr><th>符号 / 主题</th><th>主要位置</th></tr></thead><tbody><tr><td><code>tcp_v4_rcv</code> / backlog 分支</td><td><code>net/ipv4/tcp_ipv4.c</code></td></tr><tr><td><code>tcp_v4_do_rcv</code> / <code>tcp_rcv_established</code></td><td><code>net/ipv4/tcp_ipv4.c</code>, <code>net/ipv4/tcp_input.c</code></td></tr><tr><td><code>TCP_HP_BITS</code> / 快路径门闩</td><td><code>net/ipv4/tcp_input.c</code></td></tr><tr><td><code>pred_flags</code> / <code>tcp_fast_path_check</code></td><td><code>include/net/tcp.h</code></td></tr><tr><td><code>tcp_data_queue</code> / OFO / <code>tcp_queue_rcv</code></td><td><code>net/ipv4/tcp_input.c</code></td></tr><tr><td><code>__tcp_ack_snd_check</code> / 压缩 ACK</td><td><code>net/ipv4/tcp_input.c</code></td></tr><tr><td><code>tcp_data_ready</code> / <code>tcp_epollin_ready</code></td><td><code>net/ipv4/tcp_input.c</code>, <code>include/net/tcp.h</code></td></tr><tr><td><code>sock_def_readable</code></td><td><code>net/core/sock.c</code></td></tr><tr><td><code>napi_gro_receive</code> / <code>tcp_gro_receive</code></td><td><code>net/core/dev.c</code>, <code>net/ipv4/tcp_offload.c</code></td></tr></tbody></table></div><hr><p><em>文档基于本仓库 Linux 5.15.78 源码整理；若你本地内核配置（MPTCP、TLS device、BPF 等）不同，部分分支不会在二进制中出现，但源代码路径与条件编译关系仍如上所述。</em></p></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/tcp_rcv_established/>Tcp_rcv_established</a>
+<a href=/tags/tcp_data_queue/>Tcp_data_queue</a>
+<a href=/tags/%E5%BF%AB%E8%B7%AF%E5%BE%84/>快路径</a>
+<a href=/tags/%E6%85%A2%E8%B7%AF%E5%BE%84/>慢路径</a>
+<a href=/tags/%E4%B9%B1%E5%BA%8F%E9%98%9F%E5%88%97/>乱序队列</a>
+<a href=/tags/d-sack/>D-SACK</a>
+<a href=/tags/gro/>GRO</a>
+<a href=/tags/pred_flags/>Pred_flags</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp%E6%95%B0%E6%8D%AE%E5%B0%B1%E7%BB%AA%E4%B8%8Eepoll%E5%94%A4%E9%86%92%E6%9C%BA%E5%88%B6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP数据就绪与Epoll唤醒机制分析</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

@@ -1,0 +1,761 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="Socket 创建与 fd 分配全流程 基于 Linux 5.15.78，以 socket(AF_INET, SOCK_STREAM, 0) 为例，追踪从用户态到内核、从协议族到 fd 表的每一步。重点剖析对象之间的内存布局与关联关系。\n一、全局视角：一次 socket() 调用创建了哪些对象？ 用户态一句 int fd = socket(AF_INET, SOCK_STREAM, 0) 看似只返回一个整数，但内核实际分配了五个核心对象：\n对象 类型 来源 分配方式 socket_alloc struct socket_alloc sockfs inode slab kmem_cache_alloc(sock_inode_cachep) ↳ socket struct socket 嵌在 socket_alloc 内 与 inode 一体分配 ↳ vfs_inode struct inode 嵌在 socket_alloc 内 与 socket 一体分配 sock (tcp_sock) struct tcp_sock tcp_prot.slab sk_alloc() file struct file slab alloc_file_pseudo() 这五个对象通过指针互相关联，形成从 fd 到协议栈的完整链路：\n"><title>Socket 创建与 fd 分配全流程</title><link rel=canonical href=https://1bit2.github.io/p/socket-%E5%88%9B%E5%BB%BA%E4%B8%8E-fd-%E5%88%86%E9%85%8D%E5%85%A8%E6%B5%81%E7%A8%8B/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Socket 创建与 fd 分配全流程"><meta property='og:description' content="Socket 创建与 fd 分配全流程 基于 Linux 5.15.78，以 socket(AF_INET, SOCK_STREAM, 0) 为例，追踪从用户态到内核、从协议族到 fd 表的每一步。重点剖析对象之间的内存布局与关联关系。\n一、全局视角：一次 socket() 调用创建了哪些对象？ 用户态一句 int fd = socket(AF_INET, SOCK_STREAM, 0) 看似只返回一个整数，但内核实际分配了五个核心对象：\n对象 类型 来源 分配方式 socket_alloc struct socket_alloc sockfs inode slab kmem_cache_alloc(sock_inode_cachep) ↳ socket struct socket 嵌在 socket_alloc 内 与 inode 一体分配 ↳ vfs_inode struct inode 嵌在 socket_alloc 内 与 socket 一体分配 sock (tcp_sock) struct tcp_sock tcp_prot.slab sk_alloc() file struct file slab alloc_file_pseudo() 这五个对象通过指针互相关联，形成从 fd 到协议栈的完整链路：\n"><meta property='og:url' content='https://1bit2.github.io/p/socket-%E5%88%9B%E5%BB%BA%E4%B8%8E-fd-%E5%88%86%E9%85%8D%E5%85%A8%E6%B5%81%E7%A8%8B/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='socket'><meta property='article:tag' content='syscall'><meta property='article:tag' content='fd分配'><meta property='article:tag' content='VFS'><meta property='article:tag' content='inet_create'><meta property='article:tag' content='sock_alloc'><meta property='article:tag' content='fdtable'><meta property='article:tag' content='socket_alloc'><meta property='article:tag' content='container_of'><meta property='article:published_time' content='2026-04-22T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-22T00:00:00+00:00'><meta name=twitter:title content="Socket 创建与 fd 分配全流程"><meta name=twitter:description content="Socket 创建与 fd 分配全流程 基于 Linux 5.15.78，以 socket(AF_INET, SOCK_STREAM, 0) 为例，追踪从用户态到内核、从协议族到 fd 表的每一步。重点剖析对象之间的内存布局与关联关系。\n一、全局视角：一次 socket() 调用创建了哪些对象？ 用户态一句 int fd = socket(AF_INET, SOCK_STREAM, 0) 看似只返回一个整数，但内核实际分配了五个核心对象：\n对象 类型 来源 分配方式 socket_alloc struct socket_alloc sockfs inode slab kmem_cache_alloc(sock_inode_cachep) ↳ socket struct socket 嵌在 socket_alloc 内 与 inode 一体分配 ↳ vfs_inode struct inode 嵌在 socket_alloc 内 与 socket 一体分配 sock (tcp_sock) struct tcp_sock tcp_prot.slab sk_alloc() file struct file slab alloc_file_pseudo() 这五个对象通过指针互相关联，形成从 fd 到协议栈的完整链路：\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一全局视角一次-socket-调用创建了哪些对象>一、全局视角：一次 socket() 调用创建了哪些对象？</a></li><li><a href=#二核心谜题为什么-socket-和-inode-捆绑在一起>二、核心谜题：为什么 socket 和 inode 捆绑在一起？</a><ol><li><a href=#21-struct-socket_alloc一次分配两个身份>2.1 <code>struct socket_alloc</code>：一次分配、两个身份</a></li><li><a href=#22-为什么必须有-inode-设计思考>2.2 为什么必须有 inode？— 设计思考</a></li><li><a href=#23-inode-的-7-个使用时刻从创建到释放的生命周期>2.3 inode 的 7 个使用时刻：从创建到释放的生命周期</a></li><li><a href=#24-socket_i-与-sock_inode双向零开销转换>2.4 <code>SOCKET_I</code> 与 <code>SOCK_INODE</code>：双向零开销转换</a></li></ol></li><li><a href=#三调用链全景>三、调用链全景</a></li><li><a href=#四分阶段详细分析>四、分阶段详细分析</a><ol><li><a href=#阶段-1系统调用入口>阶段 1：系统调用入口</a></li><li><a href=#阶段-2sock_alloc--一体分配-socket--inode>阶段 2：sock_alloc — 一体分配 socket + inode</a></li><li><a href=#阶段-3inet_create--协议族对接>阶段 3：inet_create — 协议族对接</a></li><li><a href=#阶段-4sock_map_fd--分配-fd-并安装-file>阶段 4：sock_map_fd — 分配 fd 并安装 file</a></li></ol></li><li><a href=#五对象关系图>五、对象关系图</a><ol><li><a href=#51-创建顺序与关联建立>5.1 创建顺序与关联建立</a></li><li><a href=#52-运行时访问链从-current-到-tcp_sock>5.2 运行时访问链：从 <code>current</code> 到 <code>tcp_sock</code></a></li></ol></li><li><a href=#六vfs-回调路径从-fd-到协议栈>六、VFS 回调路径：从 fd 到协议栈</a></li><li><a href=#七常见问题>七、常见问题</a><ol><li><a href=#q1-alloc_fd-和-fd_install-之间如果失败会怎样>Q1: alloc_fd 和 fd_install 之间如果失败会怎样？</a></li><li><a href=#q2-sock_cloexec-在哪里生效它和-o_cloexec-是什么关系>Q2: SOCK_CLOEXEC 在哪里生效？它和 O_CLOEXEC 是什么关系？</a></li><li><a href=#q3-为什么-socket-要挂在-sockfs-上>Q3: 为什么 socket 要挂在 sockfs 上？</a></li><li><a href=#q4-container_of-转换的安全性>Q4: <code>container_of</code> 转换的安全性？</a></li><li><a href=#q5-一个-socket-对象在整个生命周期中被几个-slab-缓存管理>Q5: 一个 socket 对象在整个生命周期中被几个 slab 缓存管理？</a></li><li><a href=#q6-为什么-fd-是从-next_fd-而非-0-开始搜索next_fd-是-fd-值还是数组下标>Q6: 为什么 fd 是从 <code>next_fd</code> 而非 0 开始搜索？<code>next_fd</code> 是 fd 值还是数组下标？</a></li><li><a href=#q7-fdtable-扩容时如何保证并发安全>Q7: fdtable 扩容时如何保证并发安全？</a></li><li><a href=#q8-closefd-时-fd-号如何回收>Q8: close(fd) 时 fd 号如何回收？</a></li></ol></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/socket-%E5%88%9B%E5%BB%BA%E4%B8%8E-fd-%E5%88%86%E9%85%8D%E5%85%A8%E6%B5%81%E7%A8%8B/>Socket 创建与 fd 分配全流程</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 22, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>18 minute read</time></div></footer></div></header><section class=article-content><h1 id=socket-创建与-fd-分配全流程>Socket 创建与 fd 分配全流程</h1><blockquote><p>基于 Linux 5.15.78，以 <code>socket(AF_INET, SOCK_STREAM, 0)</code> 为例，追踪从用户态到内核、从协议族到 fd 表的每一步。重点剖析对象之间的内存布局与关联关系。</p></blockquote><hr><h2 id=一全局视角一次-socket-调用创建了哪些对象>一、全局视角：一次 socket() 调用创建了哪些对象？</h2><p>用户态一句 <code>int fd = socket(AF_INET, SOCK_STREAM, 0)</code> 看似只返回一个整数，但内核实际分配了<strong>五个核心对象</strong>：</p><div class=table-wrapper><table><thead><tr><th>对象</th><th>类型</th><th>来源</th><th>分配方式</th></tr></thead><tbody><tr><td>socket_alloc</td><td><code>struct socket_alloc</code></td><td>sockfs inode slab</td><td><code>kmem_cache_alloc(sock_inode_cachep)</code></td></tr><tr><td>↳ socket</td><td><code>struct socket</code></td><td>嵌在 socket_alloc 内</td><td>与 inode 一体分配</td></tr><tr><td>↳ vfs_inode</td><td><code>struct inode</code></td><td>嵌在 socket_alloc 内</td><td>与 socket 一体分配</td></tr><tr><td>sock (tcp_sock)</td><td><code>struct tcp_sock</code></td><td>tcp_prot.slab</td><td><code>sk_alloc()</code></td></tr><tr><td>file</td><td><code>struct file</code></td><td>slab</td><td><code>alloc_file_pseudo()</code></td></tr></tbody></table></div><p>这五个对象通过指针互相关联，形成从 fd 到协议栈的完整链路：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>fd (整数)
+</span></span><span class=line><span class=cl> └─→ fdt-&gt;fd[fd] ──→ struct file
+</span></span><span class=line><span class=cl>                       ├── f_op = socket_file_ops
+</span></span><span class=line><span class=cl>                       ├── private_data ──→ struct socket ─┐
+</span></span><span class=line><span class=cl>                       └── f_path.dentry──→ dentry         │
+</span></span><span class=line><span class=cl>                                             └──→ inode ←──┘ (同一 socket_alloc 内)
+</span></span><span class=line><span class=cl>                                                              
+</span></span><span class=line><span class=cl>struct socket                    struct sock (tcp_sock)
+</span></span><span class=line><span class=cl> ├── sk ────────────────────────→ ├── sk_prot = tcp_prot
+</span></span><span class=line><span class=cl> ├── ops = inet_stream_ops        ├── sk_socket ──→ (回指 socket)
+</span></span><span class=line><span class=cl> ├── file ──→ (回指 file)         ├── sk_state = TCP_CLOSE
+</span></span><span class=line><span class=cl> └── wq (等待队列)                └── (cwnd/定时器/队列...)
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=二核心谜题为什么-socket-和-inode-捆绑在一起>二、核心谜题：为什么 socket 和 inode 捆绑在一起？</h2><h3 id=21-struct-socket_alloc一次分配两个身份>2.1 <code>struct socket_alloc</code>：一次分配、两个身份</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/sock.h L1470-1473
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>socket_alloc</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>socket</span> <span class=n>socket</span><span class=p>;</span>     <span class=c1>// BSD socket 层对象
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inode</span> <span class=n>vfs_inode</span><span class=p>;</span>   <span class=c1>// VFS 层 inode
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>这不是"先创建 inode 再创建 socket"，而是一次 <code>kmem_cache_alloc</code> 同时获得两者。</strong> 它们共享同一块内存（从 <code>sock_inode_cache</code> slab 分配），layout 如下：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>           socket_alloc 内存布局（slab 分配的一整块）
+</span></span><span class=line><span class=cl>           ┌──────────────────────────────────────┐ 低地址
+</span></span><span class=line><span class=cl>           │ struct socket                         │
+</span></span><span class=line><span class=cl>           │   ├── state (SS_UNCONNECTED)          │
+</span></span><span class=line><span class=cl>           │   ├── type                            │
+</span></span><span class=line><span class=cl>           │   ├── flags                           │
+</span></span><span class=line><span class=cl>           │   ├── *ops    → inet_stream_ops       │
+</span></span><span class=line><span class=cl>           │   ├── *sk     → tcp_sock              │
+</span></span><span class=line><span class=cl>           │   ├── *file   → struct file           │
+</span></span><span class=line><span class=cl>           │   └── wq                              │
+</span></span><span class=line><span class=cl>           │       └── wait (等待队列头)            │
+</span></span><span class=line><span class=cl>  偏移 ──→ ├──────────────────────────────────────┤
+</span></span><span class=line><span class=cl>           │ struct inode (vfs_inode)               │
+</span></span><span class=line><span class=cl>           │   ├── i_ino (inode 号)                │
+</span></span><span class=line><span class=cl>           │   ├── i_mode = S_IFSOCK | 0777        │
+</span></span><span class=line><span class=cl>           │   ├── i_uid / i_gid                   │
+</span></span><span class=line><span class=cl>           │   └── i_op = sockfs_inode_ops         │
+</span></span><span class=line><span class=cl>           └──────────────────────────────────────┘ 高地址
+</span></span></code></pre></td></tr></table></div></div><h3 id=22-为什么必须有-inode-设计思考>2.2 为什么必须有 inode？— 设计思考</h3><p>Linux 内核所有 I/O 对象必须挂在某个 <code>super_block</code> 上才能被 VFS 识别为"文件"。VFS 的<strong>身份链</strong>是：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>fd (整数) ──→ file ──→ dentry ──→ inode (唯一标识文件身份)
+</span></span></code></pre></td></tr></table></div></div><p><code>alloc_file_pseudo()</code> 要求<strong>必须传入 inode</strong>：没 inode → 没 dentry → 没 <code>struct file</code> → <code>fd_install</code> 装不进去。这是最根本的硬约束。</p><p>围绕这条硬约束，inode 在 socket 场景下还承担四个维度的设计职责：</p><div class=table-wrapper><table><thead><tr><th>维度</th><th>为什么需要 inode</th><th>设计取舍</th></tr></thead><tbody><tr><td><strong>VFS 统一入口</strong></td><td><code>read</code>/<code>write</code>/<code>poll</code>/<code>close</code> 复用 VFS 路径，无需为 socket 另建系统调用分发</td><td>统一 > 性能：多一层间接跳转换取一套框架管所有 I/O</td></tr><tr><td><strong><code>alloc_file_pseudo()</code> 硬约束</strong></td><td>创建 <code>struct file</code> 必须传入 inode 构建 <code>dentry → inode</code></td><td>无法绕过，是 socket 必须建 inode 的直接原因</td></tr><tr><td><strong>安全框架载体</strong></td><td>LSM（SELinux/SMACK）通过 <code>inode->i_security</code> 给 socket 打 sid 标签</td><td>复用 inode 已有 LSM 钩子，避免给 socket 新造一套安全框架</td></tr><tr><td><strong>身份标识</strong></td><td><code>/proc/&lt;pid>/fd/</code> 展示 <code>socket:[ino]</code>，<code>fstat</code> 通过 <code>S_IFSOCK</code> 识别类型</td><td>让 <code>ss</code>/<code>lsof</code>/<code>netstat</code> 能用 ino 关联 fd 与 <code>/proc/net/tcp</code></td></tr><tr><td><strong>sockfs 伪文件系统</strong></td><td>inode 挂在 <code>sockfs</code> 上，使 socket 形式上是"文件"</td><td>遵循"一切皆文件"哲学，复用 dcache/icache 基础设施</td></tr></tbody></table></div><h3 id=23-inode-的-7-个使用时刻从创建到释放的生命周期>2.3 inode 的 7 个使用时刻：从创建到释放的生命周期</h3><p>上一节讲"为什么需要"，本节讲"何时真正被用到"。inode 平时<strong>不承载字节流数据</strong>（socket 数据走 <code>sk_buff</code> + <code>sk_receive_queue</code>/<code>sk_write_queue</code>），但在<strong>身份识别、生命周期、安全审计</strong>三个维度被反复引用。下面按 socket 生命周期的时间轴，列出 inode 被内核访问的 7 个真实时刻。</p><div class=table-wrapper><table><thead><tr><th>#</th><th>时刻</th><th>触发函数 / 源码位置</th><th>使用的 inode 字段</th><th>用户可观察现象</th></tr></thead><tbody><tr><td>①</td><td><strong>创建</strong></td><td><code>sock_alloc</code> [net/socket.c:626]</td><td><code>i_ino</code> / <code>i_mode</code> / <code>i_uid</code> / <code>i_gid</code> / <code>i_op</code></td><td>分配唯一 ino；打上 <code>S_IFSOCK | 0777</code> 类型位</td></tr><tr><td>②</td><td><strong>绑定 file</strong></td><td><code>sock_alloc_file</code> [net/socket.c:455, 468]</td><td>整个 inode 作为 <code>alloc_file_pseudo</code> 入参</td><td>file/dentry 得以构建，fd 才能安装</td></tr><tr><td>③</td><td><strong>关闭</strong></td><td>正常：<code>close() → fput → sock_close → __sock_release(sock, inode)</code>；回滚：<code>sock_release(sock)</code> 中 <code>!sock->file</code> 分支调用 <code>iput(SOCK_INODE(sock))</code> [net/socket.c:673]</td><td><code>i_count</code> 引用计数</td><td><code>i_count</code> 归零 → <code>sock_free_inode</code> 回收 slab</td></tr><tr><td>④</td><td><strong>stat 查询</strong></td><td><code>vfs_fstat → vfs_getattr_nosec</code></td><td><code>i_mode</code> / <code>i_ino</code> / <code>i_uid</code> / <code>i_gid</code></td><td><code>fstat()</code> 返回 <code>S_ISSOCK(st.st_mode)=1</code></td></tr><tr><td>⑤</td><td><strong><code>/proc/&lt;pid>/fd/</code> 展示</strong></td><td><code>sockfs_dname</code> [net/socket.c:355]</td><td><code>d_inode(dentry)->i_ino</code></td><td><code>readlink /proc/pid/fd/3</code> → <code>socket:[12345]</code></td></tr><tr><td>⑥</td><td><strong>修改权限/所有者</strong></td><td><code>sockfs_setattr</code> [net/socket.c:601]</td><td><code>i_uid</code>/<code>i_gid</code>/<code>i_mode</code>，并经 <code>SOCKET_I</code> 同步 <code>sk->sk_uid</code></td><td><code>fchown(fd, ...)</code> 能改 socket 所有者</td></tr><tr><td>⑦</td><td><strong>LSM 安全审计</strong></td><td><code>security_inode_alloc</code> + <code>sockfs_security_xattr_set</code> [net/socket.c:386]</td><td><code>i_security</code>（LSM sid）；<code>security.*</code> xattr</td><td>SELinux 对 socket 操作做权限检查</td></tr></tbody></table></div><p><strong>① 创建：<code>sock_alloc</code> 给 inode 上"户口"</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c sock_alloc()
+</span></span></span><span class=line><span class=cl><span class=n>inode</span> <span class=o>=</span> <span class=nf>new_inode_pseudo</span><span class=p>(</span><span class=n>sock_mnt</span><span class=o>-&gt;</span><span class=n>mnt_sb</span><span class=p>);</span>   <span class=c1>// 触发 sock_alloc_inode() 分配 socket_alloc
+</span></span></span><span class=line><span class=cl><span class=n>sock</span> <span class=o>=</span> <span class=nf>SOCKET_I</span><span class=p>(</span><span class=n>inode</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_ino</span> <span class=o>=</span> <span class=nf>get_next_ino</span><span class=p>();</span>                 <span class=c1>// 唯一身份编号（全局递增）
+</span></span></span><span class=line><span class=cl><span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_mode</span> <span class=o>=</span> <span class=n>S_IFSOCK</span> <span class=o>|</span> <span class=n>S_IRWXUGO</span><span class=p>;</span>          <span class=c1>// 类型位 S_IFSOCK，权限 0777
+</span></span></span><span class=line><span class=cl><span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_uid</span> <span class=o>=</span> <span class=nf>current_fsuid</span><span class=p>();</span>                <span class=c1>// 所有者
+</span></span></span><span class=line><span class=cl><span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_gid</span> <span class=o>=</span> <span class=nf>current_fsgid</span><span class=p>();</span>
+</span></span><span class=line><span class=cl><span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_op</span>  <span class=o>=</span> <span class=o>&amp;</span><span class=n>sockfs_inode_ops</span><span class=p>;</span>              <span class=c1>// 挂 sockfs 的 listxattr / setattr
+</span></span></span></code></pre></td></tr></table></div></div><p>这一刻 inode 拿到编号、类型、权限。同时 LSM 通过 <code>security_inode_alloc()</code> 在 <code>i_security</code> 挂上安全上下文（SELinux 会给每个 socket inode 分配 sid）。</p><p><strong>② 绑定 file：inode 是 <code>alloc_file_pseudo</code> 的硬入参</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c sock_alloc_file()
+</span></span></span><span class=line><span class=cl><span class=n>file</span> <span class=o>=</span> <span class=nf>alloc_file_pseudo</span><span class=p>(</span><span class=nf>SOCK_INODE</span><span class=p>(</span><span class=n>sock</span><span class=p>),</span> <span class=n>sock_mnt</span><span class=p>,</span> <span class=n>dname</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                         <span class=n>O_RDWR</span> <span class=o>|</span> <span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>O_NONBLOCK</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>                         <span class=o>&amp;</span><span class=n>socket_file_ops</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=nf>stream_open</span><span class=p>(</span><span class=nf>SOCK_INODE</span><span class=p>(</span><span class=n>sock</span><span class=p>),</span> <span class=n>file</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>alloc_file_pseudo</code> 内部：<code>d_alloc_pseudo(sock_mnt->mnt_sb, dname)</code> 建 dentry → 把 inode 挂到 <code>dentry->d_inode</code> → 让 <code>file->f_path = {mnt, dentry}</code>。<strong>这是 inode 最关键的用途</strong>：没它整条 VFS 链路断掉。</p><p><strong>③ 关闭：<code>close()</code> 触发 <code>sock_close</code>；inode 由 VFS 的 <code>iput</code> 链路回收</strong></p><p>正常路径 <code>close(fd)</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 关闭链路
+</span></span></span><span class=line><span class=cl><span class=nf>close</span><span class=p>(</span><span class=n>fd</span><span class=p>)</span> <span class=err>→</span> <span class=n>filp_close</span> <span class=err>→</span> <span class=n>fput</span>
+</span></span><span class=line><span class=cl>         <span class=err>→</span> <span class=n>file</span><span class=o>-&gt;</span><span class=n>f_op</span><span class=o>-&gt;</span><span class=nf>release</span>  <span class=p>(</span><span class=o>=</span> <span class=n>sock_close</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>         <span class=err>→</span> <span class=nf>__sock_release</span><span class=p>(</span><span class=nf>SOCKET_I</span><span class=p>(</span><span class=n>inode</span><span class=p>),</span> <span class=n>inode</span><span class=p>)</span>   <span class=c1>// inode 非 NULL
+</span></span></span><span class=line><span class=cl>              <span class=n>sock</span><span class=o>-&gt;</span><span class=n>ops</span><span class=o>-&gt;</span><span class=nf>release</span><span class=p>(</span><span class=n>sock</span><span class=p>);</span>             <span class=c1>// 协议栈释放（tcp_close 等）
+</span></span></span><span class=line><span class=cl>              <span class=n>sock</span><span class=o>-&gt;</span><span class=n>sk</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>              <span class=n>sock</span><span class=o>-&gt;</span><span class=n>ops</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>              <span class=c1>// sock-&gt;file 仍然非 NULL → 跳过 iput 分支
+</span></span></span></code></pre></td></tr></table></div></div><p>注意 <code>__sock_release</code> 在 <code>sock->file != NULL</code> 时<strong>不主动调用 <code>iput</code></strong>（<a class=link href=../../../net/socket.c>net/socket.c:671-677</a>）。inode 的释放由 VFS 链路接管：<code>fput</code> 引用归零 → <code>__fput</code> → <code>iput</code> → <code>i_callback</code> → <code>sock_free_inode</code> → <code>kmem_cache_free(sock_inode_cachep, ei)</code>。</p><p><strong>回滚路径</strong>（socket 创建过程中途失败，file 未关联成功）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c __sock_release
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>sock</span><span class=o>-&gt;</span><span class=n>file</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 创建失败回滚：无 file 关联，直接 iput 释放 inode+socket */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>iput</span><span class=p>(</span><span class=nf>SOCK_INODE</span><span class=p>(</span><span class=n>sock</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>socket 与 inode 同生共死：<code>sock_free_inode()</code> 把整块 <code>socket_alloc</code>（含 socket + inode）还给 slab，这正是 2.1 节"一次分配、两个身份"的逆过程。</p><p><strong>④ <code>stat/fstat</code> 系统调用：<code>S_ISSOCK</code> 靠 <code>i_mode</code> 判断</strong></p><p><code>fstat(fd, &amp;st)</code> 走 <code>vfs_fstat → vfs_getattr_nosec → inode->i_op->getattr</code>，读到的字段：</p><div class=table-wrapper><table><thead><tr><th><code>stat</code> 字段</th><th>来源</th><th>用户看到的值</th></tr></thead><tbody><tr><td><code>st_ino</code></td><td><code>i_ino</code></td><td>唯一编号</td></tr><tr><td><code>st_mode</code></td><td><code>i_mode</code></td><td><code>S_IFSOCK | 0777</code></td></tr><tr><td><code>st_uid/gid</code></td><td><code>i_uid/i_gid</code></td><td>所有者</td></tr><tr><td><code>st_size</code></td><td>0</td><td>socket 无大小</td></tr></tbody></table></div><p><code>S_ISSOCK(st.st_mode)</code> 宏就靠 <code>i_mode</code> 中的 <code>S_IFSOCK</code> 位判断"这是一个 socket"。</p><p><strong>⑤ <code>/proc/&lt;pid>/fd/</code> 展示：<code>socket:[ino]</code> 的来历</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c sockfs_dname()
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>char</span> <span class=o>*</span><span class=nf>sockfs_dname</span><span class=p>(</span><span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=n>dentry</span><span class=p>,</span> <span class=kt>char</span> <span class=o>*</span><span class=n>buffer</span><span class=p>,</span> <span class=kt>int</span> <span class=n>buflen</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>dynamic_dname</span><span class=p>(</span><span class=n>dentry</span><span class=p>,</span> <span class=n>buffer</span><span class=p>,</span> <span class=n>buflen</span><span class=p>,</span> <span class=s>&#34;socket:[%lu]&#34;</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                         <span class=nf>d_inode</span><span class=p>(</span><span class=n>dentry</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>i_ino</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>执行 <code>ls -l /proc/&lt;pid>/fd/</code> 或 <code>readlink</code> 时：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>lrwx------ 1 user user 64 Jun 11 10:00 3 -&gt; socket:[12345]
+</span></span></code></pre></td></tr></table></div></div><p><code>socket:[12345]</code> 里的数字就是 <code>inode->i_ino</code>。这就是为什么 <code>ss -tnp</code>、<code>lsof</code> 能用 inode 号把 fd 和 <code>/proc/net/tcp</code> 里的 socket 对应起来 —— <strong>ino 是用户态排查网络问题的关键锚点</strong>。</p><p><strong>⑥ <code>setattr</code> 修改权限：<code>sockfs_setattr</code> 反向找 socket</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c sockfs_setattr()
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>sockfs_setattr</span><span class=p>(</span><span class=k>struct</span> <span class=n>user_namespace</span> <span class=o>*</span><span class=n>mnt_userns</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                          <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=n>dentry</span><span class=p>,</span> <span class=k>struct</span> <span class=n>iattr</span> <span class=o>*</span><span class=n>iattr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>err</span> <span class=o>=</span> <span class=nf>simple_setattr</span><span class=p>(</span><span class=o>&amp;</span><span class=n>init_user_ns</span><span class=p>,</span> <span class=n>dentry</span><span class=p>,</span> <span class=n>iattr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>err</span> <span class=o>&amp;&amp;</span> <span class=p>(</span><span class=n>iattr</span><span class=o>-&gt;</span><span class=n>ia_valid</span> <span class=o>&amp;</span> <span class=n>ATTR_UID</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=n>sock</span> <span class=o>=</span> <span class=nf>SOCKET_I</span><span class=p>(</span><span class=nf>d_inode</span><span class=p>(</span><span class=n>dentry</span><span class=p>));</span>  <span class=c1>// 从 inode 反查 socket
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>sock</span><span class=o>-&gt;</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=n>sock</span><span class=o>-&gt;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_uid</span> <span class=o>=</span> <span class=n>iattr</span><span class=o>-&gt;</span><span class=n>ia_uid</span><span class=p>;</span>   <span class=c1>// 同步更新 sk_uid，供 TCP 内存记账
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>chown</code> 改 socket 所有者时，inode 是入口；改完再通过 <code>SOCKET_I</code> 反查 socket 同步 <code>sk_uid</code>。这正是 2.4 节 <code>SOCKET_I</code> 双向转换能力的真实应用。</p><p><strong>⑦ LSM 安全框架：inode 是 socket 的"安全身份证"</strong></p><ul><li><code>sock_alloc_inode</code> 分配时 → <code>security_inode_alloc()</code> 分配安全上下文</li><li><code>security_socket_create</code> 创建时 → 给 inode 打 SELinux sid 标签</li><li>后续 <code>sendmsg</code>/<code>recvmsg</code> 路径上 LSM 通过 <code>inode->i_security</code> 校验权限</li><li><code>sockfs_security_xattr_set</code> [net/socket.c:386] 拒绝用户直接写 <code>security.*</code> xattr（&ldquo;Handled by LSM&rdquo;），把控制权交给 LSM 模块</li></ul><p>socket 类的 SELinux 权限检查（<code>socket/send</code>、<code>socket/recv</code>、<code>tcp_socket/bind</code> 等）全部挂在 inode 的 sid 上，没有 inode 就无法接入 SELinux 框架。</p><p><strong>小结</strong>：inode 是 socket 在 VFS 世界的<strong>身份证</strong>。它平时不承载字节流数据，只在身份识别、生命周期、安全审计三个维度发挥作用。从 VFS 统一入口（②）到 sockfs 命名（⑤）、从 fstat（④）到关闭回收（③）、从权限修改（⑥）到 LSM 审计（⑦），inode 串起了 7 个跨子系统的触点 —— 这正是"一切皆文件"设计哲学的具体落地。</p><h3 id=24-socket_i-与-sock_inode双向零开销转换>2.4 <code>SOCKET_I</code> 与 <code>SOCK_INODE</code>：双向零开销转换</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/sock.h L1475-1483
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// inode → socket：已知 inode 地址，反推 socket_alloc 起始地址，取 socket 成员
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=nf>SOCKET_I</span><span class=p>(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=n>inode</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=o>&amp;</span><span class=nf>container_of</span><span class=p>(</span><span class=n>inode</span><span class=p>,</span> <span class=k>struct</span> <span class=n>socket_alloc</span><span class=p>,</span> <span class=n>vfs_inode</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>socket</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// socket → inode：已知 socket 地址，反推 socket_alloc 起始地址，取 vfs_inode 成员
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=nf>SOCK_INODE</span><span class=p>(</span><span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=n>socket</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=o>&amp;</span><span class=nf>container_of</span><span class=p>(</span><span class=n>socket</span><span class=p>,</span> <span class=k>struct</span> <span class=n>socket_alloc</span><span class=p>,</span> <span class=n>socket</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>vfs_inode</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>container_of</code> 的数学本质：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>SOCKET_I(inode):
+</span></span><span class=line><span class=cl>  socket_alloc_addr = inode_addr - offsetof(socket_alloc, vfs_inode)
+</span></span><span class=line><span class=cl>  return &amp;socket_alloc_addr-&gt;socket   // 偏移 0，即 socket_alloc 自身
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>SOCK_INODE(socket):
+</span></span><span class=line><span class=cl>  socket_alloc_addr = socket_addr - offsetof(socket_alloc, socket)  // 偏移 0
+</span></span><span class=line><span class=cl>  return &amp;socket_alloc_addr-&gt;vfs_inode
+</span></span></code></pre></td></tr></table></div></div><p><strong>零开销</strong>：编译期确定偏移量，运行时只做一次指针减法，无任何查表或间接调用。</p><hr><h2 id=三调用链全景>三、调用链全景</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户态 socket(AF_INET, SOCK_STREAM, 0)
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼ syscall
+</span></span><span class=line><span class=cl>SYSCALL_DEFINE3(socket)                            [net/socket.c:1631]
+</span></span><span class=line><span class=cl>  └── __sys_socket(family, type, protocol)         [net/socket.c:1591]
+</span></span><span class=line><span class=cl>       │
+</span></span><span class=line><span class=cl>       ├── 【步骤 A】sock_create()                  ← 创建 socket + sock
+</span></span><span class=line><span class=cl>       │    └── __sock_create()                    [net/socket.c:1439]
+</span></span><span class=line><span class=cl>       │         │
+</span></span><span class=line><span class=cl>       │         ├── security_socket_create()      (LSM 安全检查)
+</span></span><span class=line><span class=cl>       │         │
+</span></span><span class=line><span class=cl>       │         ├── sock_alloc()                  [net/socket.c:626]
+</span></span><span class=line><span class=cl>       │         │    ├── new_inode_pseudo(sock_mnt-&gt;mnt_sb)
+</span></span><span class=line><span class=cl>       │         │    │    └── sock_alloc_inode()  ← 分配 socket_alloc（含socket+inode）
+</span></span><span class=line><span class=cl>       │         │    │         └── kmem_cache_alloc(sock_inode_cachep)
+</span></span><span class=line><span class=cl>       │         │    └── SOCKET_I(inode)          ← container_of 取回 socket
+</span></span><span class=line><span class=cl>       │         │
+</span></span><span class=line><span class=cl>       │         └── pf-&gt;create()                  (协议族分发)
+</span></span><span class=line><span class=cl>       │              └── inet_create()            [net/ipv4/af_inet.c:277]
+</span></span><span class=line><span class=cl>       │                   ├── inetsw 表匹配       → 找到 tcp_prot + inet_stream_ops
+</span></span><span class=line><span class=cl>       │                   ├── sock-&gt;ops = inet_stream_ops
+</span></span><span class=line><span class=cl>       │                   ├── sk_alloc()          ← 从 tcp_prot.slab 分配 tcp_sock
+</span></span><span class=line><span class=cl>       │                   ├── sock_init_data()    ← 双向关联 socket↔sock
+</span></span><span class=line><span class=cl>       │                   └── sk-&gt;sk_prot-&gt;init()
+</span></span><span class=line><span class=cl>       │                        └── tcp_v4_init_sock() → tcp_init_sock()
+</span></span><span class=line><span class=cl>       │
+</span></span><span class=line><span class=cl>       └── 【步骤 B】sock_map_fd()                  ← 绑定 file 与 fd
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>            ├── get_unused_fd_flags()              [fs/file.c:559]
+</span></span><span class=line><span class=cl>            │    └── alloc_fd()                    (位图查找 + 扩容)
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>            ├── sock_alloc_file()                  [net/socket.c:446]
+</span></span><span class=line><span class=cl>            │    ├── SOCK_INODE(sock)              ← 取 inode（同一 socket_alloc 内）
+</span></span><span class=line><span class=cl>            │    ├── alloc_file_pseudo(inode, sock_mnt, &#34;TCP&#34;, ...)
+</span></span><span class=line><span class=cl>            │    │    └── 创建 file + dentry，绑定 socket_file_ops
+</span></span><span class=line><span class=cl>            │    ├── sock-&gt;file = file             ← 双向关联
+</span></span><span class=line><span class=cl>            │    └── file-&gt;private_data = sock
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>            └── fd_install(fd, file)               [fs/file.c:606]
+</span></span><span class=line><span class=cl>                 └── rcu_assign_pointer(fdt-&gt;fd[fd], file)  ← 用户态可见
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四分阶段详细分析>四、分阶段详细分析</h2><h3 id=阶段-1系统调用入口>阶段 1：系统调用入口</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c
+</span></span></span><span class=line><span class=cl><span class=nf>SYSCALL_DEFINE3</span><span class=p>(</span><span class=n>socket</span><span class=p>,</span> <span class=kt>int</span><span class=p>,</span> <span class=n>family</span><span class=p>,</span> <span class=kt>int</span><span class=p>,</span> <span class=n>type</span><span class=p>,</span> <span class=kt>int</span><span class=p>,</span> <span class=n>protocol</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>__sys_socket</span><span class=p>(</span><span class=n>family</span><span class=p>,</span> <span class=n>type</span><span class=p>,</span> <span class=n>protocol</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>__sys_socket</code> 解析 <code>type</code> 高位的 <code>SOCK_CLOEXEC</code>（exec 时自动关闭）和 <code>SOCK_NONBLOCK</code>（非阻塞），然后执行两步：<code>sock_create</code> + <code>sock_map_fd</code>。</p><h3 id=阶段-2sock_alloc--一体分配-socket--inode>阶段 2：sock_alloc — 一体分配 socket + inode</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c L626-646
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=nf>sock_alloc</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=n>inode</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=n>sock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>inode</span> <span class=o>=</span> <span class=nf>new_inode_pseudo</span><span class=p>(</span><span class=n>sock_mnt</span><span class=o>-&gt;</span><span class=n>mnt_sb</span><span class=p>);</span>  <span class=c1>// 触发 sock_alloc_inode 回调
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>inode</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>sock</span> <span class=o>=</span> <span class=nf>SOCKET_I</span><span class=p>(</span><span class=n>inode</span><span class=p>);</span>  <span class=c1>// container_of 从 inode 取回同块内存中的 socket
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_ino</span> <span class=o>=</span> <span class=nf>get_next_ino</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_mode</span> <span class=o>=</span> <span class=n>S_IFSOCK</span> <span class=o>|</span> <span class=n>S_IRWXUGO</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_uid</span> <span class=o>=</span> <span class=nf>current_fsuid</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_gid</span> <span class=o>=</span> <span class=nf>current_fsgid</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>inode</span><span class=o>-&gt;</span><span class=n>i_op</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>sockfs_inode_ops</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>sock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>new_inode_pseudo()</code> 调用 sockfs 超级块注册的 <code>sock_alloc_inode()</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c L299-317
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=nf>sock_alloc_inode</span><span class=p>(</span><span class=k>struct</span> <span class=n>super_block</span> <span class=o>*</span><span class=n>sb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>socket_alloc</span> <span class=o>*</span><span class=n>ei</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>ei</span> <span class=o>=</span> <span class=nf>kmem_cache_alloc</span><span class=p>(</span><span class=n>sock_inode_cachep</span><span class=p>,</span> <span class=n>GFP_KERNEL</span><span class=p>);</span>  <span class=c1>// 一次分配完整 socket_alloc
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>ei</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>init_waitqueue_head</span><span class=p>(</span><span class=o>&amp;</span><span class=n>ei</span><span class=o>-&gt;</span><span class=n>socket</span><span class=p>.</span><span class=n>wq</span><span class=p>.</span><span class=n>wait</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>ei</span><span class=o>-&gt;</span><span class=n>socket</span><span class=p>.</span><span class=n>state</span> <span class=o>=</span> <span class=n>SS_UNCONNECTED</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>ei</span><span class=o>-&gt;</span><span class=n>socket</span><span class=p>.</span><span class=n>ops</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>ei</span><span class=o>-&gt;</span><span class=n>socket</span><span class=p>.</span><span class=n>sk</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>ei</span><span class=o>-&gt;</span><span class=n>socket</span><span class=p>.</span><span class=n>file</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=o>&amp;</span><span class=n>ei</span><span class=o>-&gt;</span><span class=n>vfs_inode</span><span class=p>;</span>  <span class=c1>// 返回 inode 给 VFS 框架
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>slab 缓存在启动时创建：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c L334-343
+</span></span></span><span class=line><span class=cl><span class=n>sock_inode_cachep</span> <span class=o>=</span> <span class=nf>kmem_cache_create</span><span class=p>(</span><span class=s>&#34;sock_inode_cache&#34;</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                      <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>socket_alloc</span><span class=p>),</span> <span class=p>...);</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>此时的 socket 是空壳</strong>：<code>ops = NULL</code>、<code>sk = NULL</code>、<code>file = NULL</code>。</p><h3 id=阶段-3inet_create--协议族对接>阶段 3：inet_create — 协议族对接</h3><p><code>__sock_create</code> 通过 <code>net_families[AF_INET]->create</code> 分发到 <code>inet_create</code>。</p><p><strong>3.1 inetsw 表匹配</strong></p><p><code>inetsw[SOCK_STREAM]</code> 链表中查找匹配项：</p><ul><li><code>ops = inet_stream_ops</code>（BSD socket 操作表：accept/bind/connect/listen 等）</li><li><code>prot = tcp_prot</code>（传输层操作表 + slab 信息）</li></ul><p><strong>3.2 sk_alloc — 分配传输层控制块</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=n>sk</span> <span class=o>=</span> <span class=nf>sk_alloc</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>PF_INET</span><span class=p>,</span> <span class=n>GFP_KERNEL</span><span class=p>,</span> <span class=n>answer_prot</span><span class=p>,</span> <span class=n>kern</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p>从 <code>tcp_prot.slab</code> 高速缓存分配零初始化的 <code>tcp_sock</code>（约 2KB）。<code>tcp_sock</code> 的嵌套继承链：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>struct tcp_sock
+</span></span><span class=line><span class=cl>  └── struct inet_connection_sock
+</span></span><span class=line><span class=cl>       └── struct inet_sock
+</span></span><span class=line><span class=cl>            └── struct sock
+</span></span><span class=line><span class=cl>                 └── struct sock_common
+</span></span></code></pre></td></tr></table></div></div><p>通过 <code>tcp_sk(sk)</code>、<code>inet_sk(sk)</code> 等向下转型宏访问各层字段。</p><p><strong>3.3 sock_init_data — 双向关联建立</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/core/sock.c:sock_init_data()
+</span></span></span><span class=line><span class=cl><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_socket</span> <span class=o>=</span> <span class=n>sock</span><span class=p>;</span>   <span class=c1>// sock → socket（上层）
+</span></span></span><span class=line><span class=cl><span class=n>sock</span><span class=o>-&gt;</span><span class=n>sk</span> <span class=o>=</span> <span class=n>sk</span><span class=p>;</span>           <span class=c1>// socket → sock（下层）
+</span></span></span></code></pre></td></tr></table></div></div><p>同时初始化：<code>sk_state = TCP_CLOSE</code>、收发队列、默认缓冲区、回调函数（<code>sk_data_ready</code>、<code>sk_write_space</code> 等）。</p><p><strong>3.4 tcp_init_sock — TCP 特有初始化</strong></p><ul><li>三个定时器：重传、延迟 ACK、keepalive</li><li>初始 RTO = 1s，最小 RTO = 200ms</li><li>初始拥塞窗口 <code>cwnd = 10</code>（RFC 6928）</li><li><code>ssthresh = 0x7fffffff</code>（无穷大）</li><li>默认拥塞控制算法（通常 CUBIC）</li></ul><h3 id=阶段-4sock_map_fd--分配-fd-并安装-file>阶段 4：sock_map_fd — 分配 fd 并安装 file</h3><p><strong>4.1 fd 表数据结构全景</strong></p><p>每个进程通过 <code>task_struct->files</code> 指向 <code>files_struct</code>，其核心是 <code>fdtable</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/fdtable.h
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>fdtable</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>max_fds</span><span class=p>;</span>           <span class=c1>// 当前容量
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>file</span> <span class=n>__rcu</span> <span class=o>**</span><span class=n>fd</span><span class=p>;</span>         <span class=c1>// file 指针数组，按 fd 索引
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>close_on_exec</span><span class=p>;</span>   <span class=c1>// exec 时自动关闭的 fd 位图
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>open_fds</span><span class=p>;</span>        <span class=c1>// 一级位图：每 bit 对应一个 fd 是否已占用
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>full_fds_bits</span><span class=p>;</span>   <span class=c1>// 二级位图：每 bit 概括 BITS_PER_LONG 个 fd 是否全满
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rcu_head</span> <span class=n>rcu</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>files_struct</code> 内嵌了初始 fdtable 和小数组，避免短生命周期进程做额外内存分配：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>files_struct</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>atomic_t</span> <span class=n>count</span><span class=p>;</span>                                <span class=c1>// 引用计数（CLONE_FILES 共享时 &gt; 1）
+</span></span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>resize_in_progress</span><span class=p>;</span>                       <span class=c1>// 扩容互斥标记
+</span></span></span><span class=line><span class=cl>    <span class=kt>wait_queue_head_t</span> <span class=n>resize_wait</span><span class=p>;</span>                 <span class=c1>// 并发扩容等待队列
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fdtable</span> <span class=n>__rcu</span> <span class=o>*</span><span class=n>fdt</span><span class=p>;</span>                     <span class=c1>// 当前活跃 fdtable（RCU 切换）
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fdtable</span> <span class=n>fdtab</span><span class=p>;</span>                          <span class=c1>// 内嵌初始 fdtable
+</span></span></span><span class=line><span class=cl>    <span class=kt>spinlock_t</span> <span class=n>file_lock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>next_fd</span><span class=p>;</span>                          <span class=c1>// 启发式起始搜索位置
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>close_on_exec_init</span><span class=p>[</span><span class=mi>1</span><span class=p>];</span>           <span class=c1>// 内嵌初始位图
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>open_fds_init</span><span class=p>[</span><span class=mi>1</span><span class=p>];</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>full_fds_bits_init</span><span class=p>[</span><span class=mi>1</span><span class=p>];</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>file</span> <span class=n>__rcu</span> <span class=o>*</span><span class=n>fd_array</span><span class=p>[</span><span class=n>NR_OPEN_DEFAULT</span><span class=p>];</span>  <span class=c1>// 初始 fd 数组（64 槽）
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p>初始状态下 <code>fdt</code> 指向内嵌的 <code>fdtab</code>，fd 数组为 64 槽（<code>NR_OPEN_DEFAULT = BITS_PER_LONG = 64</code>）。当 fd 超过 64 时才触发扩容。</p><p>内存布局如下：</p><style>.fdt-layout{max-width:750px;display:flex;gap:20px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:16px;margin:12px 0;font-family:Consolas,source code pro,monospace;font-size:12px}.fdt-layout .col{flex:1}.fdt-layout .struct-box{border:1px solid #bbb;border-radius:4px;padding:8px;margin-bottom:8px;background:#f8f8f8}.fdt-layout .struct-box .sh{font-weight:700;font-size:13px;color:#333;margin-bottom:6px;border-bottom:1px solid #ddd;padding-bottom:3px}.fdt-layout .row{display:flex;align-items:center;margin:3px 0;padding:3px 6px;border:1px solid #ddd;border-radius:3px;background:#fff;font-size:11px;transition:background .12s}.fdt-layout .row:hover{background:#f0f7ff;border-color:#a0c4e8}.fdt-layout .row .fn{flex:1;color:#333}.fdt-layout .row .vl{color:#888;font-size:10px;text-align:right}.fdt-layout .inner{border:1px solid #d5d0a0;border-radius:4px;padding:6px;margin-top:6px;background:#fffef5}.fdt-layout .inner .sh{font-weight:700;font-size:12px;color:#665}.fdt-layout .arrow{color:#2a7ae2;font-size:18px;text-align:center;line-height:28px}.fdt-layout .target{border:1px solid #555;border-radius:3px;padding:4px 8px;margin:3px 0;background:#fff;font-size:11px;transition:background .12s}.fdt-layout .target:hover{background:#f0f7ff;border-color:#2a7ae2}.fdt-layout .target .tn{font-weight:600;color:#333}.fdt-layout .target .td{color:#888;font-size:10px;margin-left:8px}.fdt-layout .note{font-size:10px;color:#999;margin-top:6px;padding:4px;background:#f5f5f5;border-radius:3px}</style><div class=fdt-layout><div class=col><div class=struct-box><div class=sh>files_struct</div><div class=row><span class=fn><b>fdt</b> ──────→</span><span class=vl>初始指向 &amp;fdtab</span></div><div class=row><span class=fn><b>next_fd</b></span><span class=vl>= 0</span></div><div class=row><span class=fn><b>file_lock</b></span><span class=vl>spinlock</span></div><div class=row><span class=fn><b>count</b></span><span class=vl>引用计数 (CLONE_FILES)</span></div><div class=row><span class=fn><b>resize_in_progress</b></span><span class=vl>扩容互斥标记</span></div><div class=inner><div class=sh>fdtab（内嵌 fdtable）</div><div class=row><span class=fn><b>max_fds</b></span><span class=vl>= 64</span></div><div class=row><span class=fn><b>fd</b> ──→</span><span class=vl>→ fd_array</span></div><div class=row><span class=fn><b>open_fds</b> ──→</span><span class=vl>→ open_fds_init</span></div><div class=row><span class=fn><b>close_on_exec</b> ──→</span><span class=vl>→ close_on_exec_init</span></div><div class=row><span class=fn><b>full_fds_bits</b> ──→</span><span class=vl>→ full_fds_bits_init</span></div><div class=row><span class=fn>rcu_head</span><span class=vl>延迟释放</span></div></div></div></div><div class=col style=padding-top:90px><div class=arrow>→ → →</div><div class=target><span class=tn>fd_array[64]</span><span class=td>file 指针数组 · 内嵌 · 无 kmalloc</span></div><div class=target><span class=tn>open_fds_init[1]</span><span class=td>1 × unsigned long = 64 bits</span></div><div class=target><span class=tn>close_on_exec_init[1]</span><span class=td>exec 时自动关闭标记</span></div><div class=target><span class=tn>full_fds_bits_init[1]</span><span class=td>1 bit 概括全部 64 fd</span></div><div class=note><b>初始状态</b>：所有数组内嵌在 files_struct 中<br>无额外堆分配 · fd 超 64 时触发 expand_fdtable 扩容<br>扩容后 fdt 指向新 kmalloc 的 fdtable，旧表 call_rcu 释放</div></div></div><p><strong>fdtable 四类数组对照</strong></p><p><code>fdtable</code> 内并不是单一数组，而是<strong>1 个指针数组 + 3 块 unsigned long 位图</strong>的组合。四类数组的元素类型、用途、粒度完全不同：</p><div class=table-wrapper><table><thead><tr><th>字段</th><th>元素类型</th><th>每元素覆盖</th><th>用途</th></tr></thead><tbody><tr><td><code>fd[]</code></td><td><code>struct file __rcu *</code></td><td><strong>1 个 fd</strong>（8 字节槽位）</td><td>fd 号 → file 指针的索引表</td></tr><tr><td><code>open_fds</code></td><td><code>unsigned long</code></td><td><strong>64 个 fd</strong>（每 bit 1 个）</td><td>一级占用位图</td></tr><tr><td><code>close_on_exec</code></td><td><code>unsigned long</code></td><td><strong>64 个 fd</strong></td><td>exec 时自动关闭的位图</td></tr><tr><td><code>full_fds_bits</code></td><td><code>unsigned long</code></td><td><strong>64 × 64 = 4096 个 fd</strong></td><td>二级摘要位图（每 bit 概括一个 ulong 宽）</td></tr></tbody></table></div><p>以 <code>fd = 20</code> 为例，它同时落入 4 个数组的下列位置：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>fdt-&gt;fd[20]                        : 第 20 个槽位（8 字节指针）
+</span></span><span class=line><span class=cl>fdt-&gt;open_fds[0]      的第 20 bit  : 1 bit 标记占用
+</span></span><span class=line><span class=cl>fdt-&gt;close_on_exec[0] 的第 20 bit  : 1 bit 标记 exec 关闭
+</span></span><span class=line><span class=cl>fdt-&gt;full_fds_bits[0] 的第 0  bit  : 概括 open_fds[0] 全 64 bit 是否全满
+</span></span></code></pre></td></tr></table></div></div><p><strong>位图 vs 指针数组的本质区别</strong>：</p><ul><li><code>fd[]</code> 是<strong>定长槽位数组</strong>，每槽 8 字节存 <code>file *</code>，用 <code>fdt->fd[N] = file</code> 直接写入</li><li>三块位图是<strong>位压缩数组</strong>，每 bit 表 1 个 fd，用 <code>__set_bit(N, fdt->open_fds)</code> 置位（x86_64 little-endian，<code>open_fds[N/64]</code> 的第 <code>N%64</code> 位）</li><li>两者<strong>下标语义对齐</strong>：fd=N 同时对应 <code>fd[N]</code> 槽位 + <code>open_fds</code> 第 N bit</li></ul><p><strong>扩容时的分配差异</strong>（<code>fs/file.c</code> <code>alloc_fdtable</code>）：</p><ul><li><code>fd[]</code> 单独一次 <code>kvmalloc_array(nr, sizeof(struct file *))</code></li><li>三块位图<strong>一次 kvmalloc 连续内存</strong>，首尾相接：<code>open_fds | close_on_exec | full_fds_bits</code></li><li>这样 4 块内存（fdt 本体 + fd[] + 三块位图）构成一个 fdtable 的完整存储</li></ul><p><strong>4.2 两级位图查找算法</strong></p><p><strong>为什么用位图而不是直接遍历 <code>fd[]</code>？</strong> 这是经典的"空间换时间 + 指令级并行"模式：</p><div class=table-wrapper><table><thead><tr><th>方案</th><th>查找"第一个空闲 fd"的做法</th><th>复杂度</th><th>实际使用</th></tr></thead><tbody><tr><td>逐槽扫 <code>fd[]</code></td><td><code>for (i=0; i&lt;max_fds; i++) if (!fd[i]) return i;</code></td><td>O(N) 次指针比较</td><td>✗</td></tr><tr><td>单级位图 <code>open_fds</code></td><td>每 64 个 fd 压成 1 个 <code>unsigned long</code>，用 CPU 位扫描指令找第一个 0</td><td>O(N/64)</td><td>中等规模可用</td></tr><tr><td><strong>两级位图（Linux 实际方案）</strong></td><td>第一级 <code>full_fds_bits</code> 跳过全满的 64-fd 块，第二级 <code>open_fds</code> 在块内精确定位</td><td><strong>O(N/64) + 硬件位扫描</strong></td><td>✓</td></tr></tbody></table></div><p>位图之所以快，有三个本质原因：</p><ol><li><strong>空间压缩 64 倍</strong>：64 个 fd 的占用状态压缩成 1 个 <code>unsigned long</code>（8 字节），原本需要 64 次指针比较的工作量被压进 1 次字读取。</li><li><strong>硬件位扫描指令</strong>：x86_64 的 <code>BSF</code>/<code>TZCNT</code>、ARM 的 <code>RBIT+CLZ</code> 能在单条指令内从一个 64-bit 字里找到第一个 0 位 —— 这是 <code>find_next_zero_bit</code> 的底层实现。</li><li><strong>二级摘要把"跨块扫描"降到常数</strong>：当 <code>max_fds = 1048576</code>（默认 <code>sysctl_nr_open</code>）时，<code>open_fds</code> 有 16384 个 ulong；再加一层 <code>full_fds_bits</code>（256 个 ulong），最多 2 次位扫描就能定位空闲块。</li></ol><div class=table-wrapper><table><thead><tr><th><code>max_fds</code></th><th>逐槽扫 <code>fd[]</code></th><th>单级位图</th><th>两级位图</th></tr></thead><tbody><tr><td>64</td><td>64 次比较</td><td>1 次 BSF</td><td>1 次 BSF</td></tr><tr><td>1024</td><td>1024 次比较</td><td>16 次 BSF</td><td>1–2 次 BSF</td></tr><tr><td>65536</td><td>65536 次比较</td><td>1024 次 BSF</td><td>1–2 次 BSF</td></tr><tr><td>1048576</td><td>10⁶ 次比较</td><td>16384 次 BSF</td><td>2–3 次 BSF</td></tr></tbody></table></div><blockquote><p>这个模式在内核中随处可见：<code>page buddy allocator</code> 的 <code>free_area</code> 位图、<code>block bitmap</code> 管理磁盘空闲块、<code>cpumask</code> 选 CPU —— 思路完全一致。</p></blockquote><p><code>alloc_fd</code> 的核心是 <code>find_next_fd</code>，使用两级位图快速跳过全满区域：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/file.c
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>unsigned</span> <span class=kt>int</span> <span class=nf>find_next_fd</span><span class=p>(</span><span class=k>struct</span> <span class=n>fdtable</span> <span class=o>*</span><span class=n>fdt</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>start</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>maxfd</span> <span class=o>=</span> <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>max_fds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>maxbit</span> <span class=o>=</span> <span class=n>maxfd</span> <span class=o>/</span> <span class=n>BITS_PER_LONG</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>bitbit</span> <span class=o>=</span> <span class=n>start</span> <span class=o>/</span> <span class=n>BITS_PER_LONG</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 第一级：在 full_fds_bits 中跳过全满的 64-fd 块
+</span></span></span><span class=line><span class=cl>    <span class=n>bitbit</span> <span class=o>=</span> <span class=nf>find_next_zero_bit</span><span class=p>(</span><span class=n>fdt</span><span class=o>-&gt;</span><span class=n>full_fds_bits</span><span class=p>,</span> <span class=n>maxbit</span><span class=p>,</span> <span class=n>bitbit</span><span class=p>)</span> <span class=o>*</span> <span class=n>BITS_PER_LONG</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>bitbit</span> <span class=o>&gt;</span> <span class=n>maxfd</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>maxfd</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>bitbit</span> <span class=o>&gt;</span> <span class=n>start</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>start</span> <span class=o>=</span> <span class=n>bitbit</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 第二级：在 open_fds 中精确定位该块内第一个空闲位
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>find_next_zero_bit</span><span class=p>(</span><span class=n>fdt</span><span class=o>-&gt;</span><span class=n>open_fds</span><span class=p>,</span> <span class=n>maxfd</span><span class=p>,</span> <span class=n>start</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>图示（64 位系统，<code>BITS_PER_LONG = 64</code>）：</p><style>.bitmap-demo{max-width:780px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:16px;margin:12px 0;font-family:Consolas,source code pro,monospace;font-size:12px}.bitmap-demo h4{margin:0 0 6px;font-size:13px;color:#333}.bitmap-demo .sub{font-size:10px;color:#888;margin-bottom:8px}.bitmap-demo .bits{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px}.bitmap-demo .bit{width:52px;height:36px;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:3px;font-size:12px;font-weight:700;border:1.5px solid;cursor:default;transition:transform .1s}.bitmap-demo .bit:hover{transform:scale(1.08)}.bitmap-demo .bit.full{background:#fce4e4;border-color:#e57373;color:#c62828}.bitmap-demo .bit.free{background:#e8f5e9;border-color:#66bb6a;color:#2e7d32}.bitmap-demo .bit .idx{font-size:9px;font-weight:400;color:#999;margin-top:1px}.bitmap-demo .bit.free .idx{color:#558b2f}.bitmap-demo .expand-arrow{font-size:18px;color:#66bb6a;margin:4px 0 4px 20px}.bitmap-demo .bit-detail{display:flex;gap:3px;flex-wrap:wrap;margin-bottom:6px}.bitmap-demo .bd{width:34px;height:30px;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:2px;font-size:10px;border:1px solid #ddd}.bitmap-demo .bd.occ{background:#fff0f0;color:#aaa}.bitmap-demo .bd.hit{background:#e8f5e9;border:2px solid #66bb6a;color:#2e7d32;font-weight:700}.bitmap-demo .bd .bi{font-size:8px;color:#bbb}.bitmap-demo .bd.hit .bi{color:#558b2f;font-weight:600}.bitmap-demo .result{display:inline-block;background:#e8f5e9;border:1.5px solid #66bb6a;border-radius:4px;padding:4px 14px;font-weight:700;color:#2e7d32;font-size:13px;margin:6px 0}.bitmap-demo .steps{background:#f8f9fa;border:1px solid #e8e8e8;border-radius:4px;padding:8px 12px;margin-top:10px}.bitmap-demo .steps .st{margin:3px 0;font-size:11px;color:#444;line-height:1.6}.bitmap-demo .steps .st b{color:#2e7d32}.bitmap-demo .perf{font-size:10px;color:#666;margin-top:8px;padding:4px 8px;background:#f0f4f8;border-radius:3px;border:1px solid #d5dee8}</style><div class=bitmap-demo><h4>第一级：full_fds_bits（摘要位图）</h4><div class=sub>每 bit 概括 64 个 fd 是否全满 · find_next_zero_bit 跳过全满块</div><div class=bits><div class="bit full">1<span class=idx>bit 0</span></div><div class="bit free" style=border-width:2.5px>0 ✓<span class=idx>bit 1</span></div><div class="bit full">1<span class=idx>bit 2</span></div><div class="bit free">0<span class=idx>bit 3</span></div><div style="display:flex;align-items:center;color:#999;font-size:11px;padding:0 6px">…</div></div><div class=expand-arrow>↓ bit 1 = 0 → 展开 open_fds[1]</div><h4>第二级：open_fds[1]（fd 64–127，逐位扫描）</h4><div class=sub>在该 64-bit 块内找第一个 0 · 精确定位空闲 fd</div><div class=bit-detail><div class="bd occ">1<span class=bi>64</span></div><div class="bd occ">1<span class=bi>65</span></div><div class="bd occ">1<span class=bi>66</span></div><div class="bd hit">0<span class=bi>67 ✓</span></div><div class="bd occ">1<span class=bi>68</span></div><div class="bd occ">1<span class=bi>69</span></div><div class="bd occ">1<span class=bi>70</span></div><div class="bd occ">1<span class=bi>71</span></div><div style="display:flex;align-items:center;color:#999;font-size:10px;padding:0 4px">… 共 64 bits</div></div><div class=result>→ 返回 fd = 67</div><div class=steps><div class=st>❶ 扫描 <code>full_fds_bits</code>：<b>跳过</b> bit0（全满）→ 命中 bit1（有空闲），对应 fd [64, 127]</div><div class=st>❷ 进入 <code>open_fds[1]</code>：<code>find_next_zero_bit(start=64)</code> → 跳过 64,65,66 → <b>命中 bit 67</b></div><div class=st>❸ 返回 fd = 67，<code>alloc_fd</code> 调用 <code>__set_open_fd(67, fdt)</code> 标记占用</div></div><div class=perf>复杂度 O(N / BITS_PER_LONG) — 数千 fd 时仍可一次跳过 64 个全满位，远优于逐位 O(N) 扫描</div></div><p><strong>查找过程</strong>：</p><ol><li>从 <code>start / 64</code> 位开始扫描 <code>full_fds_bits</code>，找到第一个为 0 的 bit（说明该 64-fd 块有空闲）</li><li>跳入该块对应的 <code>open_fds</code> 区域，找第一个为 0 的 bit</li><li>该 bit 的全局索引即为空闲 fd 号</li></ol><p><strong>4.3 alloc_fd 完整流程</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/file.c（简化注释版）
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>alloc_fd</span><span class=p>(</span><span class=kt>unsigned</span> <span class=n>start</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=n>end</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=n>flags</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>files_struct</span> <span class=o>*</span><span class=n>files</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>files</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fdtable</span> <span class=o>*</span><span class=n>fdt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>spin_lock</span><span class=p>(</span><span class=o>&amp;</span><span class=n>files</span><span class=o>-&gt;</span><span class=n>file_lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>repeat</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=n>fdt</span> <span class=o>=</span> <span class=nf>files_fdtable</span><span class=p>(</span><span class=n>files</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>fd</span> <span class=o>=</span> <span class=n>start</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>fd</span> <span class=o>&lt;</span> <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>fd</span> <span class=o>=</span> <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span><span class=p>;</span>        <span class=c1>// 启发式：跳过已知占满的低位
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>fd</span> <span class=o>&lt;</span> <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>max_fds</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>fd</span> <span class=o>=</span> <span class=nf>find_next_fd</span><span class=p>(</span><span class=n>fdt</span><span class=p>,</span> <span class=n>fd</span><span class=p>);</span> <span class=c1>// 两级位图查找
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>fd</span> <span class=o>&gt;=</span> <span class=n>end</span><span class=p>)</span>                  <span class=c1>// 超过 RLIMIT_NOFILE → EMFILE
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>error</span> <span class=o>=</span> <span class=nf>expand_files</span><span class=p>(</span><span class=n>files</span><span class=p>,</span> <span class=n>fd</span><span class=p>);</span> <span class=c1>// 需要时扩容 fdtable
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>error</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span> <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>error</span><span class=p>)</span> <span class=k>goto</span> <span class=n>repeat</span><span class=p>;</span>          <span class=c1>// 扩容中途可能释放锁，位图变化须重查
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>start</span> <span class=o>&lt;=</span> <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span> <span class=o>=</span> <span class=n>fd</span> <span class=o>+</span> <span class=mi>1</span><span class=p>;</span>    <span class=c1>// 更新启发式起点
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>__set_open_fd</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=n>fdt</span><span class=p>);</span>          <span class=c1>// 置 open_fds 位 + 可能更新 full_fds_bits
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>O_CLOEXEC</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>__set_close_on_exec</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=n>fdt</span><span class=p>);</span> <span class=c1>// 置 close_on_exec 位
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>spin_unlock</span><span class=p>(</span><span class=o>&amp;</span><span class=n>files</span><span class=o>-&gt;</span><span class=n>file_lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>fd</span><span class=p>;</span>                       <span class=c1>// 返回 fd 号，此时 fdt-&gt;fd[fd] 仍为 NULL
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>关键点：</p><ul><li><strong>位图标记与指针安装分离</strong>：<code>alloc_fd</code> 只标记 <code>open_fds</code>，<code>fdt->fd[fd]</code> 仍为 NULL，直到后续 <code>fd_install</code> 才写入 file 指针</li><li><strong><code>next_fd</code> 启发式</strong>：避免每次从 fd=0 开始扫描，加速连续分配场景</li><li><strong>失败回滚</strong>：如果后续 <code>sock_alloc_file</code> 失败，必须调 <code>put_unused_fd</code> 归还位图</li></ul><p><strong>4.4 __set_open_fd — 位图标记与摘要更新</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/file.c
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>__set_open_fd</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>fd</span><span class=p>,</span> <span class=k>struct</span> <span class=n>fdtable</span> <span class=o>*</span><span class=n>fdt</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>__set_bit</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>open_fds</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>fd</span> <span class=o>/=</span> <span class=n>BITS_PER_LONG</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!~</span><span class=n>fdt</span><span class=o>-&gt;</span><span class=n>open_fds</span><span class=p>[</span><span class=n>fd</span><span class=p>])</span>           <span class=c1>// 该 ulong 全为 1？
+</span></span></span><span class=line><span class=cl>        <span class=nf>__set_bit</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>full_fds_bits</span><span class=p>);</span> <span class=c1>// 标记二级摘要为&#34;满&#34;
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>!~fdt->open_fds[fd]</code>：对 <code>open_fds[fd]</code> 取反，若全 1 则取反后为 0，<code>!0</code> 为 true。</p><p><strong>4.5 fdtable 扩容机制</strong></p><p>当 <code>fd >= fdt->max_fds</code> 时触发扩容：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/file.c alloc_fdtable（简化）
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>struct</span> <span class=n>fdtable</span> <span class=o>*</span><span class=nf>alloc_fdtable</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>nr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 容量计算：归一化到 1024B 粒度 → 向上取 2 的幂 → 还原为 fd 数
+</span></span></span><span class=line><span class=cl>    <span class=n>nr</span> <span class=o>/=</span> <span class=p>(</span><span class=mi>1024</span> <span class=o>/</span> <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>));</span>  <span class=c1>// 64 位系统：nr / 128
+</span></span></span><span class=line><span class=cl>    <span class=n>nr</span> <span class=o>=</span> <span class=nf>roundup_pow_of_two</span><span class=p>(</span><span class=n>nr</span> <span class=o>+</span> <span class=mi>1</span><span class=p>);</span>       <span class=c1>// 2 的幂对齐
+</span></span></span><span class=line><span class=cl>    <span class=n>nr</span> <span class=o>*=</span> <span class=p>(</span><span class=mi>1024</span> <span class=o>/</span> <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>));</span>   <span class=c1>// 还原
+</span></span></span><span class=line><span class=cl>    <span class=n>nr</span> <span class=o>=</span> <span class=nf>ALIGN</span><span class=p>(</span><span class=n>nr</span><span class=p>,</span> <span class=n>BITS_PER_LONG</span><span class=p>);</span>         <span class=c1>// 64 对齐
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>fdt</span> <span class=o>=</span> <span class=nf>kmalloc</span><span class=p>(</span><span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>fdtable</span><span class=p>),</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl>    <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>max_fds</span> <span class=o>=</span> <span class=n>nr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>fd</span> <span class=o>=</span> <span class=nf>kvmalloc_array</span><span class=p>(</span><span class=n>nr</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>),</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// open_fds + close_on_exec + full_fds_bits 一次分配，首尾相接
+</span></span></span><span class=line><span class=cl>    <span class=n>data</span> <span class=o>=</span> <span class=nf>kvmalloc</span><span class=p>(</span><span class=mi>2</span> <span class=o>*</span> <span class=n>nr</span> <span class=o>/</span> <span class=n>BITS_PER_BYTE</span> <span class=o>+</span> <span class=nf>BITBIT_SIZE</span><span class=p>(</span><span class=n>nr</span><span class=p>),</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl>    <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>open_fds</span> <span class=o>=</span> <span class=n>data</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>close_on_exec</span> <span class=o>=</span> <span class=n>data</span> <span class=o>+</span> <span class=n>nr</span> <span class=o>/</span> <span class=n>BITS_PER_BYTE</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>full_fds_bits</span> <span class=o>=</span> <span class=n>data</span> <span class=o>+</span> <span class=mi>2</span> <span class=o>*</span> <span class=n>nr</span> <span class=o>/</span> <span class=n>BITS_PER_BYTE</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>fdt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>扩容序列（64 位系统）：<code>64 → 128 → 256 → 512 → 1024 → 2048 → ...</code>（2 的幂增长）。</p><p><code>expand_fdtable</code> 执行切换：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>1. spin_unlock → alloc_fdtable（可能睡眠）
+</span></span><span class=line><span class=cl>2. 如果 files-&gt;count &gt; 1（CLONE_FILES 共享）→ synchronize_rcu 等待所有读者退出
+</span></span><span class=line><span class=cl>3. spin_lock → copy_fdtable（旧→新）→ rcu_assign_pointer(files-&gt;fdt, new_fdt)
+</span></span><span class=line><span class=cl>4. 旧表通过 call_rcu 延迟释放（保护并发 fd_install 读者）
+</span></span></code></pre></td></tr></table></div></div><p><strong>4.6 sock_alloc_file — 创建伪文件</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c L446-470
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=nf>sock_alloc_file</span><span class=p>(</span><span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=n>sock</span><span class=p>,</span> <span class=kt>int</span> <span class=n>flags</span><span class=p>,</span> <span class=k>const</span> <span class=kt>char</span> <span class=o>*</span><span class=n>dname</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>dname</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>dname</span> <span class=o>=</span> <span class=n>sock</span><span class=o>-&gt;</span><span class=n>sk</span> <span class=o>?</span> <span class=n>sock</span><span class=o>-&gt;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot_creator</span><span class=o>-&gt;</span><span class=nl>name</span> <span class=p>:</span> <span class=s>&#34;&#34;</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>file</span> <span class=o>=</span> <span class=nf>alloc_file_pseudo</span><span class=p>(</span><span class=nf>SOCK_INODE</span><span class=p>(</span><span class=n>sock</span><span class=p>),</span> <span class=n>sock_mnt</span><span class=p>,</span> <span class=n>dname</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                             <span class=n>O_RDWR</span> <span class=o>|</span> <span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>O_NONBLOCK</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>                             <span class=o>&amp;</span><span class=n>socket_file_ops</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>sock</span><span class=o>-&gt;</span><span class=n>file</span> <span class=o>=</span> <span class=n>file</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>file</span><span class=o>-&gt;</span><span class=n>private_data</span> <span class=o>=</span> <span class=n>sock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>stream_open</span><span class=p>(</span><span class=nf>SOCK_INODE</span><span class=p>(</span><span class=n>sock</span><span class=p>),</span> <span class=n>file</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>file</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>SOCK_INODE(sock)</code> 取同一 <code>socket_alloc</code> 中的 <code>vfs_inode</code>，传给 <code>alloc_file_pseudo</code> 构建 dentry→inode 链路。</p><p><strong>4.7 fd_install — 写入 fd 表</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/file.c
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>fd_install</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>fd</span><span class=p>,</span> <span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>file</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>files_struct</span> <span class=o>*</span><span class=n>files</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>files</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>rcu_read_lock_sched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=n>files</span><span class=o>-&gt;</span><span class=n>resize_in_progress</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>rcu_read_unlock_sched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=nf>spin_lock</span><span class=p>(</span><span class=o>&amp;</span><span class=n>files</span><span class=o>-&gt;</span><span class=n>file_lock</span><span class=p>);</span>       <span class=c1>// 慢路径：扩容中持锁写入
+</span></span></span><span class=line><span class=cl>        <span class=nf>rcu_assign_pointer</span><span class=p>(</span><span class=n>fdt</span><span class=o>-&gt;</span><span class=n>fd</span><span class=p>[</span><span class=n>fd</span><span class=p>],</span> <span class=n>file</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>spin_unlock</span><span class=p>(</span><span class=o>&amp;</span><span class=n>files</span><span class=o>-&gt;</span><span class=n>file_lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>smp_rmb</span><span class=p>();</span>                               <span class=c1>// 与 expand_fdtable 的 smp_wmb 配对
+</span></span></span><span class=line><span class=cl>    <span class=n>fdt</span> <span class=o>=</span> <span class=nf>rcu_dereference_sched</span><span class=p>(</span><span class=n>files</span><span class=o>-&gt;</span><span class=n>fdt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>rcu_assign_pointer</span><span class=p>(</span><span class=n>fdt</span><span class=o>-&gt;</span><span class=n>fd</span><span class=p>[</span><span class=n>fd</span><span class=p>],</span> <span class=n>file</span><span class=p>);</span>   <span class=c1>// 快路径：无锁写入
+</span></span></span><span class=line><span class=cl>    <span class=nf>rcu_read_unlock_sched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>fd_install</code> 有两条路径：</p><ul><li><strong>快路径</strong>（常见）：无扩容进行中，RCU 读侧临界区内直接写指针</li><li><strong>慢路径</strong>（罕见）：扩容进行中，退化为持 <code>file_lock</code> 写入</li></ul><p>此后 fd 对用户态可见。<code>read</code>/<code>write</code>/<code>close</code> 等通过 VFS → <code>socket_file_ops</code> → <code>inet_stream_ops</code> / <code>tcp_prot</code> 到达 TCP 协议栈。</p><p><strong>4.8 fd 分配与安装时序图</strong></p><style>.fd-seq{max-width:780px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:0;margin:12px 0;font-family:Consolas,source code pro,monospace;font-size:12px;overflow:hidden}.fd-seq .phase{padding:12px 16px;border-bottom:1px solid #eee;position:relative}.fd-seq .phase:last-child{border-bottom:none}.fd-seq .phase:hover{background:#fafcff}.fd-seq .ph{display:flex;align-items:center;margin-bottom:8px}.fd-seq .ph .num{display:inline-flex;width:24px;height:24px;align-items:center;justify-content:center;border-radius:50%;background:#555;color:#fff;font-size:12px;font-weight:700;margin-right:8px;flex-shrink:0}.fd-seq .ph .fn{font-weight:700;font-size:13px;color:#333}.fd-seq .ph .src{font-size:10px;color:#888;margin-left:8px}.fd-seq .op{margin:3px 0 3px 36px;padding:3px 8px;font-size:11px;color:#444;border-left:2px solid #ddd;line-height:1.6}.fd-seq .op.key{border-left-color:#66bb6a;background:#f6fdf6}.fd-seq .op .tag{display:inline-block;font-size:9px;padding:1px 6px;border-radius:3px;margin-left:8px;vertical-align:middle}.fd-seq .op .tag.warn{background:#fff3cd;color:#856404;border:1px solid #ffc107}.fd-seq .op .tag.ok{background:#e8f5e9;color:#2e7d32;border:1px solid #66bb6a}.fd-seq .op .tag.err{background:#fce4e4;color:#c62828;border:1px solid #e57373}.fd-seq .summary{padding:10px 16px;background:#f0f4f8;font-size:11px;color:#555;border-top:1px solid #d5dee8}</style><div class=fd-seq><div class=phase><div class=ph><span class=num>1</span>
+<span class=fn>get_unused_fd_flags(flags)</span>
+<span class=src>fs/file.c → alloc_fd(0, RLIMIT_NOFILE, flags)</span></div><div class=op><code>spin_lock(&files->file_lock)</code></div><div class=op><code>find_next_fd(fdt, fd)</code> — 两级位图查找空闲 fd</div><div class=op><code>expand_files(files, fd)</code> — 容量不足时扩容 fdtable</div><div class="op key"><code>__set_open_fd(fd, fdt)</code> — 标记 open_fds + 更新 full_fds_bits</div><div class=op><code>__set_close_on_exec(fd, fdt)</code> — O_CLOEXEC 时设置</div><div class=op><code>spin_unlock</code> → return fd <span class="tag warn">位图已标记，fdt->fd[fd] 仍为 NULL</span></div></div><div class=phase><div class=ph><span class=num>2</span>
+<span class=fn>sock_alloc_file(sock, flags, dname)</span>
+<span class=src>net/socket.c</span></div><div class=op><code>alloc_file_pseudo(SOCK_INODE(sock), sock_mnt, "TCP", ...)</code></div><div class="op key"><code>sock->file = file; file->private_data = sock</code> — 双向关联</div><div class=op><code>stream_open()</code> → return file <span class="tag err">失败时 → put_unused_fd(fd) 归还位图</span></div></div><div class=phase><div class=ph><span class=num>3</span>
+<span class=fn>fd_install(fd, file)</span>
+<span class=src>fs/file.c</span></div><div class=op><code>rcu_read_lock_sched()</code></div><div class=op>检查 <code>resize_in_progress</code> → 快路径(无锁) / 慢路径(持锁)</div><div class="op key"><code>rcu_assign_pointer(fdt->fd[fd], file)</code> <span class="tag ok">fd 对用户态可见！</span></div><div class=op><code>rcu_read_unlock_sched()</code></div></div><div class=summary><b>设计要点</b>：位图标记（alloc_fd）与指针写入（fd_install）分离 — 两步之间若 sock_alloc_file 失败，put_unused_fd 可安全回滚位图，不产生悬挂 fd</div></div><hr><h2 id=五对象关系图>五、对象关系图</h2><blockquote><p><strong>交互版</strong>：浏览器打开 <a class=link href=socket%e5%88%9b%e5%bb%ba%e5%af%b9%e8%b1%a1%e5%85%b3%e7%b3%bb%e5%9b%be.html>socket创建对象关系图.html</a>（悬停对象查看源码级详情：ops 成员表、继承链、初始化参数、current 访问链）</p></blockquote><h3 id=51-创建顺序与关联建立>5.1 创建顺序与关联建立</h3><div class=table-wrapper><table><thead><tr><th>步骤</th><th>函数</th><th>分配来源</th><th>关联建立</th></tr></thead><tbody><tr><td>①</td><td><code>sock_alloc()</code> → <code>sock_alloc_inode()</code></td><td><code>sock_inode_cache</code> slab</td><td>socket 空壳（ops/sk/file 均 NULL）</td></tr><tr><td>②</td><td><code>inet_create()</code> → <code>sk_alloc()</code></td><td><code>tcp_prot.slab</code></td><td><code>socket.sk ↔ sock.sk_socket</code> 双向关联；<code>socket.ops = inet_stream_ops</code></td></tr><tr><td>③</td><td><code>sock_alloc_file()</code> + <code>fd_install()</code></td><td>file slab</td><td><code>socket.file ↔ file.private_data</code> 双向关联；<code>fdt->fd[fd] → file</code></td></tr></tbody></table></div><h3 id=52-运行时访问链从-current-到-tcp_sock>5.2 运行时访问链：从 <code>current</code> 到 <code>tcp_sock</code></h3><p>系统调用（<code>read</code>/<code>write</code>/<code>poll</code>/<code>close</code>/<code>getsockopt</code>/<code>epoll_ctl</code>）从 <code>current</code> 出发走 5 跳到达协议栈，每跳都是单指针解引用（O(1)）：</p><div class=table-wrapper><table><thead><tr><th>跳</th><th>起点 → 终点</th><th>解引用方式</th><th>并发保护</th></tr></thead><tbody><tr><td>①</td><td><code>current</code> → <code>task_struct</code></td><td>per-cpu 变量（<code>this_cpu_read_stable</code>）</td><td>调度器切换时更新</td></tr><tr><td>②</td><td><code>task_struct</code> → <code>files_struct</code></td><td><code>current->files</code> 单指针</td><td>—</td></tr><tr><td>③</td><td><code>files_struct</code> → <code>fdtable</code></td><td><code>rcu_dereference_check(files->fdt)</code></td><td>RCU 读侧 / <code>file_lock</code></td></tr><tr><td>④</td><td><code>fdtable</code> → <code>file</code></td><td><code>rcu_dereference(fdt->fd[fd])</code></td><td>配对 <code>rcu_assign_pointer</code></td></tr><tr><td>⑤</td><td><code>file</code> → <code>socket</code> → <code>sock</code></td><td><code>file->private_data</code> / <code>sock->sk</code></td><td><code>sock_from_file</code> 校验 <code>f_op</code></td></tr></tbody></table></div><p><strong>三个设计要点</strong>：</p><ul><li><strong>CLONE_FILES 共享语义</strong>：<code>clone(CLONE_FILES)</code> 让多线程共享 <code>files_struct</code>（<code>count > 1</code>），扩容时须 <code>synchronize_rcu</code> 等其他核退出 RCU 临界区后再切换 <code>fdt</code> 指针</li><li><strong>RCU 贯穿始终</strong>：<code>fdt</code> 切换、<code>fd[]</code> 写入都用 RCU，让无锁读者（<code>fd_install</code> 快路径）与并发扩容（<code>expand_fdtable</code>）共存</li><li><strong>身份链 vs 数据链分离</strong>：身份链（fd→file→dentry→inode）走 VFS 框架；数据链（socket→sock→sk_buff 队列）走协议栈；两者通过 <code>file->private_data</code> 桥接</li></ul><hr><h2 id=六vfs-回调路径从-fd-到协议栈>六、VFS 回调路径：从 fd 到协议栈</h2><p>用户态 <code>read(fd)</code> 的完整路径：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>read(fd)
+</span></span><span class=line><span class=cl>  → vfs_read()
+</span></span><span class=line><span class=cl>    → file-&gt;f_op-&gt;read_iter()              // socket_file_ops.read_iter
+</span></span><span class=line><span class=cl>      → sock_read_iter()                    // net/socket.c
+</span></span><span class=line><span class=cl>        → sock-&gt;ops-&gt;recvmsg()             // inet_stream_ops.recvmsg
+</span></span><span class=line><span class=cl>          → inet_recvmsg()
+</span></span><span class=line><span class=cl>            → sk-&gt;sk_prot-&gt;recvmsg()       // tcp_prot.recvmsg
+</span></span><span class=line><span class=cl>              → tcp_recvmsg()
+</span></span></code></pre></td></tr></table></div></div><p>每个箭头对应一个函数指针跳转，分别经过：<strong>VFS → socket_file_ops → inet_stream_ops → tcp_prot</strong>。</p><hr><h2 id=七常见问题>七、常见问题</h2><h3 id=q1-alloc_fd-和-fd_install-之间如果失败会怎样>Q1: alloc_fd 和 fd_install 之间如果失败会怎样？</h3><p><code>sock_alloc_file</code> 失败时内部已调 <code>sock_release</code> 释放 socket，调用方用 <code>put_unused_fd</code> 归还位图上的 fd 号。两者必须成对——分配了位图没装 file 就得归还，否则 fd 号泄漏。</p><h3 id=q2-sock_cloexec-在哪里生效它和-o_cloexec-是什么关系>Q2: SOCK_CLOEXEC 在哪里生效？它和 O_CLOEXEC 是什么关系？</h3><p><strong>定义</strong>（<code>include/linux/net.h:74-79</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=cp>#define SOCK_TYPE_MASK  0xf          </span><span class=c1>// 低 4 位 = 真实 socket 类型
+</span></span></span><span class=line><span class=cl><span class=cp>#define SOCK_CLOEXEC    O_CLOEXEC    </span><span class=c1>// 与 O_CLOEXEC 同值
+</span></span></span><span class=line><span class=cl><span class=cp>#define SOCK_NONBLOCK   O_NONBLOCK   </span><span class=c1>// 与 O_NONBLOCK 同值
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>三个作用</strong>：</p><p>① <strong>类型与标志复用同一参数</strong>：用户写 <code>socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)</code>，一个 <code>type</code> 参数同时传类型和标志。<code>__sys_socket</code> 用位掩码拆分：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c __sys_socket
+</span></span></span><span class=line><span class=cl><span class=n>flags</span> <span class=o>=</span> <span class=n>type</span> <span class=o>&amp;</span> <span class=o>~</span><span class=n>SOCK_TYPE_MASK</span><span class=p>;</span>         <span class=c1>// 高位 = 标志
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=o>~</span><span class=p>(</span><span class=n>SOCK_CLOEXEC</span> <span class=o>|</span> <span class=n>SOCK_NONBLOCK</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=o>-</span><span class=n>EINVAL</span><span class=p>;</span>                     <span class=c1>// 只允许这两个标志
+</span></span></span><span class=line><span class=cl><span class=n>type</span>  <span class=o>&amp;=</span> <span class=n>SOCK_TYPE_MASK</span><span class=p>;</span>                <span class=c1>// 低 4 位 = 真实类型
+</span></span></span></code></pre></td></tr></table></div></div><p>② <strong>与 <code>O_CLOEXEC</code> 同值 → 免翻译直接传</strong>：<code>net/socket.c:1598</code> 用 <code>BUILD_BUG_ON(SOCK_CLOEXEC != O_CLOEXEC)</code> 编译期断言两者相等，<code>sock_map_fd(sock, flags)</code> 把 <code>flags</code> 当 <code>O_CLOEXEC</code> 传给 <code>get_unused_fd_flags</code>，无需位转换。</p><p>③ <strong>运行时语义</strong>：<code>alloc_fd</code> 中 <code>__set_close_on_exec(fd, fdt)</code> 置位图（<code>fs/file.c:530</code>）。进程调用 <code>execve()</code> 时，<code>fs/exec.c</code> 的 <code>do_close_on_exec()</code> 扫 <code>close_on_exec</code> 位图，凡置位的 fd 自动 <code>close()</code>，防止子进程继承敏感 fd（监听 socket、密钥文件、数据库连接）。</p><p><strong>设计思考（POSIX.1-2008 引入）</strong>：<code>socket()</code> + <code>fcntl(F_SETFD, FD_CLOEXEC)</code> 两步操作之间有竞态窗口 —— signal handler 或并发线程可能插入 <code>fork+exec</code>，导致子进程意外继承 fd。一步到位的 <code>SOCK_CLOEXEC</code> 消除该竞态。同一设计模式也用于 <code>epoll_create1(EPOLL_CLOEXEC)</code>、<code>eventfd(EFD_CLOEXEC)</code>、<code>timerfd_create(TFD_CLOEXEC)</code> 等所有返回 fd 的系统调用。</p><h3 id=q3-为什么-socket-要挂在-sockfs-上>Q3: 为什么 socket 要挂在 sockfs 上？</h3><p>内核通过 VFS 统一管理所有 I/O 对象。socket 挂在 sockfs 上后，<code>read</code>/<code>write</code>/<code>poll</code>/<code>close</code> 等系统调用可以复用 VFS 的统一入口（<code>vfs_read</code> 等），而不需要为 socket 另建一套系统调用分发机制。</p><h3 id=q4-container_of-转换的安全性>Q4: <code>container_of</code> 转换的安全性？</h3><p><code>SOCKET_I</code> / <code>SOCK_INODE</code> 的安全性取决于传入的 inode/socket 确实属于 <code>socket_alloc</code>。在内核中，只有 sockfs 的 inode 会被传给 <code>SOCKET_I</code>——调用方通常先检查 <code>inode->i_sb->s_magic == SOCKFS_MAGIC</code> 或 <code>S_ISSOCK(inode->i_mode)</code>。</p><h3 id=q5-一个-socket-对象在整个生命周期中被几个-slab-缓存管理>Q5: 一个 socket 对象在整个生命周期中被几个 slab 缓存管理？</h3><p>两个独立的 slab：</p><ul><li><code>sock_inode_cache</code>：管理 <code>socket_alloc</code>（含 socket + inode）</li><li><code>TCP</code> slab（<code>tcp_prot.slab</code>）：管理 <code>tcp_sock</code></li></ul><p>关闭时释放顺序相反：先 <code>tcp_close</code> 释放 tcp_sock，再 <code>sock_free_inode</code> 释放 socket_alloc。</p><h3 id=q6-为什么-fd-是从-next_fd-而非-0-开始搜索next_fd-是-fd-值还是数组下标>Q6: 为什么 fd 是从 <code>next_fd</code> 而非 0 开始搜索？<code>next_fd</code> 是 fd 值还是数组下标？</h3><p><code>files->next_fd</code> 是<strong>下一个建议使用的 fd 数值</strong>（语义上等于候选 fd 号，恰好也等于数组下标，但本质是 fd 值），是启发式优化。连续调用 <code>socket()</code>/<code>open()</code> 时，低位 fd 通常已被占满。</p><p>源码三处体现"fd 值"语义（<code>fs/file.c</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// L504 alloc_fd：把候选 fd 号抬到 next_fd（不是&#34;从下标 next_fd 读&#34;）
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>fd</span> <span class=o>&lt;</span> <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>fd</span> <span class=o>=</span> <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// L526 alloc_fd：设为&#34;已分配 fd 值 + 1&#34;
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>start</span> <span class=o>&lt;=</span> <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span> <span class=o>=</span> <span class=n>fd</span> <span class=o>+</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// L570 __put_unused_fd：设为&#34;刚释放的 fd 值&#34;，下次优先复用低号
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>fd</span> <span class=o>&lt;</span> <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>files</span><span class=o>-&gt;</span><span class=n>next_fd</span> <span class=o>=</span> <span class=n>fd</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>若是"数组下标偏移"，<code>fd + 1</code> 的语义无从解释。<code>close(fd)</code> 释放一个较小的 fd 时，<code>__put_unused_fd</code> 把 <code>next_fd</code> 拉回该 fd 值，下次 <code>alloc_fd</code> 优先复用它，保证低号不被长期闲置。</p><p><strong>推演示例</strong>：用户先后分配 fd 18–23，再 close(20)，再分配一次。假设初始 <code>next_fd = 18</code>（即 0–17 已被占用）。</p><div class=table-wrapper><table><thead><tr><th>操作</th><th><code>alloc_fd</code> / <code>__put_unused_fd</code> 内部</th><th><code>next_fd</code> 结果</th></tr></thead><tbody><tr><td><code>socket()</code></td><td><code>fd = max(18, 18) = 18</code> → 命中 18 → <code>next_fd = 18 + 1</code></td><td><strong>19</strong></td></tr><tr><td><code>socket()</code></td><td><code>fd = 19</code> → 命中 → <code>next_fd = 20</code></td><td><strong>20</strong></td></tr><tr><td><code>socket()</code></td><td><code>fd = 20</code> → <code>next_fd = 21</code></td><td><strong>21</strong></td></tr><tr><td><code>socket()</code></td><td><code>fd = 21</code> → <code>next_fd = 22</code></td><td><strong>22</strong></td></tr><tr><td><code>socket()</code></td><td><code>fd = 22</code> → <code>next_fd = 23</code></td><td><strong>23</strong></td></tr><tr><td><code>socket()</code></td><td><code>fd = 23</code> → <code>next_fd = 24</code></td><td><strong>24</strong></td></tr><tr><td><code>close(20)</code></td><td>清 <code>open_fds[20]</code>；<code>if (20 &lt; 24) next_fd = 20</code></td><td><strong>20</strong></td></tr><tr><td><code>socket()</code></td><td><code>fd = max(0, 20) = 20</code> → 命中 20（刚释放）→ <code>next_fd = 21</code></td><td><strong>21</strong></td></tr></tbody></table></div><p><strong>关键观察</strong>：</p><ul><li>连续分配阶段 <code>next_fd</code> 单调递增，跳过已满低位</li><li><code>close(20)</code> 后 <code>next_fd</code> 被拉回到 20，下次分配<strong>立即复用</strong>刚释放的低号</li><li>若此时 20 被其他线程抢先占用，<code>find_next_fd</code> 会继续往后扫到下一个空闲位，但 <code>next_fd</code> 已记录"这里可能有机会"，避免从 0 起步扫描</li></ul><h3 id=q7-fdtable-扩容时如何保证并发安全>Q7: fdtable 扩容时如何保证并发安全？</h3><p>三层保护协作：</p><ol><li><strong><code>file_lock</code> 自旋锁</strong>：<code>alloc_fd</code> / <code>fd_install</code>（慢路径）/ <code>expand_fdtable</code> 持锁访问</li><li><strong><code>resize_in_progress</code> 标志</strong>：<code>fd_install</code> 快路径无锁时检查此标志，若扩容中则退化为持锁慢路径</li><li><strong>RCU</strong>：<code>rcu_assign_pointer(files->fdt, new_fdt)</code> 切换表指针，旧表通过 <code>call_rcu</code> 延迟释放，保证并发读者不触及已释放内存</li></ol><h3 id=q8-closefd-时-fd-号如何回收>Q8: close(fd) 时 fd 号如何回收？</h3><p><code>close(fd)</code> → <code>pick_file()</code> → <code>__put_unused_fd()</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>__clear_open_fd</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>fd</span><span class=p>,</span> <span class=k>struct</span> <span class=n>fdtable</span> <span class=o>*</span><span class=n>fdt</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>__clear_bit</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>open_fds</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>__clear_bit</span><span class=p>(</span><span class=n>fd</span> <span class=o>/</span> <span class=n>BITS_PER_LONG</span><span class=p>,</span> <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>full_fds_bits</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>清 <code>open_fds</code> 对应位，同时无条件清 <code>full_fds_bits</code> 对应位（保守策略：即使该块未变空也标记为"有空闲"，下次查找会进入该块）。然后 <code>next_fd = min(next_fd, fd)</code> 保证低号优先复用。</p></section><footer class=article-footer><section class=article-tags><a href=/tags/socket/>Socket</a>
+<a href=/tags/syscall/>Syscall</a>
+<a href=/tags/fd%E5%88%86%E9%85%8D/>Fd分配</a>
+<a href=/tags/vfs/>VFS</a>
+<a href=/tags/inet_create/>Inet_create</a>
+<a href=/tags/sock_alloc/>Sock_alloc</a>
+<a href=/tags/fdtable/>Fdtable</a>
+<a href=/tags/socket_alloc/>Socket_alloc</a>
+<a href=/tags/container_of/>Container_of</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp-bind-%E6%93%8D%E4%BD%9C%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP Bind 操作源码分析</h2></div></a></article><article><a href=/p/linux-%E7%BD%91%E7%BB%9C%E6%A0%B8%E5%BF%83%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E8%AE%BE%E8%AE%A1%E7%90%86%E5%BF%B5%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 网络核心数据结构设计理念分析</h2></div></a></article><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/netfilter-%E6%A1%86%E6%9E%B6%E4%B8%8E%E9%92%A9%E5%AD%90%E6%9C%BA%E5%88%B6/><div class=article-details><h2 class=article-title>Netfilter 框架与钩子机制</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

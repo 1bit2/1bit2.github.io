@@ -1,0 +1,736 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="TCP Bind 操作源码分析 基于 Linux 5.15.78，分析 bind() 系统调用从用户态到内核的完整路径：系统调用入口、地址校验、权限检查、BPF 钩子、状态机约束。\n端口分配算法（inet_csk_get_port、inet_csk_find_open_port）、bhash 哈希表结构、冲突检测（inet_csk_bind_conflict）的详细分析参见 TCP 端口分配与哈希表。\n目录 一、全景调用链 二、系统调用入口：__sys_bind() 三、协议层入口：inet_bind() 四、核心绑定逻辑：__inet_bind() 五、SO_REUSEADDR 与 SO_REUSEPORT 六、SO_BINDTODEVICE 与 bind 的交互 七、常见错误与排查 一、全景调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 用户态: bind(sockfd, addr, addrlen) │ ▼ __sys_bind() [net/socket.c:1757] ├── sockfd_lookup_light() // fd → struct socket ├── move_addr_to_kernel() // 用户地址拷贝到内核 ├── security_socket_bind() // LSM 安全检查 └── sock->ops->bind() // → inet_bind() │ ▼ inet_bind() [net/ipv4/af_inet.c:495] ├── BPF_CGROUP_RUN_PROG_INET_BIND_LOCK() // cgroup-BPF pre-bind └── __inet_bind() // 核心：地址校验 + 端口绑定 │ ▼ sk->sk_prot->get_port() // → inet_csk_get_port() │ ├─ 快路径: tb->fastreuse / sk_reuseport_match → success │ (SO_REUSEADDR / SO_REUSEPORT 命中) │ └─ 慢路径: inet_csk_bind_conflict() // 逐一检查 owners 链 · sk_bound_dev_if 分域 (§六.1) · sk_reuse + sk_state != TCP_LISTEN · sk_reuseport + uid_eq │ ▼ BPF_CGROUP_RUN_PROG_INET4_POST_BIND() // cgroup-BPF post-bind __inet_bind() 内部 10 步细节（地址族验证、FIB 查类型、特权端口、lock_sock/release_sock、状态检查、saddr 设置）详见 §四。\n"><title>TCP Bind 操作源码分析</title><link rel=canonical href=https://1bit2.github.io/p/tcp-bind-%E6%93%8D%E4%BD%9C%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP Bind 操作源码分析"><meta property='og:description' content="TCP Bind 操作源码分析 基于 Linux 5.15.78，分析 bind() 系统调用从用户态到内核的完整路径：系统调用入口、地址校验、权限检查、BPF 钩子、状态机约束。\n端口分配算法（inet_csk_get_port、inet_csk_find_open_port）、bhash 哈希表结构、冲突检测（inet_csk_bind_conflict）的详细分析参见 TCP 端口分配与哈希表。\n目录 一、全景调用链 二、系统调用入口：__sys_bind() 三、协议层入口：inet_bind() 四、核心绑定逻辑：__inet_bind() 五、SO_REUSEADDR 与 SO_REUSEPORT 六、SO_BINDTODEVICE 与 bind 的交互 七、常见错误与排查 一、全景调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 用户态: bind(sockfd, addr, addrlen) │ ▼ __sys_bind() [net/socket.c:1757] ├── sockfd_lookup_light() // fd → struct socket ├── move_addr_to_kernel() // 用户地址拷贝到内核 ├── security_socket_bind() // LSM 安全检查 └── sock->ops->bind() // → inet_bind() │ ▼ inet_bind() [net/ipv4/af_inet.c:495] ├── BPF_CGROUP_RUN_PROG_INET_BIND_LOCK() // cgroup-BPF pre-bind └── __inet_bind() // 核心：地址校验 + 端口绑定 │ ▼ sk->sk_prot->get_port() // → inet_csk_get_port() │ ├─ 快路径: tb->fastreuse / sk_reuseport_match → success │ (SO_REUSEADDR / SO_REUSEPORT 命中) │ └─ 慢路径: inet_csk_bind_conflict() // 逐一检查 owners 链 · sk_bound_dev_if 分域 (§六.1) · sk_reuse + sk_state != TCP_LISTEN · sk_reuseport + uid_eq │ ▼ BPF_CGROUP_RUN_PROG_INET4_POST_BIND() // cgroup-BPF post-bind __inet_bind() 内部 10 步细节（地址族验证、FIB 查类型、特权端口、lock_sock/release_sock、状态检查、saddr 设置）详见 §四。\n"><meta property='og:url' content='https://1bit2.github.io/p/tcp-bind-%E6%93%8D%E4%BD%9C%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='bind'><meta property='article:tag' content='inet_bind'><meta property='article:tag' content='SO_REUSEADDR'><meta property='article:tag' content='SO_REUSEPORT'><meta property='article:tag' content='socket'><meta property='article:published_time' content='2026-04-28T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-28T00:00:00+00:00'><meta name=twitter:title content="TCP Bind 操作源码分析"><meta name=twitter:description content="TCP Bind 操作源码分析 基于 Linux 5.15.78，分析 bind() 系统调用从用户态到内核的完整路径：系统调用入口、地址校验、权限检查、BPF 钩子、状态机约束。\n端口分配算法（inet_csk_get_port、inet_csk_find_open_port）、bhash 哈希表结构、冲突检测（inet_csk_bind_conflict）的详细分析参见 TCP 端口分配与哈希表。\n目录 一、全景调用链 二、系统调用入口：__sys_bind() 三、协议层入口：inet_bind() 四、核心绑定逻辑：__inet_bind() 五、SO_REUSEADDR 与 SO_REUSEPORT 六、SO_BINDTODEVICE 与 bind 的交互 七、常见错误与排查 一、全景调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 用户态: bind(sockfd, addr, addrlen) │ ▼ __sys_bind() [net/socket.c:1757] ├── sockfd_lookup_light() // fd → struct socket ├── move_addr_to_kernel() // 用户地址拷贝到内核 ├── security_socket_bind() // LSM 安全检查 └── sock->ops->bind() // → inet_bind() │ ▼ inet_bind() [net/ipv4/af_inet.c:495] ├── BPF_CGROUP_RUN_PROG_INET_BIND_LOCK() // cgroup-BPF pre-bind └── __inet_bind() // 核心：地址校验 + 端口绑定 │ ▼ sk->sk_prot->get_port() // → inet_csk_get_port() │ ├─ 快路径: tb->fastreuse / sk_reuseport_match → success │ (SO_REUSEADDR / SO_REUSEPORT 命中) │ └─ 慢路径: inet_csk_bind_conflict() // 逐一检查 owners 链 · sk_bound_dev_if 分域 (§六.1) · sk_reuse + sk_state != TCP_LISTEN · sk_reuseport + uid_eq │ ▼ BPF_CGROUP_RUN_PROG_INET4_POST_BIND() // cgroup-BPF post-bind __inet_bind() 内部 10 步细节（地址族验证、FIB 查类型、特权端口、lock_sock/release_sock、状态检查、saddr 设置）详见 §四。\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#目录>目录</a></li><li><a href=#一全景调用链>一、全景调用链</a></li><li><a href=#二系统调用入口__sys_bind>二、系统调用入口：<code>__sys_bind()</code></a></li><li><a href=#三协议层入口inet_bind>三、协议层入口：<code>inet_bind()</code></a></li><li><a href=#四核心绑定逻辑__inet_bind>四、核心绑定逻辑：<code>__inet_bind()</code></a><ol><li><a href=#关键分支port0-vs-port0>关键分支：port=0 vs port≠0</a></li><li><a href=#地址类型检查inet_addr_type_table>地址类型检查：<code>inet_addr_type_table()</code></a></li></ol></li><li><a href=#五so_reuseaddr-与-so_reuseport>五、SO_REUSEADDR 与 SO_REUSEPORT</a><ol><li><a href=#so_reuseaddr>SO_REUSEADDR</a></li><li><a href=#so_reuseport>SO_REUSEPORT</a></li><li><a href=#具体场景示例>具体场景示例</a><ol><li><a href=#场景-1服务器重启so_reuseaddr-最常用场景>场景 1：服务器重启（SO_REUSEADDR 最常用场景）</a></li><li><a href=#场景-2旧-listen-socket-仍在so_reuseaddr-失败>场景 2：旧 LISTEN socket 仍在（SO_REUSEADDR 失败）</a></li><li><a href=#场景-3只有一方设-so_reuseaddr失败>场景 3：只有一方设 SO_REUSEADDR（失败）</a></li><li><a href=#场景-4多-worker-监听同一端口so_reuseport-典型用法>场景 4：多 worker 监听同一端口（SO_REUSEPORT 典型用法）</a></li><li><a href=#场景-5uid-不同--单方未设so_reuseport-失败>场景 5：UID 不同 / 单方未设（SO_REUSEPORT 失败）</a></li><li><a href=#场景选择决策树>场景选择决策树</a></li></ol></li></ol></li><li><a href=#六so_bindtodevice-与-bind-的交互>六、SO_BINDTODEVICE 与 bind 的交互</a><ol><li><a href=#61-bind-阶段一端口冲突按设备分域--最常用>6.1 bind 阶段（一）：端口冲突按设备分域 — 最常用</a></li><li><a href=#62-bind-阶段二vrf-场景下地址校验走设备对应的-fib-表>6.2 bind 阶段（二）：VRF 场景下地址校验走设备对应的 FIB 表</a></li><li><a href=#63-connect--发包阶段路由-oif-被钉死>6.3 connect / 发包阶段：路由 oif 被钉死</a></li><li><a href=#64-收包阶段按设备匹配-listener>6.4 收包阶段：按设备匹配 listener</a></li><li><a href=#65-推荐顺序与代码示例>6.5 推荐顺序与代码示例</a></li><li><a href=#66-源码对照表供读者复核>6.6 源码对照表（供读者复核）</a></li><li><a href=#67-排查陷阱so_bindtodevice-下的-eaddrinuse-误判>6.7 排查陷阱：SO_BINDTODEVICE 下的 EADDRINUSE 误判</a></li></ol></li><li><a href=#七常见错误与排查>七、常见错误与排查</a><ol><li><a href=#排查端口占用>排查端口占用</a></li><li><a href=#延伸阅读>延伸阅读</a></li></ol></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-bind-%E6%93%8D%E4%BD%9C%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/>TCP Bind 操作源码分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 28, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>12 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp-bind-操作源码分析>TCP Bind 操作源码分析</h1><blockquote><p>基于 Linux 5.15.78，分析 <code>bind()</code> 系统调用从用户态到内核的完整路径：系统调用入口、地址校验、权限检查、BPF 钩子、状态机约束。</p><p>端口分配算法（<code>inet_csk_get_port</code>、<code>inet_csk_find_open_port</code>）、bhash 哈希表结构、冲突检测（<code>inet_csk_bind_conflict</code>）的详细分析参见 <a class=link href=TCP%e7%ab%af%e5%8f%a3%e5%88%86%e9%85%8d%e4%b8%8e%e5%93%88%e5%b8%8c%e8%a1%a8.md>TCP 端口分配与哈希表</a>。</p></blockquote><hr><h2 id=目录>目录</h2><ul><li><a class=link href=#%e4%b8%80%e5%85%a8%e6%99%af%e8%b0%83%e7%94%a8%e9%93%be>一、全景调用链</a></li><li><a class=link href=#%e4%ba%8c%e7%b3%bb%e7%bb%9f%e8%b0%83%e7%94%a8%e5%85%a5%e5%8f%a3__sys_bind>二、系统调用入口：<code>__sys_bind()</code></a></li><li><a class=link href=#%e4%b8%89%e5%8d%8f%e8%ae%ae%e5%b1%82%e5%85%a5%e5%8f%a3inet_bind>三、协议层入口：<code>inet_bind()</code></a></li><li><a class=link href=#%e5%9b%9b%e6%a0%b8%e5%bf%83%e7%bb%91%e5%ae%9a%e9%80%bb%e8%be%91__inet_bind>四、核心绑定逻辑：<code>__inet_bind()</code></a></li><li><a class=link href=#%e4%ba%94so_reuseaddr-%e4%b8%8e-so_reuseport>五、SO_REUSEADDR 与 SO_REUSEPORT</a></li><li><a class=link href=#%e5%85%adso_bindtodevice-%e4%b8%8e-bind-%e7%9a%84%e4%ba%a4%e4%ba%92>六、SO_BINDTODEVICE 与 bind 的交互</a></li><li><a class=link href=#%e4%b8%83%e5%b8%b8%e8%a7%81%e9%94%99%e8%af%af%e4%b8%8e%e6%8e%92%e6%9f%a5>七、常见错误与排查</a></li></ul><hr><h2 id=一全景调用链>一、全景调用链</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户态: bind(sockfd, addr, addrlen)
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>__sys_bind()                            [net/socket.c:1757]
+</span></span><span class=line><span class=cl>    ├── sockfd_lookup_light()            // fd → struct socket
+</span></span><span class=line><span class=cl>    ├── move_addr_to_kernel()            // 用户地址拷贝到内核
+</span></span><span class=line><span class=cl>    ├── security_socket_bind()           // LSM 安全检查
+</span></span><span class=line><span class=cl>    └── sock-&gt;ops-&gt;bind()                // → inet_bind()
+</span></span><span class=line><span class=cl>        │
+</span></span><span class=line><span class=cl>        ▼
+</span></span><span class=line><span class=cl>    inet_bind()                         [net/ipv4/af_inet.c:495]
+</span></span><span class=line><span class=cl>        ├── BPF_CGROUP_RUN_PROG_INET_BIND_LOCK()   // cgroup-BPF pre-bind
+</span></span><span class=line><span class=cl>        └── __inet_bind()                          // 核心：地址校验 + 端口绑定
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>            ▼
+</span></span><span class=line><span class=cl>        sk-&gt;sk_prot-&gt;get_port()         // → inet_csk_get_port()
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>            ├─ 快路径: tb-&gt;fastreuse / sk_reuseport_match → success
+</span></span><span class=line><span class=cl>            │          (SO_REUSEADDR / SO_REUSEPORT 命中)
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>            └─ 慢路径: inet_csk_bind_conflict()   // 逐一检查 owners 链
+</span></span><span class=line><span class=cl>                       · sk_bound_dev_if 分域 (§六.1)
+</span></span><span class=line><span class=cl>                       · sk_reuse + sk_state != TCP_LISTEN
+</span></span><span class=line><span class=cl>                       · sk_reuseport + uid_eq
+</span></span><span class=line><span class=cl>        │
+</span></span><span class=line><span class=cl>        ▼
+</span></span><span class=line><span class=cl>    BPF_CGROUP_RUN_PROG_INET4_POST_BIND()          // cgroup-BPF post-bind
+</span></span></code></pre></td></tr></table></div></div><blockquote><p><code>__inet_bind()</code> 内部 10 步细节（地址族验证、FIB 查类型、特权端口、<code>lock_sock</code>/<code>release_sock</code>、状态检查、saddr 设置）详见 <a class=link href=#%e5%9b%9b%e6%a0%b8%e5%bf%83%e7%bb%91%e5%ae%9a%e9%80%bb%e8%be%91__inet_bind>§四</a>。</p><p><code>sk_bound_dev_if</code> 在 bind 生命周期的 4 处读取（端口冲突分域 / VRF FIB / 路由 oif / 收包匹配）详见 <a class=link href=#%e5%85%adso_bindtodevice-%e4%b8%8e-bind-%e7%9a%84%e4%ba%a4%e4%ba%92>§六</a>。</p><p>端口获取的深层细节（bhash 查找 / 冲突检测 / 自动分配 / TIME_WAIT 复用）详见 <a class=link href=TCP%e7%ab%af%e5%8f%a3%e5%88%86%e9%85%8d%e4%b8%8e%e5%93%88%e5%b8%8c%e8%a1%a8.md>TCP 端口分配与哈希表</a>。</p></blockquote><hr><h2 id=二系统调用入口__sys_bind>二、系统调用入口：<code>__sys_bind()</code></h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c:1757-1782
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>__sys_bind</span><span class=p>(</span><span class=kt>int</span> <span class=n>fd</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sockaddr</span> <span class=n>__user</span> <span class=o>*</span><span class=n>umyaddr</span><span class=p>,</span> <span class=kt>int</span> <span class=n>addrlen</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=n>sock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sockaddr_storage</span> <span class=n>address</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>err</span><span class=p>,</span> <span class=n>fput_needed</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>sock</span> <span class=o>=</span> <span class=nf>sockfd_lookup_light</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>err</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fput_needed</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sock</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>err</span> <span class=o>=</span> <span class=nf>move_addr_to_kernel</span><span class=p>(</span><span class=n>umyaddr</span><span class=p>,</span> <span class=n>addrlen</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>address</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>err</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>err</span> <span class=o>=</span> <span class=nf>security_socket_bind</span><span class=p>(</span><span class=n>sock</span><span class=p>,</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr</span> <span class=o>*</span><span class=p>)</span><span class=o>&amp;</span><span class=n>address</span><span class=p>,</span> <span class=n>addrlen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>err</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                <span class=n>err</span> <span class=o>=</span> <span class=n>sock</span><span class=o>-&gt;</span><span class=n>ops</span><span class=o>-&gt;</span><span class=nf>bind</span><span class=p>(</span><span class=n>sock</span><span class=p>,</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr</span> <span class=o>*</span><span class=p>)</span><span class=o>&amp;</span><span class=n>address</span><span class=p>,</span> <span class=n>addrlen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=nf>fput_light</span><span class=p>(</span><span class=n>sock</span><span class=o>-&gt;</span><span class=n>file</span><span class=p>,</span> <span class=n>fput_needed</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>流程：fd 查找 → 地址拷贝 → LSM 检查 → 协议族 bind。</p><hr><h2 id=三协议层入口inet_bind>三、协议层入口：<code>inet_bind()</code></h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/af_inet.c:495-515
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>inet_bind</span><span class=p>(</span><span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=n>sock</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sockaddr</span> <span class=o>*</span><span class=n>uaddr</span><span class=p>,</span> <span class=kt>int</span> <span class=n>addr_len</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span> <span class=o>=</span> <span class=n>sock</span><span class=o>-&gt;</span><span class=n>sk</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>flags</span> <span class=o>=</span> <span class=n>BIND_WITH_LOCK</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// RAW socket 有自己的 bind 实现
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=n>bind</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>bind</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>uaddr</span><span class=p>,</span> <span class=n>addr_len</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>addr_len</span> <span class=o>&lt;</span> <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr_in</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>EINVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// cgroup-BPF pre-bind 钩子：容器场景可修改绑定行为
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 可设置 BIND_NO_CAP_NET_BIND_SERVICE 旁路特权端口检查
+</span></span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=nf>BPF_CGROUP_RUN_PROG_INET_BIND_LOCK</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>uaddr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                              <span class=n>CGROUP_INET4_BIND</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>flags</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>err</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>__inet_bind</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>uaddr</span><span class=p>,</span> <span class=n>addr_len</span><span class=p>,</span> <span class=n>flags</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四核心绑定逻辑__inet_bind>四、核心绑定逻辑：<code>__inet_bind()</code></h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span><span class=lnt>74
+</span><span class=lnt>75
+</span><span class=lnt>76
+</span><span class=lnt>77
+</span><span class=lnt>78
+</span><span class=lnt>79
+</span><span class=lnt>80
+</span><span class=lnt>81
+</span><span class=lnt>82
+</span><span class=lnt>83
+</span><span class=lnt>84
+</span><span class=lnt>85
+</span><span class=lnt>86
+</span><span class=lnt>87
+</span><span class=lnt>88
+</span><span class=lnt>89
+</span><span class=lnt>90
+</span><span class=lnt>91
+</span><span class=lnt>92
+</span><span class=lnt>93
+</span><span class=lnt>94
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/af_inet.c:530-624
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>__inet_bind</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sockaddr</span> <span class=o>*</span><span class=n>uaddr</span><span class=p>,</span> <span class=kt>int</span> <span class=n>addr_len</span><span class=p>,</span> <span class=n>u32</span> <span class=n>flags</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sockaddr_in</span> <span class=o>*</span><span class=n>addr</span> <span class=o>=</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr_in</span> <span class=o>*</span><span class=p>)</span><span class=n>uaddr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_sock</span> <span class=o>*</span><span class=n>inet</span> <span class=o>=</span> <span class=nf>inet_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>short</span> <span class=n>snum</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>chk_addr_ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>tb_id</span> <span class=o>=</span> <span class=n>RT_TABLE_LOCAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ① 地址族验证：必须 AF_INET（兼容 AF_UNSPEC + INADDR_ANY）
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_family</span> <span class=o>!=</span> <span class=n>AF_INET</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>EAFNOSUPPORT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_family</span> <span class=o>!=</span> <span class=n>AF_UNSPEC</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>            <span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span> <span class=o>!=</span> <span class=nf>htonl</span><span class=p>(</span><span class=n>INADDR_ANY</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ② 地址类型检查：通过 FIB 路由表判断是否为本地地址
+</span></span></span><span class=line><span class=cl>    <span class=n>tb_id</span> <span class=o>=</span> <span class=nf>l3mdev_fib_table_by_index</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>)</span> <span class=o>?</span> <span class=o>:</span> <span class=n>tb_id</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>chk_addr_ret</span> <span class=o>=</span> <span class=nf>inet_addr_type_table</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span><span class=p>,</span> <span class=n>tb_id</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ③ 非本地地址绑定控制
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 默认只能绑定本机 IP，IP_FREEBIND/IP_TRANSPARENT 可绑定任意 IP
+</span></span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>EADDRNOTAVAIL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>inet_can_nonlocal_bind</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>inet</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span> <span class=o>!=</span> <span class=nf>htonl</span><span class=p>(</span><span class=n>INADDR_ANY</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>chk_addr_ret</span> <span class=o>!=</span> <span class=n>RTN_LOCAL</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>chk_addr_ret</span> <span class=o>!=</span> <span class=n>RTN_MULTICAST</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>chk_addr_ret</span> <span class=o>!=</span> <span class=n>RTN_BROADCAST</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ④ 特权端口检查：&lt; 1024 需要 CAP_NET_BIND_SERVICE
+</span></span></span><span class=line><span class=cl>    <span class=n>snum</span> <span class=o>=</span> <span class=nf>ntohs</span><span class=p>(</span><span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_port</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>EACCES</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>BIND_NO_CAP_NET_BIND_SERVICE</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>snum</span> <span class=o>&amp;&amp;</span> <span class=nf>inet_port_requires_bind_service</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>snum</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=o>!</span><span class=nf>ns_capable</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>user_ns</span><span class=p>,</span> <span class=n>CAP_NET_BIND_SERVICE</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ★ lock_sock 受 BIND_WITH_LOCK 标志控制，避免 BPF/内核调用路径重复加锁
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>BIND_WITH_LOCK</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>lock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ⑤ 状态检查：必须 TCP_CLOSE 且未绑定过
+</span></span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>EINVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_CLOSE</span> <span class=o>||</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_num</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out_release_sock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ⑥ 设置本地地址
+</span></span></span><span class=line><span class=cl>    <span class=c1>// inet_rcv_saddr: 用于收包哈希匹配
+</span></span></span><span class=line><span class=cl>    <span class=c1>// inet_saddr: 用于发包源地址
+</span></span></span><span class=line><span class=cl>    <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_rcv_saddr</span> <span class=o>=</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span> <span class=o>=</span> <span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>chk_addr_ret</span> <span class=o>==</span> <span class=n>RTN_MULTICAST</span> <span class=o>||</span> <span class=n>chk_addr_ret</span> <span class=o>==</span> <span class=n>RTN_BROADCAST</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// 多播/广播使用出口设备地址
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ⑦ 端口绑定：调用 inet_csk_get_port()
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 详见 [TCP 端口分配与哈希表](TCP端口分配与哈希表.md)
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>snum</span> <span class=o>||</span> <span class=o>!</span><span class=p>(</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>bind_address_no_port</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>                  <span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>BIND_FORCE_ADDRESS_NO_PORT</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>get_port</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>snum</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span> <span class=o>=</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_rcv_saddr</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>EADDRINUSE</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>out_release_sock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// post-bind BPF 钩子（BPF 调用路径跳过，避免递归）
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>BIND_FROM_BPF</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>err</span> <span class=o>=</span> <span class=nf>BPF_CGROUP_RUN_PROG_INET4_POST_BIND</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=n>err</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span> <span class=o>=</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_rcv_saddr</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=k>goto</span> <span class=n>out_release_sock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ⑧ 设置用户锁定标志，防止系统自动修改地址/端口
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_rcv_saddr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_userlocks</span> <span class=o>|=</span> <span class=n>SOCK_BINDADDR_LOCK</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>snum</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_userlocks</span> <span class=o>|=</span> <span class=n>SOCK_BINDPORT_LOCK</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_sport</span> <span class=o>=</span> <span class=nf>htons</span><span class=p>(</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_num</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_daddr</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_dport</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sk_dst_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>out_release_sock</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ★ 与上方 lock_sock 对称：只有 BIND_WITH_LOCK 路径才释放
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>BIND_WITH_LOCK</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>release_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>out</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>为什么 <code>lock_sock</code> / <code>release_sock</code> 必须受 <code>BIND_WITH_LOCK</code> 控制？</strong></p><p><code>__inet_bind</code> 同时被两条路径调用：</p><ul><li><strong>用户态 <code>bind()</code></strong>：<code>inet_bind</code> 传 <code>BIND_WITH_LOCK</code>，需要自己加锁</li><li><strong>BPF post-bind / 内核内部</strong>：传 <code>BIND_FROM_BPF</code> 等不带锁标志，调用方已持锁或无需加锁</li></ul><p>如果忽略这个标志直接 <code>lock_sock(sk)</code>，BPF 路径会在已持锁状态下重复加锁 → 死锁；而 <code>release_sock</code> 不对称释放则会破坏锁计数。</p><h3 id=关键分支port0-vs-port0>关键分支：port=0 vs port≠0</h3><ul><li><strong>port≠0（指定端口）</strong>：<code>get_port(sk, snum)</code> 在 bhash 中查找冲突</li><li><strong>port=0（自动分配）</strong>：<code>get_port(sk, 0)</code> 调用 <code>inet_csk_find_open_port()</code> 从临时端口范围分配</li><li><strong>port=0 + <code>bind_address_no_port</code></strong>：跳过 <code>get_port</code>，只绑定地址，端口延迟到 <code>connect()</code> 时分配</li></ul><h3 id=地址类型检查inet_addr_type_table>地址类型检查：<code>inet_addr_type_table()</code></h3><p>通过 FIB 路由表查询地址类型。<code>inet_addr_type_table</code> 定义在 <code>net/ipv4/fib_frontend.c:236</code>，内部转调 <code>__inet_dev_addr_type</code>（<code>fib_frontend.c:205</code>），核心查找逻辑如下：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/fib_frontend.c:221-228 (在 __inet_dev_addr_type 内)
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>fib_table_lookup</span><span class=p>(</span><span class=n>table</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fl4</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>res</span><span class=p>,</span> <span class=n>FIB_LOOKUP_NOREF</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fib_nh_common</span> <span class=o>*</span><span class=n>nhc</span> <span class=o>=</span> <span class=nf>fib_info_nhc</span><span class=p>(</span><span class=n>res</span><span class=p>.</span><span class=n>fi</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>dev</span> <span class=o>||</span> <span class=n>dev</span> <span class=o>==</span> <span class=n>nhc</span><span class=o>-&gt;</span><span class=n>nhc_dev</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=n>res</span><span class=p>.</span><span class=n>type</span><span class=p>;</span>   <span class=c1>// RTN_LOCAL / RTN_BROADCAST / RTN_UNICAST 等
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=五so_reuseaddr-与-so_reuseport>五、SO_REUSEADDR 与 SO_REUSEPORT</h2><blockquote><p>这两个选项影响 <code>inet_csk_get_port()</code> 中的冲突检测逻辑，冲突检测的完整代码分析参见 <a class=link href=TCP%e7%ab%af%e5%8f%a3%e5%88%86%e9%85%8d%e4%b8%8e%e5%93%88%e5%b8%8c%e8%a1%a8.md>TCP 端口分配与哈希表</a>。本节仅总结使用层面的行为差异。</p></blockquote><h3 id=so_reuseaddr>SO_REUSEADDR</h3><div class=table-wrapper><table><thead><tr><th>场景</th><th>效果</th></tr></thead><tbody><tr><td>对端 socket 在 <code>TIME_WAIT</code> 状态</td><td><strong>允许绑定</strong>（最常见用途：服务器重启）</td></tr><tr><td>对端 socket 在 <code>ESTABLISHED</code> 状态</td><td><strong>允许绑定</strong>（不同地址对不冲突）</td></tr><tr><td>对端 socket 在 <code>LISTEN</code> 状态</td><td><strong>不允许</strong>（<code>sk2->sk_state == TCP_LISTEN</code> 时检查失败）</td></tr><tr><td>双方绑定 <code>0.0.0.0:80</code> 且都 LISTEN</td><td><strong>冲突</strong>，即使都设置 REUSEADDR</td></tr></tbody></table></div><p>核心限制：<code>reuse && sk2->sk_reuse && sk2->sk_state != TCP_LISTEN</code>。LISTEN 状态的 socket 无法被 REUSEADDR 绕过。</p><h3 id=so_reuseport>SO_REUSEPORT</h3><div class=table-wrapper><table><thead><tr><th>条件</th><th>要求</th></tr></thead><tbody><tr><td>双方都设置 <code>SO_REUSEPORT</code></td><td>必须</td></tr><tr><td>同一 UID（<code>uid_eq</code>）</td><td>必须（安全隔离）</td></tr><tr><td>地址相同</td><td>允许（这是 REUSEPORT 的用途）</td></tr><tr><td>不同进程 LISTEN 同一端口</td><td>允许（内核做负载均衡分发 SYN）</td></tr></tbody></table></div><p>REUSEPORT 的核心优势：<strong>允许多个 LISTEN socket 绑定同一 <code>addr:port</code></strong>，解决了 REUSEADDR 无法做到的场景。</p><h3 id=具体场景示例>具体场景示例</h3><h4 id=场景-1服务器重启so_reuseaddr-最常用场景>场景 1：服务器重启（SO_REUSEADDR 最常用场景）</h4><p><strong>问题</strong>：HTTP 服务器 crash 或被 <code>kill</code>，重启时旧 socket 仍残留在 <code>TIME_WAIT</code> / <code>ESTABLISHED</code>，<code>bind()</code> 同一端口返回 <code>EADDRINUSE</code>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// server.c
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>sk</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(</span><span class=n>AF_INET</span><span class=p>,</span> <span class=n>SOCK_STREAM</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>opt</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_REUSEADDR</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>opt</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>opt</span><span class=p>));</span>  <span class=c1>// ★ 必加
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>sockaddr_in</span> <span class=n>addr</span> <span class=o>=</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>sin_family</span> <span class=o>=</span> <span class=n>AF_INET</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>sin_port</span>   <span class=o>=</span> <span class=nf>htons</span><span class=p>(</span><span class=mi>8080</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span> <span class=o>=</span> <span class=nf>htonl</span><span class=p>(</span><span class=n>INADDR_ANY</span><span class=p>),</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>bind</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr</span> <span class=o>*</span><span class=p>)</span><span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>addr</span><span class=p>))</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>perror</span><span class=p>(</span><span class=s>&#34;bind&#34;</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>exit</span><span class=p>(</span><span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=nf>listen</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=mi>128</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>行为</strong>：</p><div class=table-wrapper><table><thead><tr><th>旧 socket 状态</th><th>新 socket 设 SO_REUSEADDR</th><th>bind 结果</th></tr></thead><tbody><tr><td><code>TIME_WAIT</code>（活跃连接已关闭）</td><td>是</td><td>✓ 成功</td></tr><tr><td><code>ESTABLISHED</code>（仍有活跃连接）</td><td>是</td><td>✓ 成功（不同四元组不冲突）</td></tr><tr><td><code>FIN_WAIT_2</code> / <code>CLOSE_WAIT</code></td><td>是</td><td>✓ 成功</td></tr><tr><td>旧 listener 仍在 <code>LISTEN</code> 状态</td><td>是</td><td>✗ <code>EADDRINUSE</code>（见场景 2）</td></tr><tr><td>任意状态</td><td>否</td><td>✗ <code>EADDRINUSE</code></td></tr></tbody></table></div><p><strong>源码路径</strong>：<code>inet_csk_bind_conflict()</code>（<code>inet_connection_sock.c:133-183</code>）</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>reuse</span> <span class=o>&amp;&amp;</span> <span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_reuse</span> <span class=o>&amp;&amp;</span> <span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_LISTEN</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 双方都 REUSEADDR 且对方不在 LISTEN → 不 break，允许复用
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>inet_rcv_saddr_equal</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>sk2</span><span class=p>,</span> <span class=nb>true</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>break</span><span class=p>;</span>  <span class=c1>// relax=true 时这里不会执行到
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h4 id=场景-2旧-listen-socket-仍在so_reuseaddr-失败>场景 2：旧 LISTEN socket 仍在（SO_REUSEADDR 失败）</h4><p><strong>问题</strong>：父进程 fork 出 worker 后自己保持 LISTEN，worker 重启时想绑定同一端口。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 父进程
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>parent_sk</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(...);</span>
+</span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>parent_sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=p>...);</span>    <span class=c1>// 绑 0.0.0.0:8080
+</span></span></span><span class=line><span class=cl><span class=nf>listen</span><span class=p>(</span><span class=n>parent_sk</span><span class=p>,</span> <span class=mi>128</span><span class=p>);</span>         <span class=c1>// 状态 = TCP_LISTEN
+</span></span></span><span class=line><span class=cl><span class=nf>fork</span><span class=p>();</span>                         <span class=c1>// 子进程继承 parent_sk
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// 子进程（另起一个 socket）
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>child_sk</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(...);</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>child_sk</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_REUSEADDR</span><span class=p>,</span> <span class=o>&amp;</span><span class=p>(</span><span class=kt>int</span><span class=p>){</span><span class=mi>1</span><span class=p>},</span> <span class=k>sizeof</span><span class=p>(</span><span class=kt>int</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>child_sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=p>...);</span>     <span class=c1>// 同样地址
+</span></span></span><span class=line><span class=cl><span class=c1>// → EADDRINUSE！因为 parent_sk 仍在 TCP_LISTEN 状态
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>源码解释</strong>：<code>inet_csk_bind_conflict()</code> 对 <code>sk2->sk_state == TCP_LISTEN</code> 显式短路，即使双方都设了 <code>SO_REUSEADDR</code> 也会 <code>break</code>（冲突）。</p><p><strong>解决方法</strong>：改用 <code>SO_REUSEPORT</code>（见场景 4），或确保旧 listener 先 <code>close()</code>。</p><h4 id=场景-3只有一方设-so_reuseaddr失败>场景 3：只有一方设 SO_REUSEADDR（失败）</h4><p><strong>问题</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 进程 A（未设 SO_REUSEADDR）
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>sk_a</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(...);</span>
+</span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>sk_a</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=nf>listen</span><span class=p>(</span><span class=n>sk_a</span><span class=p>,</span> <span class=mi>128</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=c1>// ... A 接受连接，某活跃连接进入 ESTABLISHED
+</span></span></span><span class=line><span class=cl><span class=nf>close</span><span class=p>(</span><span class=n>sk_a</span><span class=p>);</span>                    <span class=c1>// listener 关闭，但子连接仍在 ESTABLISHED
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// 进程 B（设了 SO_REUSEADDR）
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>sk_b</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(...);</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>sk_b</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_REUSEADDR</span><span class=p>,</span> <span class=o>&amp;</span><span class=p>(</span><span class=kt>int</span><span class=p>){</span><span class=mi>1</span><span class=p>},</span> <span class=k>sizeof</span><span class=p>(</span><span class=kt>int</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>sk_b</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=c1>// → EADDRINUSE！因为 A 的 ESTABLISHED 子连接 sk_reuse=0
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>源码解释</strong>：<code>reuse && sk2->sk_reuse && sk2->sk_state != TCP_LISTEN</code> 三个条件<strong>全部为真</strong>才放行。B 设了 <code>reuse=1</code>，但 A 的 ESTABLISHED socket <code>sk2->sk_reuse=0</code>，整体为假 → 走 <code>else</code> 分支，地址相同 → <code>break</code> 冲突。</p><p><strong>关键教训</strong>：<code>SO_REUSEADDR</code> 必须<strong>双方都设</strong>才生效。服务器启动第一件事就该 <code>setsockopt(SO_REUSEADDR)</code>，否则 crash 后下次启动无法复用端口。</p><h4 id=场景-4多-worker-监听同一端口so_reuseport-典型用法>场景 4：多 worker 监听同一端口（SO_REUSEPORT 典型用法）</h4><p><strong>问题</strong>：Nginx / Redis 多 worker 进程都想 <code>listen()</code> 同一端口，由内核分发 SYN 实现负载均衡。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// worker.c — 每个 worker 进程独立运行同一份代码
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>sk</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(</span><span class=n>AF_INET</span><span class=p>,</span> <span class=n>SOCK_STREAM</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>opt</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_REUSEPORT</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>opt</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>opt</span><span class=p>));</span>  <span class=c1>// ★ 必加
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>sockaddr_in</span> <span class=n>addr</span> <span class=o>=</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>sin_family</span> <span class=o>=</span> <span class=n>AF_INET</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>sin_port</span>   <span class=o>=</span> <span class=nf>htons</span><span class=p>(</span><span class=mi>80</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span> <span class=o>=</span> <span class=nf>htonl</span><span class=p>(</span><span class=n>INADDR_ANY</span><span class=p>),</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr</span> <span class=o>*</span><span class=p>)</span><span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>addr</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=nf>listen</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=mi>1024</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// accept 循环：每个 worker 各自 accept()，内核按 hash 分发 SYN
+</span></span></span><span class=line><span class=cl><span class=k>while</span> <span class=p>(</span><span class=mi>1</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>client</span> <span class=o>=</span> <span class=nf>accept</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>handle</span><span class=p>(</span><span class=n>client</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>启动方式</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 父进程 fork 4 个 worker，每个都独立 bind+listen 80 端口</span>
+</span></span><span class=line><span class=cl><span class=k>for</span> i in <span class=m>1</span> <span class=m>2</span> <span class=m>3</span> 4<span class=p>;</span> <span class=k>do</span> ./worker <span class=p>&amp;</span> <span class=k>done</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>验证</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl>$ ss -ltnp <span class=p>|</span> grep :80
+</span></span><span class=line><span class=cl>LISTEN  <span class=m>0</span>  <span class=m>1024</span>  0.0.0.0:80  users:<span class=o>((</span><span class=s2>&#34;worker&#34;</span>,pid<span class=o>=</span>1234,fd<span class=o>=</span>3<span class=o>))</span>
+</span></span><span class=line><span class=cl>LISTEN  <span class=m>0</span>  <span class=m>1024</span>  0.0.0.0:80  users:<span class=o>((</span><span class=s2>&#34;worker&#34;</span>,pid<span class=o>=</span>1235,fd<span class=o>=</span>3<span class=o>))</span>
+</span></span><span class=line><span class=cl>LISTEN  <span class=m>0</span>  <span class=m>1024</span>  0.0.0.0:80  users:<span class=o>((</span><span class=s2>&#34;worker&#34;</span>,pid<span class=o>=</span>1236,fd<span class=o>=</span>3<span class=o>))</span>
+</span></span><span class=line><span class=cl>LISTEN  <span class=m>0</span>  <span class=m>1024</span>  0.0.0.0:80  users:<span class=o>((</span><span class=s2>&#34;worker&#34;</span>,pid<span class=o>=</span>1237,fd<span class=o>=</span>3<span class=o>))</span>
+</span></span></code></pre></td></tr></table></div></div><p>4 个 listener 同时存在，不报 <code>EADDRINUSE</code>。</p><p><strong>源码路径</strong>：<code>inet_csk_get_port()</code>（<code>inet_connection_sock.c:461-476</code>）</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>hlist_empty</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>owners</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_reuse</span> <span class=o>==</span> <span class=n>SK_FORCE_REUSE</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>success</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>((</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>fastreuse</span> <span class=o>&gt;</span> <span class=mi>0</span> <span class=o>&amp;&amp;</span> <span class=n>reuse</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=nf>sk_reuseport_match</span><span class=p>(</span><span class=n>tb</span><span class=p>,</span> <span class=n>sk</span><span class=p>))</span>     <span class=c1>// ★ SO_REUSEPORT 走这里
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>success</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>inet_csk_bind_conflict</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>tb</span><span class=p>,</span> <span class=nb>true</span><span class=p>,</span> <span class=nb>true</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>fail_unlock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>sk_reuseport_match()</code>（<code>inet_connection_sock.c:316-347</code>）依次校验：</p><ol><li><code>tb->fastreuseport > 0</code> — 桶内所有 socket 都支持 REUSEPORT</li><li><code>sk->sk_reuseport</code> — 新 socket 已设 REUSEPORT</li><li><code>!rcu_access_pointer(sk->sk_reuseport_cb)</code> — 无 BPF 程序干扰</li><li><code>uid_eq(tb->fastuid, uid)</code> — <strong>同一用户</strong>（安全隔离）</li></ol><h4 id=场景-5uid-不同--单方未设so_reuseport-失败>场景 5：UID 不同 / 单方未设（SO_REUSEPORT 失败）</h4><p><strong>问题 A：双方 UID 不同</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 进程 A 以 root 运行</span>
+</span></span><span class=line><span class=cl>sudo ./worker     <span class=c1># uid=0, 绑定 80 端口成功</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 进程 B 以普通用户运行</span>
+</span></span><span class=line><span class=cl>./worker          <span class=c1># uid=1000, 绑定同一端口</span>
+</span></span><span class=line><span class=cl><span class=c1># → EADDRINUSE（sk_reuseport_match 在 uid_eq 处返回 0）</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>问题 B：只有一方设 SO_REUSEPORT</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 进程 A（未设 SO_REUSEPORT）
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>sk_a</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(...);</span>
+</span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>sk_a</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=nf>listen</span><span class=p>(</span><span class=n>sk_a</span><span class=p>,</span> <span class=mi>128</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// 进程 B（设了 SO_REUSEPORT）
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>sk_b</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(...);</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>sk_b</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_REUSEPORT</span><span class=p>,</span> <span class=o>&amp;</span><span class=p>(</span><span class=kt>int</span><span class=p>){</span><span class=mi>1</span><span class=p>},</span> <span class=k>sizeof</span><span class=p>(</span><span class=kt>int</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>sk_b</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=c1>// → EADDRINUSE（sk_reuseport_match 在 !sk-&gt;sk_reuseport 处返回 0）
+</span></span></span><span class=line><span class=cl><span class=c1>// 随后进入 inet_csk_bind_conflict，地址相同 → 冲突
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>关键教训</strong>：</p><ul><li><code>SO_REUSEPORT</code> 同样要求<strong>双方都设</strong>（与 REUSEADDR 一致）</li><li><code>SO_REUSEPORT</code> 额外要求<strong>同一 UID</strong>，root 进程与用户进程不能"共享端口"——这是多租户隔离的安全防线</li></ul><h4 id=场景选择决策树>场景选择决策树</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>我要让新 socket bind() 已被占用的端口
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ├─ 旧 socket 是 TIME_WAIT / ESTABLISHED 等&#34;非 LISTEN&#34; 状态？
+</span></span><span class=line><span class=cl>    │   └─ 是 → SO_REUSEADDR（双方都设）
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ├─ 我要多个进程同时 LISTEN 同一端口做负载均衡？
+</span></span><span class=line><span class=cl>    │   └─ 是 → SO_REUSEPORT（双方都设 + 同 UID）
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ├─ 我要新 listener 在旧 listener 仍在运行时接管端口？
+</span></span><span class=line><span class=cl>    │   └─ 不可能（REUSEADDR 被 LISTEN 状态短路，REUSEPORT 让两个 listener 共存而非接管）
+</span></span><span class=line><span class=cl>    │       → 解决：让旧进程先 close()，或用 systemd socket activation
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    └─ 我要 connect() 复用 TIME_WAIT 的四元组？
+</span></span><span class=line><span class=cl>        └─ 不是 bind 层问题，改用 sysctl tcp_tw_reuse（见 TCP端口分配与哈希表.md §5）
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=六so_bindtodevice-与-bind-的交互>六、SO_BINDTODEVICE 与 bind 的交互</h2><blockquote><p>进阶主题：分析先 <code>setsockopt(SO_BINDTODEVICE)</code> 再 <code>bind()</code> 在 socket 生命周期（bind → connect/发包 → 收包）中对 4 处行为的影响。所有源码引用均来自 Linux 5.15.78，每处标有文件:行号，末尾附"源码对照表"供复核。</p><p><strong>一句话机制</strong>：<code>SO_BINDTODEVICE</code> 的内核动作<strong>只是</strong> <code>sk->sk_bound_dev_if = ifindex</code>（<code>net/core/sock.c:619</code>），然后 <code>sk_bound_dev_if</code> 在后续 4 处被读取。TCP 的 <code>tcp_prot</code> 未实现 <code>.rehash</code> 回调（<code>tcp_ipv4.c:3836-3881</code> 的结构体无 <code>.rehash</code> 字段），所以<strong>改绑设备不会 rehash、不会重做冲突检测</strong>。</p><p>下面按 <strong>bind 阶段 → connect/发包阶段 → 收包阶段</strong> 的 socket 生命周期展开，从最常用到最深入。</p></blockquote><h3 id=61-bind-阶段一端口冲突按设备分域--最常用>6.1 bind 阶段（一）：端口冲突按设备分域 — 最常用</h3><p>这是 <code>SO_BINDTODEVICE + bind</code> 最常被利用的能力。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c:133-183  inet_csk_bind_conflict()
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>inet_csk_bind_conflict</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                  <span class=k>const</span> <span class=k>struct</span> <span class=n>inet_bind_bucket</span> <span class=o>*</span><span class=n>tb</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                  <span class=kt>bool</span> <span class=n>relax</span><span class=p>,</span> <span class=kt>bool</span> <span class=n>reuseport_ok</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=p>...</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sk_for_each_bound</span><span class=p>(</span><span class=n>sk2</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>owners</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>sk</span> <span class=o>!=</span> <span class=n>sk2</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>            <span class=p>(</span><span class=o>!</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span> <span class=o>||</span>         <span class=c1>// ★ 双方任一未绑设备
+</span></span></span><span class=line><span class=cl>             <span class=o>!</span><span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>             <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span> <span class=o>==</span> <span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>))</span> <span class=p>{</span>  <span class=c1>// ★ 或设备相同
+</span></span></span><span class=line><span class=cl>            <span class=c1>// 才进入 IP/端口/REUSEADDR 冲突判断
+</span></span></span><span class=line><span class=cl>            <span class=p>...</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>sk2</span> <span class=o>!=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>解读</strong>：</p><ul><li>只有"双方 <code>sk_bound_dev_if</code> 都为 0，或相等"才继续判断 IP+port 冲突</li><li>只要<strong>任一方绑了不同设备</strong>，外层 <code>if</code> 为假，直接跳过，视为"不冲突"</li></ul><p><strong>行为矩阵</strong>（已存在一个 listener，新 socket 试图 bind 同一 IP:port）：</p><div class=table-wrapper><table><thead><tr><th>已存在 listener</th><th>新 socket</th><th>结果</th></tr></thead><tbody><tr><td><code>0.0.0.0:80</code>，未绑设备</td><td><code>bind 0.0.0.0:80</code> 绑 eth0</td><td><strong>EADDRINUSE</strong>（任一未绑 → 判冲突）</td></tr><tr><td><code>0.0.0.0:80</code>，绑 eth0</td><td><code>bind 0.0.0.0:80</code> 绑 eth1</td><td><strong>成功</strong> ✓（不同设备）</td></tr><tr><td><code>0.0.0.0:80</code>，绑 eth0</td><td><code>bind 0.0.0.0:80</code> 绑 eth0</td><td><strong>EADDRINUSE</strong>（同设备）</td></tr><tr><td><code>10.0.0.5:80</code>，绑 eth0</td><td><code>bind 10.0.0.5:80</code> 绑 eth1</td><td><strong>成功</strong> ✓</td></tr></tbody></table></div><p><strong>典型场景</strong>：多网卡服务器在每张网卡独立监听同一端口（双网卡负载均衡、多租户 VRF 隔离、DPDK/XDP 与内核栈共存）。</p><p><strong>陷阱</strong>：必须<strong>双方都绑设备</strong>才能"并行"监听；只要任一方 <code>sk_bound_dev_if == 0</code>，仍然冲突。</p><h3 id=62-bind-阶段二vrf-场景下地址校验走设备对应的-fib-表>6.2 bind 阶段（二）：VRF 场景下地址校验走设备对应的 FIB 表</h3><p><code>bind(ip)</code> 要验证 <code>ip</code> 是本机本地地址，否则会返回 <code>EADDRNOTAVAIL</code>（见 §四 步骤 ③）。这一检查的 FIB 表受 <code>sk_bound_dev_if</code> 影响：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/af_inet.c:550-562  __inet_bind()
+</span></span></span><span class=line><span class=cl><span class=cm>/* 步骤2: 检查地址类型(本地/多播/广播) */</span>
+</span></span><span class=line><span class=cl><span class=n>tb_id</span> <span class=o>=</span> <span class=nf>l3mdev_fib_table_by_index</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>)</span> <span class=o>?</span> <span class=o>:</span> <span class=n>tb_id</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=n>chk_addr_ret</span> <span class=o>=</span> <span class=nf>inet_addr_type_table</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span><span class=p>,</span> <span class=n>tb_id</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cm>/* 非本地地址绑定检查 */</span>
+</span></span><span class=line><span class=cl><span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>EADDRNOTAVAIL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>inet_can_nonlocal_bind</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>inet</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=n>addr</span><span class=o>-&gt;</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span> <span class=o>!=</span> <span class=nf>htonl</span><span class=p>(</span><span class=n>INADDR_ANY</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=n>chk_addr_ret</span> <span class=o>!=</span> <span class=n>RTN_LOCAL</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=n>chk_addr_ret</span> <span class=o>!=</span> <span class=n>RTN_MULTICAST</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=n>chk_addr_ret</span> <span class=o>!=</span> <span class=n>RTN_BROADCAST</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>解读</strong>：</p><ul><li><code>l3mdev_fib_table_by_index()</code> 在设备属于某 VRF（L3 master device）时返回该 VRF 的独立 FIB 表 ID；否则返回 0，走默认 <code>RT_TABLE_LOCAL</code></li><li><code>inet_addr_type_table</code> 在<strong>该 FIB 表内</strong>判断 <code>addr</code> 是否为 <code>RTN_LOCAL</code></li></ul><p><strong>行为差异</strong>：</p><div class=table-wrapper><table><thead><tr><th>场景</th><th>不绑设备</th><th>绑 VRF 设备</th></tr></thead><tbody><tr><td>bind <code>10.0.0.5</code>（该 IP 只在 VRF-A 内是 local）</td><td><code>-EADDRNOTAVAIL</code>（主表查不到）</td><td><strong>成功</strong>（VRF-A 表命中）</td></tr><tr><td>bind <code>192.168.1.10</code>（主表 local）</td><td><strong>成功</strong></td><td>绑非主表 VRF → <code>-EADDRNOTAVAIL</code></td></tr></tbody></table></div><p><strong>用途</strong>：VRF 多租户隔离 —— 每个 VRF 内的 socket 只能 bind 到该 VRF 路由表可见的 IP，跨 VRF 同名 IP 互不干扰。</p><h3 id=63-connect--发包阶段路由-oif-被钉死>6.3 connect / 发包阶段：路由 oif 被钉死</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:445-448  tcp_v4_connect()
+</span></span></span><span class=line><span class=cl><span class=n>rt</span> <span class=o>=</span> <span class=nf>ip_route_connect</span><span class=p>(</span><span class=n>fl4</span><span class=p>,</span> <span class=n>nexthop</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                      <span class=nf>RT_CONN_FLAGS</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>,</span>  <span class=c1>// ★ 路由 oif 被钉死
+</span></span></span><span class=line><span class=cl>                      <span class=n>IPPROTO_TCP</span><span class=p>,</span> <span class=n>orig_sport</span><span class=p>,</span> <span class=n>orig_dport</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>解读</strong>：<code>connect()</code> 发起的路由查询把 <code>sk_bound_dev_if</code> 当作 output interface 传给 <code>ip_route_connect</code>，FIB 只在<strong>该设备可达</strong>的路由里选择。</p><p><strong>行为差异</strong>：</p><div class=table-wrapper><table><thead><tr><th>场景</th><th>不绑设备</th><th>绑 eth0</th></tr></thead><tbody><tr><td>路由表中 eth0 / eth1 都能到目标</td><td>内核按 metric 选最优</td><td><strong>强制走 eth0</strong>，即使 eth1 metric 更优</td></tr><tr><td>目标只能从 eth1 到</td><td>走 eth1</td><td><code>-ENETUNREACH</code></td></tr></tbody></table></div><p><strong>用途</strong>：强制流量从指定网卡出（如管理口 vs 业务口分离）。</p><h3 id=64-收包阶段按设备匹配-listener>6.4 收包阶段：按设备匹配 listener</h3><p>客户端 SYN 到达时，内核在 <code>tcp_hashinfo.ehash</code>（已建立连接哈希表）查找匹配的 listener。查找函数按 <code>sk_bound_dev_if</code> 匹配入站设备：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_hashtables.c:243-245  遍历 listener 时的匹配
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>inet_sk_bound_dev_eq</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>,</span> <span class=n>dif</span><span class=p>,</span> <span class=n>sdif</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=o>-</span><span class=mi>1</span><span class=p>;</span>                   <span class=c1>// ★ 入站设备与绑定的设备不匹配 → 跳过
+</span></span></span><span class=line><span class=cl><span class=n>score</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span> <span class=o>?</span> <span class=mi>2</span> <span class=o>:</span> <span class=mi>1</span><span class=p>;</span>   <span class=c1>// 绑设备的 listener 优先级更高
+</span></span></span></code></pre></td></tr></table></div></div><p><code>inet_sk_bound_dev_eq</code> 是个 wrapper（<code>include/net/inet_sock.h:152-161</code>），它读取 <code>sysctl_tcp_l3mdev_accept</code> 后转调底层 <code>inet_bound_dev_eq</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/inet_sock.h:144-150
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>inet_bound_dev_eq</span><span class=p>(</span><span class=kt>bool</span> <span class=n>l3mdev_accept</span><span class=p>,</span> <span class=kt>int</span> <span class=n>bound_dev_if</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                     <span class=kt>int</span> <span class=n>dif</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sdif</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>bound_dev_if</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>!</span><span class=n>sdif</span> <span class=o>||</span> <span class=n>l3mdev_accept</span><span class=p>;</span>   <span class=c1>// 未绑：允许 slave 设备入站（受 sysctl 控制）
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>bound_dev_if</span> <span class=o>==</span> <span class=n>dif</span> <span class=o>||</span> <span class=n>bound_dev_if</span> <span class=o>==</span> <span class=n>sdif</span><span class=p>;</span>  <span class=c1>// 绑：必须匹配 dif 或其 master/slave
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// include/net/inet_sock.h:152-161
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>inet_sk_bound_dev_eq</span><span class=p>(</span><span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span><span class=p>,</span> <span class=kt>int</span> <span class=n>bound_dev_if</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                        <span class=kt>int</span> <span class=n>dif</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sdif</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl><span class=cp>#if IS_ENABLED(CONFIG_NET_L3_MASTER_DEV)
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>inet_bound_dev_eq</span><span class=p>(</span><span class=o>!!</span><span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_l3mdev_accept</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>                             <span class=n>bound_dev_if</span><span class=p>,</span> <span class=n>dif</span><span class=p>,</span> <span class=n>sdif</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=cp>#else
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>inet_bound_dev_eq</span><span class=p>(</span><span class=nb>true</span><span class=p>,</span> <span class=n>bound_dev_if</span><span class=p>,</span> <span class=n>dif</span><span class=p>,</span> <span class=n>sdif</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>解读</strong>：</p><ul><li>绑了 eth0 的 listener 只接收从 eth0（或其 L3 master/slave）入站的 SYN</li><li>从 eth1 来的 SYN 会匹配绑 eth1 的另一 listener，互不串扰</li><li>未绑设备的 listener 默认接收所有设备（除非 <code>sysctl_l3mdev_accept=0</code>）</li></ul><p><strong>用途</strong>：这是"同一端口多设备独立监听能正常工作"的根本保证 —— 否则两个 listener 同时存在时，入站 SYN 会被随机命中。</p><h3 id=65-推荐顺序与代码示例>6.5 推荐顺序与代码示例</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>int</span> <span class=n>sk</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(</span><span class=n>AF_INET</span><span class=p>,</span> <span class=n>SOCK_STREAM</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// ✅ 推荐：先绑设备，再 bind
+</span></span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_BINDTODEVICE</span><span class=p>,</span> <span class=s>&#34;eth0&#34;</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=s>&#34;eth0&#34;</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr</span> <span class=o>*</span><span class=p>)</span><span class=o>&amp;</span><span class=n>addr</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>addr</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=nf>listen</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>backlog</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// ⚠️ 反例：先 bind 再改设备
+</span></span></span><span class=line><span class=cl><span class=nf>bind</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_BINDTODEVICE</span><span class=p>,</span> <span class=s>&#34;eth1&#34;</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=c1>// 问题 1：需要 CAP_NET_RAW 才能改已绑的 sk_bound_dev_if
+</span></span></span><span class=line><span class=cl><span class=c1>// 问题 2：TCP 无 .rehash，不会在 bhash 桶里重新校验冲突
+</span></span></span><span class=line><span class=cl><span class=c1>//         如果 eth1 上已有同 IP:port listener，socket 会进入&#34;已 bind 但收包错乱&#34;状态
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>工程规范</strong>：把 <code>SO_BINDTODEVICE</code> 放在 socket() 之后、bind() 之前，让 bind 一次性完成设备感知的冲突检测。</p><h3 id=66-源码对照表供读者复核>6.6 源码对照表（供读者复核）</h3><div class=table-wrapper><table><thead><tr><th>论断</th><th>文件:行号</th></tr></thead><tbody><tr><td><code>SO_BINDTODEVICE</code> 写 <code>sk->sk_bound_dev_if</code></td><td><code>net/core/sock.c:619</code></td></tr><tr><td>重复绑设备需 <code>CAP_NET_RAW</code></td><td><code>net/core/sock.c:611-613</code></td></tr><tr><td>TCP <code>tcp_prot</code> 未实现 <code>.rehash</code></td><td><code>net/ipv4/tcp_ipv4.c:3836-3881</code>（结构体无 <code>.rehash</code> 字段）</td></tr><tr><td>bind 冲突按 <code>sk_bound_dev_if</code> 分域</td><td><code>net/ipv4/inet_connection_sock.c:157-161</code></td></tr><tr><td>bind 时 FIB 查表受设备影响</td><td><code>net/ipv4/af_inet.c:551-552</code></td></tr><tr><td>connect 路由 oif 被钉死</td><td><code>net/ipv4/tcp_ipv4.c:445-448</code></td></tr><tr><td>收包按设备匹配 listener</td><td><code>net/ipv4/inet_hashtables.c:243-245</code></td></tr><tr><td><code>inet_sk_bound_dev_eq</code> / <code>inet_bound_dev_eq</code> 处理 L3 master/slave</td><td><code>include/net/inet_sock.h:144-161</code></td></tr></tbody></table></div><h3 id=67-排查陷阱so_bindtodevice-下的-eaddrinuse-误判>6.7 排查陷阱：SO_BINDTODEVICE 下的 EADDRINUSE 误判</h3><p>常规 <code>EADDRINUSE</code> 排查只看 IP+port，但如果 socket 设置了 <code>SO_BINDTODEVICE</code>，冲突判定还会考虑设备（见 上文）。<strong>同一 IP:port 在不同网卡上可以被两个 listener 同时占用</strong>，此时 <code>ss -tlnp</code> 会列出两条记录，不是故障。</p><hr><hr><h2 id=七常见错误与排查>七、常见错误与排查</h2><div class=table-wrapper><table><thead><tr><th>错误码</th><th>场景</th><th>排查方法</th></tr></thead><tbody><tr><td><code>EACCES</code></td><td>非特权进程绑定端口 &lt; 1024</td><td><code>sysctl net.ipv4.ip_unprivileged_port_start</code> 或 <code>CAP_NET_BIND_SERVICE</code></td></tr><tr><td><code>EADDRINUSE</code></td><td>端口冲突</td><td><code>ss -tlnp | grep :PORT</code>；检查 TIME_WAIT 残留；设 <code>SO_REUSEADDR</code></td></tr><tr><td><code>EADDRNOTAVAIL</code></td><td>绑定的 IP 非本机地址</td><td><code>ip addr show</code>；设 <code>IP_FREEBIND</code> 或 <code>IP_TRANSPARENT</code></td></tr><tr><td><code>EINVAL</code></td><td>socket 已绑定（重复 bind）或状态不对</td><td>检查是否多次 bind</td></tr><tr><td><code>EAFNOSUPPORT</code></td><td><code>sin_family</code> 不是 <code>AF_INET</code></td><td>检查 sockaddr_in 初始化</td></tr></tbody></table></div><h3 id=排查端口占用>排查端口占用</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 查看端口绑定情况</span>
+</span></span><span class=line><span class=cl>ss -tlnp <span class=p>|</span> grep :8080
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看 TIME_WAIT 连接</span>
+</span></span><span class=line><span class=cl>ss -tan state time-wait <span class=p>|</span> grep :8080
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看 bhash 统计</span>
+</span></span><span class=line><span class=cl>cat /proc/net/sockstat
+</span></span><span class=line><span class=cl><span class=c1># TCP: inuse X orphan Y tw Z alloc W mem M</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=延伸阅读>延伸阅读</h3><p>bind 失败时，除了上表的通用排查，还要结合本文其他章节定位根因：</p><div class=table-wrapper><table><thead><tr><th>错误码</th><th>触发场景</th><th>详见</th></tr></thead><tbody><tr><td><code>EADDRINUSE</code></td><td>端口已被 bind / listen / TIME_WAIT 占用</td><td><a class=link href=#%e4%ba%94so_reuseaddr-%e4%b8%8e-so_reuseport>§五 SO_REUSEADDR / SO_REUSEPORT</a> 场景 1-5</td></tr><tr><td><code>EADDRINUSE</code></td><td>同一 IP:port 在不同网卡上看似冲突</td><td><a class=link href=#%e5%85%adso_bindtodevice-%e4%b8%8e-bind-%e7%9a%84%e4%ba%a4%e4%ba%92>§六 SO_BINDTODEVICE</a> §6.7</td></tr><tr><td><code>EADDRNOTAVAIL</code></td><td>bind 的 IP 在 VRF 路由表内不可见</td><td><a class=link href=#%e5%85%adso_bindtodevice-%e4%b8%8e-bind-%e7%9a%84%e4%ba%a4%e4%ba%92>§六 §6.2</a> VRF FIB 表</td></tr><tr><td><code>EACCES</code></td><td>端口 &lt; 1024 且无 CAP_NET_BIND_SERVICE</td><td><a class=link href=#%e5%9b%9b%e6%a0%b8%e5%bf%83%e7%bb%91%e5%ae%9a%e9%80%bb%e8%be%91__inet_bind>§四 步骤 ④</a></td></tr></tbody></table></div><hr></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/bind/>Bind</a>
+<a href=/tags/inet_bind/>Inet_bind</a>
+<a href=/tags/so_reuseaddr/>SO_REUSEADDR</a>
+<a href=/tags/so_reuseport/>SO_REUSEPORT</a>
+<a href=/tags/socket/>Socket</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

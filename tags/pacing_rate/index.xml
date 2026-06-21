@@ -1,0 +1,1578 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>Pacing_rate on 深栈</title><link>https://1bit2.github.io/tags/pacing_rate/</link><description>Recent content in Pacing_rate on 深栈</description><generator>Hugo -- gohugo.io</generator><language>en-us</language><lastBuildDate>Thu, 16 Apr 2026 00:00:00 +0000</lastBuildDate><atom:link href="https://1bit2.github.io/tags/pacing_rate/index.xml" rel="self" type="application/rss+xml"/><item><title>BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理</title><link>https://1bit2.github.io/p/bbr-bottleneck-bandwidth-and-rtt-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E7%AE%97%E6%B3%95%E5%8E%9F%E7%90%86/</link><pubDate>Thu, 16 Apr 2026 00:00:00 +0000</pubDate><guid>https://1bit2.github.io/p/bbr-bottleneck-bandwidth-and-rtt-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E7%AE%97%E6%B3%95%E5%8E%9F%E7%90%86/</guid><description>&lt;h1 id="bbr-bottleneck-bandwidth-and-rtt-拥塞控制算法原理"&gt;BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理
+&lt;/h1&gt;&lt;blockquote&gt;
+&lt;p&gt;基于 Linux 5.15.78 内核源码 &lt;code&gt;net/ipv4/tcp_bbr.c&lt;/code&gt; 分析&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;&lt;strong&gt;沉淀说明&lt;/strong&gt;：本文档与 &lt;code&gt;tcp_bbr.c&lt;/code&gt; 顶部长注释、实现常量（&lt;code&gt;bbr_*&lt;/code&gt;）保持一致；算法论文级推导以 ACM Queue 原文为准，实现细节以本树源码为准。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="一设计哲学"&gt;一、设计哲学
+&lt;/h2&gt;&lt;h3 id="11-传统算法的问题"&gt;1.1 传统算法的问题
+&lt;/h3&gt;&lt;p&gt;传统 TCP 拥塞控制（Reno、CUBIC 等）基于 &lt;strong&gt;&amp;ldquo;丢包即拥塞&amp;rdquo;&lt;/strong&gt; 假设：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;场景&lt;/th&gt;
+&lt;th&gt;问题&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;深缓冲网络 (bufferbloat)&lt;/td&gt;
+&lt;td&gt;先填满巨大缓冲区再丢包 → 排队延迟极高（数百毫秒）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;浅缓冲网络&lt;/td&gt;
+&lt;td&gt;缓冲区小 → 频繁丢包 → 反复降速 → 带宽利用率低&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;有随机丢包的链路（如无线网络）&lt;/td&gt;
+&lt;td&gt;误将随机丢包当作拥塞信号 → 不必要的降速&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h3 id="12-bbr-的核心思路"&gt;1.2 BBR 的核心思路
+&lt;/h3&gt;&lt;p&gt;BBR 不依赖丢包，而是直接 &lt;strong&gt;建模网络路径的两个物理参数&lt;/strong&gt;：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;BtlBw&lt;/strong&gt; (Bottleneck Bandwidth)：瓶颈链路的最大吞吐能力&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;RTprop&lt;/strong&gt; (Round-trip propagation time)：链路的最小传播延迟（不含排队）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;BBR 的目标是让发送速率精确地&amp;quot;骑在&amp;quot; BtlBw 上，同时保持 inflight 数据量等于 BDP（管道恰好满、队列恰好空），实现 &lt;strong&gt;最大吞吐 + 最低延迟&lt;/strong&gt; 的理想工作点。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="二核心算法公式"&gt;二、核心算法公式
+&lt;/h2&gt;&lt;h3 id="21-网络模型参数估计"&gt;2.1 网络模型参数估计
+&lt;/h3&gt;&lt;h4 id="btlbw瓶颈带宽"&gt;BtlBw（瓶颈带宽）
+&lt;/h4&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;BtlBw = windowed_max(delivery_rate, 过去 10 个 RTT)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;delivery_rate&lt;/strong&gt; = ACK 确认的数据量 / 投递间隔时间&lt;/li&gt;
+&lt;li&gt;使用滑动窗口 &lt;strong&gt;最大值&lt;/strong&gt; 滤波器（&lt;code&gt;win_minmax&lt;/code&gt;）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;为什么取最大值&lt;/strong&gt;：真实带宽是投递速率的上界，各种噪声（排队延迟、ACK 聚合、调度抖动）只会使测量偏低，不会偏高。取最大值过滤向下噪声。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;窗口长度 = 10 RTT&lt;/strong&gt;：覆盖完整的 PROBE_BW gain cycle (8 RTT) + 2 RTT 余量&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h4 id="rtprop传播延迟"&gt;RTprop（传播延迟）
+&lt;/h4&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;RTprop = windowed_min(rtt_sample, 过去 10 秒)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;ul&gt;
+&lt;li&gt;RTT = 传播延迟 + &lt;strong&gt;排队延迟&lt;/strong&gt; + 处理延迟&lt;/li&gt;
+&lt;li&gt;使用滑动窗口 &lt;strong&gt;最小值&lt;/strong&gt; 滤波器&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;为什么取最小值&lt;/strong&gt;：真实传播延迟是 RTT 的下界，排队只会抬高不会降低。取最小值过滤向上噪声。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;窗口长度 = 10 秒&lt;/strong&gt;：适应路由变化等网络条件变化。到期后强制进入 PROBE_RTT 重新测量。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3 id="22-bdp带宽-延迟积"&gt;2.2 BDP（带宽-延迟积）
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;BDP = BtlBw × RTprop
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;物理含义&lt;/strong&gt;：网络管道中可以容纳的在途数据量（单位：数据包）。这是实现&amp;quot;管道满、队列空&amp;quot;理想状态的精确 inflight 数据量。&lt;/p&gt;
+&lt;h3 id="23-发送速率控制pacing-rate"&gt;2.3 发送速率控制（Pacing Rate）
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;pacing_rate = pacing_gain × BtlBw × (1 - 1%)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;组成部分&lt;/th&gt;
+&lt;th&gt;含义&lt;/th&gt;
+&lt;th&gt;源码位置&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;pacing_gain&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;增益因子，不同状态取不同值&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_update_gains()&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;BtlBw&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;瓶颈带宽估计&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_bw()&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;(1 - 1%)&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;边际系数，略低于带宽&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_pacing_margin_percent&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;1% 边际的设计原理&lt;/strong&gt;：&lt;/p&gt;
+&lt;p&gt;如果 pacing_rate 精确等于 BtlBw，任何微小的测量误差（哪怕 0.1% 的高估）都会导致持续的队列积累。乘以 0.99 使平均注入速率略低于实际带宽：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;带宽高估时：0.99 × 高估值 ≈ 真实值，不会积累队列&lt;/li&gt;
+&lt;li&gt;带宽准确时：0.99 × 真实值，管道 99% 利用率，队列为空&lt;/li&gt;
+&lt;li&gt;带宽低估时：本身就不会积累队列&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这 1% 的吞吐量代价几乎不可感知，但显著降低了稳态队列占用和延迟。&lt;/p&gt;
+&lt;h3 id="24-拥塞窗口控制cwnd"&gt;2.4 拥塞窗口控制（cwnd）
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;target_cwnd = cwnd_gain × BDP + extra_acked + quantization_budget
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;cwnd = max(target_cwnd, 4)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;组成部分&lt;/th&gt;
+&lt;th&gt;含义&lt;/th&gt;
+&lt;th&gt;作用&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;cwnd_gain × BDP&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;基础 inflight 上限&lt;/td&gt;
+&lt;td&gt;cwnd_gain=2 提供 2 倍 BDP 余量&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;extra_acked&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;ACK 聚合额外余量&lt;/td&gt;
+&lt;td&gt;补偿 ACK 聚合间隙&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;quantization_budget&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;TSO/GRO 处理余量&lt;/td&gt;
+&lt;td&gt;3×tso_segs + 取偶 + Phase0 补偿&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;min = 4&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;最小 cwnd&lt;/td&gt;
+&lt;td&gt;保证 delayed-ACK 下管道畅通&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;cwnd 不含 1% 边际的原因&lt;/strong&gt;：pacing_rate 和 cwnd 职责不同：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;pacing_rate 控制数据 &lt;strong&gt;注入速率&lt;/strong&gt;（水龙头流速）&lt;/li&gt;
+&lt;li&gt;cwnd 控制在途数据 &lt;strong&gt;上限&lt;/strong&gt;（水池容量上限）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;cwnd 需要宽松的天花板来容忍 ACK 延迟和聚合波动，而不是精确限制。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="三状态机运行原理"&gt;三、状态机运行原理
+&lt;/h2&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; V
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; +---&amp;gt; STARTUP ----+
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | | |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | V |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | DRAIN ----+
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | | |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | V |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; +---&amp;gt; PROBE_BW ----+
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | ^ | |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | | | |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | +----+ |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; | |
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; +---- PROBE_RTT &amp;lt;--+
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h3 id="31-startup--快速探测管道容量"&gt;3.1 STARTUP — 快速探测管道容量
+&lt;/h3&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;参数&lt;/th&gt;
+&lt;th&gt;值&lt;/th&gt;
+&lt;th&gt;说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;pacing_gain&lt;/td&gt;
+&lt;td&gt;2/ln(2) ≈ 2.885&lt;/td&gt;
+&lt;td&gt;每 RTT 发送速率翻倍&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;cwnd_gain&lt;/td&gt;
+&lt;td&gt;2/ln(2) ≈ 2.885&lt;/td&gt;
+&lt;td&gt;匹配 pacing 增长&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;high_gain = 2/ln(2) 的数学推导&lt;/strong&gt;：&lt;/p&gt;
+&lt;p&gt;在 paced 发送模式下，设第 n 轮的发送量为 &lt;code&gt;S(n)&lt;/code&gt;，增益为 &lt;code&gt;G&lt;/code&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;S(n) = G × BtlBw_est(n-1) × RTT
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;因为 BtlBw 估计基于上一轮的投递速率，&lt;code&gt;BtlBw_est(n) ≈ S(n-1) / RTT&lt;/code&gt;，所以：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;S(n) = G × S(n-1)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;要使每轮总发送量翻倍（匹配传统慢启动），需要：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;S(1) + S(2) + ... + S(n) = 2 × (S(1) + S(2) + ... + S(n-1))
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;即 &lt;code&gt;S(n) = S(1) + S(2) + ... + S(n-1)&lt;/code&gt;，对等比数列 &lt;code&gt;G^(n-1)&lt;/code&gt; 求解得 &lt;strong&gt;G = 2/ln(2) ≈ 2.885&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;退出条件&lt;/strong&gt;：连续 3 轮 BtlBw 增长 &amp;lt; 25% → 判定管道已满&lt;/p&gt;
+&lt;p&gt;为什么要 3 轮：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;第 1 轮：接收端 rwin 自动调优可能正在扩大&lt;/li&gt;
+&lt;li&gt;第 2 轮：用更大 rwin 填充管道&lt;/li&gt;
+&lt;li&gt;第 3 轮：获得更高的投递速率样本&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h3 id="32-drain--排空-startup-建立的队列"&gt;3.2 DRAIN — 排空 STARTUP 建立的队列
+&lt;/h3&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;参数&lt;/th&gt;
+&lt;th&gt;值&lt;/th&gt;
+&lt;th&gt;说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;pacing_gain&lt;/td&gt;
+&lt;td&gt;1/2.885 ≈ 0.347&lt;/td&gt;
+&lt;td&gt;STARTUP 增益的倒数&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;cwnd_gain&lt;/td&gt;
+&lt;td&gt;2.885&lt;/td&gt;
+&lt;td&gt;保持高 cwnd，不触发慢启动&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;排空原理&lt;/strong&gt;：&lt;/p&gt;
+&lt;p&gt;STARTUP 结束时 inflight ≈ 2.885 × BDP，队列积累 = (2.885 - 1) × BDP ≈ 1.885 × BDP。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;发送速率 = 0.347 × BtlBw
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;ACK 返回速率 = BtlBw
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;净排出速率 = BtlBw × (1 - 0.347) = 0.653 × BtlBw
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;排空时间 ≈ 1.885 × BDP / (0.653 × BtlBw) ≈ 2.9 × RTprop
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;选择 drain_gain = 1/high_gain 使 STARTUP 多注入和 DRAIN 排出的数据量精确对称。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;DRAIN 期间 cwnd_gain 仍为 2.885 的原因&lt;/strong&gt;：如果同时降低 cwnd，cwnd 会小于当前 inflight，TCP 会停止发送直到 inflight 降至 cwnd 以下——相当于突然断流而非渐进排空。保持高 cwnd，让 pacing_rate 自然控制排空节奏。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;退出条件&lt;/strong&gt;：inflight ≤ BDP&lt;/p&gt;
+&lt;h3 id="33-probe_bw--稳态运行与带宽探测"&gt;3.3 PROBE_BW — 稳态运行与带宽探测
+&lt;/h3&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;参数&lt;/th&gt;
+&lt;th&gt;值&lt;/th&gt;
+&lt;th&gt;说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;pacing_gain 循环&lt;/td&gt;
+&lt;td&gt;[5/4, 3/4, 1, 1, 1, 1, 1, 1]&lt;/td&gt;
+&lt;td&gt;8 phase 循环&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;cwnd_gain&lt;/td&gt;
+&lt;td&gt;2.0&lt;/td&gt;
+&lt;td&gt;容忍 ACK 波动&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;每 phase 持续时间&lt;/td&gt;
+&lt;td&gt;≈ 1 × RTprop&lt;/td&gt;
+&lt;td&gt;按 min_rtt 计时&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;Gain Cycling 详解&lt;/strong&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;Phase 0 (gain=1.25): 探测 — 以高于 BtlBw 25% 的速率发送
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 如果有新带宽 → BtlBw 滤波器捕获更高样本
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 多注入 0.25 × BDP 数据到队列
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── 退出条件：时间 ≥ RTprop 且 (丢包 或 inflight ≥ 1.25×BDP)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;Phase 1 (gain=0.75): 排空 — 以低于 BtlBw 25% 的速率发送
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 排出 Phase 0 多注入的 0.25 × BDP 数据
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 数学平衡：多注入 = (1.25-1)×BDP = 少注入 = (1-0.75)×BDP = 0.25×BDP
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── 退出条件：时间 ≥ RTprop 或 inflight ≤ BDP
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;Phase 2-7 (gain=1.0): 巡航 — 以 BtlBw 速率匀速发送
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 管道满、队列空，高吞吐低延迟
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── 退出条件：时间 ≥ RTprop
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;公平性&lt;/strong&gt;：多条 BBR 流共享瓶颈时，各流的 gain cycling 异步进行（起始 phase 随机化），短时间交替试探，长时间收敛到公平份额。&lt;/p&gt;
+&lt;h3 id="34-probe_rtt--协作测量传播延迟"&gt;3.4 PROBE_RTT — 协作测量传播延迟
+&lt;/h3&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;参数&lt;/th&gt;
+&lt;th&gt;值&lt;/th&gt;
+&lt;th&gt;说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;pacing_gain&lt;/td&gt;
+&lt;td&gt;1.0&lt;/td&gt;
+&lt;td&gt;正常速率&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;cwnd&lt;/td&gt;
+&lt;td&gt;4 包 (强制)&lt;/td&gt;
+&lt;td&gt;最小值&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;持续时间&lt;/td&gt;
+&lt;td&gt;max(200ms, 1 RTT)&lt;/td&gt;
+&lt;td&gt;在 inflight ≤ 4 后计时&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;触发条件&lt;/td&gt;
+&lt;td&gt;min_rtt 10 秒未更新&lt;/td&gt;
+&lt;td&gt;窗口到期&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;运行流程&lt;/strong&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;span class="lnt"&gt;7
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;10 秒 min_rtt 窗口到期
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 保存当前 cwnd
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 压缩 cwnd 到 4 包
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 等待 inflight 降到 ≤ 4
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 启动 200ms 计时器
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 200ms + 1 RTT 后退出
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 恢复 cwnd，进入 PROBE_BW 或 STARTUP
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;性能开销&lt;/strong&gt;：200ms / 10s = 2% 吞吐量损失&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;协作效果&lt;/strong&gt;：所有 BBR 流都会周期性进入 PROBE_RTT，共同排空瓶颈队列，使每个流都能测到准确的 RTprop。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="四参数变化一览表"&gt;四、参数变化一览表
+&lt;/h2&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;参数&lt;/th&gt;
+&lt;th&gt;STARTUP&lt;/th&gt;
+&lt;th&gt;DRAIN&lt;/th&gt;
+&lt;th&gt;PROBE_BW&lt;/th&gt;
+&lt;th&gt;PROBE_RTT&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;pacing_gain&lt;/td&gt;
+&lt;td&gt;2.885&lt;/td&gt;
+&lt;td&gt;0.347&lt;/td&gt;
+&lt;td&gt;循环 [5/4, 3/4, 1×6]&lt;/td&gt;
+&lt;td&gt;1.0&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;cwnd_gain&lt;/td&gt;
+&lt;td&gt;2.885&lt;/td&gt;
+&lt;td&gt;2.885&lt;/td&gt;
+&lt;td&gt;2.0&lt;/td&gt;
+&lt;td&gt;1.0&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;inflight 目标&lt;/td&gt;
+&lt;td&gt;递增至饱和&lt;/td&gt;
+&lt;td&gt;降至 BDP&lt;/td&gt;
+&lt;td&gt;≈ BDP ± 25%&lt;/td&gt;
+&lt;td&gt;4 pkts&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;BtlBw 更新&lt;/td&gt;
+&lt;td&gt;是&lt;/td&gt;
+&lt;td&gt;是&lt;/td&gt;
+&lt;td&gt;是&lt;/td&gt;
+&lt;td&gt;否 (app_limited)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;RTprop 更新&lt;/td&gt;
+&lt;td&gt;机会性&lt;/td&gt;
+&lt;td&gt;机会性&lt;/td&gt;
+&lt;td&gt;机会性&lt;/td&gt;
+&lt;td&gt;强制更新&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;典型持续时间&lt;/td&gt;
+&lt;td&gt;~6 RTT&lt;/td&gt;
+&lt;td&gt;~3 RTT&lt;/td&gt;
+&lt;td&gt;大部分时间&lt;/td&gt;
+&lt;td&gt;200ms+1RTT&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;hr&gt;
+&lt;h2 id="五bbr_main-每-ack-完整执行流程"&gt;五、&lt;code&gt;bbr_main&lt;/code&gt; 每 ACK 完整执行流程
+&lt;/h2&gt;&lt;p&gt;&lt;code&gt;bbr_main()&lt;/code&gt; 是 BBR 的核心入口，TCP 栈在每个 ACK 到达时调用。它分为两大阶段：&lt;strong&gt;更新模型&lt;/strong&gt;（感知网络）和&lt;strong&gt;设置控制输出&lt;/strong&gt;（控制发送）。下面按代码调用顺序逐层展开。&lt;/p&gt;
+&lt;h3 id="50-总览调用树"&gt;5.0 总览：调用树
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;span class="lnt"&gt;21
+&lt;/span&gt;&lt;span class="lnt"&gt;22
+&lt;/span&gt;&lt;span class="lnt"&gt;23
+&lt;/span&gt;&lt;span class="lnt"&gt;24
+&lt;/span&gt;&lt;span class="lnt"&gt;25
+&lt;/span&gt;&lt;span class="lnt"&gt;26
+&lt;/span&gt;&lt;span class="lnt"&gt;27
+&lt;/span&gt;&lt;span class="lnt"&gt;28
+&lt;/span&gt;&lt;span class="lnt"&gt;29
+&lt;/span&gt;&lt;span class="lnt"&gt;30
+&lt;/span&gt;&lt;span class="lnt"&gt;31
+&lt;/span&gt;&lt;span class="lnt"&gt;32
+&lt;/span&gt;&lt;span class="lnt"&gt;33
+&lt;/span&gt;&lt;span class="lnt"&gt;34
+&lt;/span&gt;&lt;span class="lnt"&gt;35
+&lt;/span&gt;&lt;span class="lnt"&gt;36
+&lt;/span&gt;&lt;span class="lnt"&gt;37
+&lt;/span&gt;&lt;span class="lnt"&gt;38
+&lt;/span&gt;&lt;span class="lnt"&gt;39
+&lt;/span&gt;&lt;span class="lnt"&gt;40
+&lt;/span&gt;&lt;span class="lnt"&gt;41
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;bbr_main(sk, rs) ← TCP栈每ACK调用一次
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;├── bbr_update_model(sk, rs) ← 第1步：感知网络，更新内部模型
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_update_bw() ← ① 带宽采样：轮次检测 + LT限速器 + BtlBw滤波
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── 轮次(round)检测 delivered计数切分RTT轮次
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── bbr_lt_bw_sampling() 检测token-bucket限速器
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── minmax_running_max() 滑动窗口最大值更新BtlBw
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_update_ack_aggregation() ← ② ACK聚合度追踪
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── 双缓冲滑动窗口记录extra_acked最大值
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_update_cycle_phase() ← ③ PROBE_BW增益循环推进
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── bbr_is_next_cycle_phase() phase切换条件判定
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── bbr_advance_cycle_phase() 推进到下一个phase
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_check_full_bw_reached() ← ④ STARTUP管道填满检测
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── 连续3轮BtlBw增长&amp;lt;25% → full_bw_reached=1
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_check_drain() ← ⑤ STARTUP→DRAIN→PROBE_BW转换
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── full_bw_reached → 切到DRAIN
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── inflight≤BDP → 切到PROBE_BW
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_update_min_rtt() ← ⑥ RTprop维护 + PROBE_RTT状态机
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── 更新min_rtt_us(取最小/到期强制替换)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── 10s到期 → 进入PROBE_RTT
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── PROBE_RTT内部：等排空→计时→退出
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ └── bbr_update_gains() ← ⑦ 根据当前mode设置pacing_gain/cwnd_gain
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;├── bbr_bw(sk) ← 获取有效带宽(BtlBw或lt_bw)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;├── bbr_set_pacing_rate(sk,bw,gain) ← 第2步输出: pacing_rate = gain × bw × 0.99
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ └── bbr_bw_to_pacing_rate() 定点转bytes/sec，含1%边际
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;└── bbr_set_cwnd(sk,rs,acked,bw,gain) ← 第3步输出: cwnd
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── bbr_set_cwnd_to_recover_or_restore() 丢包恢复路径
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── bbr_bdp() BDP = ceil(bw × min_rtt × gain)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── bbr_ack_aggregation_cwnd() + ACK聚合余量
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── bbr_quantization_budget() + TSO/GRO量化余量
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── PROBE_RTT时强制cwnd=4
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h3 id="51-第一步bbr_update_model--感知网络"&gt;5.1 第一步：&lt;code&gt;bbr_update_model()&lt;/code&gt; — 感知网络
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;bbr_update_model()&lt;/code&gt; 按固定顺序调用 7 个子函数来更新 BBR 对网络的认知。&lt;strong&gt;顺序不可打乱&lt;/strong&gt;——后面的函数依赖前面的结果（例如 &lt;code&gt;bbr_check_drain()&lt;/code&gt; 需要 &lt;code&gt;bbr_check_full_bw_reached()&lt;/code&gt; 设置的 &lt;code&gt;full_bw_reached&lt;/code&gt; 标志）。&lt;/p&gt;
+&lt;h4 id="-bbr_update_bw--带宽采样与-btlbw-更新"&gt;① &lt;code&gt;bbr_update_bw()&lt;/code&gt; — 带宽采样与 BtlBw 更新
+&lt;/h4&gt;&lt;p&gt;这是模型更新的第一步，也是 BBR 最核心的函数。每个 ACK 都调用。它做三件事：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;A. 轮次(round)检测&lt;/strong&gt; — 用 delivered 计数切分 RTT 轮次&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;span class="lnt"&gt;7
+&lt;/span&gt;&lt;span class="lnt"&gt;8
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;条件：!before(rs-&amp;gt;prior_delivered, bbr-&amp;gt;next_rtt_delivered)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;含义：本ACK的参考包是在&amp;#34;当前轮次门槛之后&amp;#34;发出的 → 一个RTT已过
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;触发时：
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; next_rtt_delivered = tp-&amp;gt;delivered （画新门槛线）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; rtt_cnt++ （全局轮次计数器+1）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; round_start = 1 （通知其他子函数&amp;#34;新轮次到了&amp;#34;）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; packet_conservation = 0 （结束丢包恢复的包守恒）
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;为什么用 delivered 计数而不用挂钟？&lt;/strong&gt; RTT 会随队列深度变化，挂钟切分的&amp;quot;一轮&amp;quot;可能不对齐实际的包往返。delivered 计数与包的实际到达严格绑定，天然适应 RTT 的波动。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;B. LT 限速器采样&lt;/strong&gt; — &lt;code&gt;bbr_lt_bw_sampling()&lt;/code&gt;&lt;/p&gt;
+&lt;p&gt;检测链路上是否有 token-bucket 限速器（详见§六）。如果检测到，&lt;code&gt;bbr_bw()&lt;/code&gt; 会返回 &lt;code&gt;lt_bw&lt;/code&gt; 替代 &lt;code&gt;bbr_max_bw()&lt;/code&gt;。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;C. BtlBw 滤波器更新&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="n"&gt;bw&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;rs&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;delivered&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt; &lt;span class="n"&gt;BW_UNIT&lt;/span&gt; &lt;span class="o"&gt;/&lt;/span&gt; &lt;span class="n"&gt;rs&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;interval_us&lt;/span&gt; &lt;span class="c1"&gt;// 本次投递速率
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;!&lt;/span&gt;&lt;span class="n"&gt;rs&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;is_app_limited&lt;/span&gt; &lt;span class="o"&gt;||&lt;/span&gt; &lt;span class="n"&gt;bw&lt;/span&gt; &lt;span class="o"&gt;&amp;gt;=&lt;/span&gt; &lt;span class="nf"&gt;bbr_max_bw&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt; &lt;span class="c1"&gt;// 过滤app_limited样本
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;minmax_running_max&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;bbr&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;bw&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="mi"&gt;10&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;rtt_cnt&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;bw&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="c1"&gt;// 10轮窗口取最大
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;为什么取 max&lt;/strong&gt;：瓶颈带宽是投递速率的物理上限。排队、ACK 聚合、调度延迟只会让单次样本偏低，不会系统性偏高。取 max 过滤向下噪声。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;为什么跳过 app_limited&lt;/strong&gt;：应用没喂满数据时投递速率偏低，写入 max 滤波器没意义——但如果 bw 仍然 ≥ 当前 BtlBw，说明路径可能变好了，例外纳入。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;滑动窗口 10 轮&lt;/strong&gt;：覆盖 8 phase 的 gain cycle + 2 轮余量，确保即使在 gain=0.75 的低速 phase 也不会把高峰样本过早淘汰。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h4 id="-bbr_update_ack_aggregation--ack-聚合度追踪"&gt;② &lt;code&gt;bbr_update_ack_aggregation()&lt;/code&gt; — ACK 聚合度追踪
+&lt;/h4&gt;&lt;p&gt;网络设备（LRO/GRO）和 delayed-ACK 会把多个 ACK 合并成一个大 ACK。在合并间隙中，发送端收不到 ACK → inflight 不减 → cwnd 被&amp;quot;卡住&amp;quot;。如果 cwnd 没有足够余量，这会导致发送端被迫停发。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;epoch_us = 当前时间 - 纪元起点
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;expected_acked = BtlBw × epoch_us // 按带宽应该确认多少
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;extra_acked = actual_acked - expected_acked // 超出预期的部分 = ACK聚合量
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;使用&lt;strong&gt;双缓冲&lt;/strong&gt;实现近似滑动窗口（每 5 RTT 轮换），追踪 &lt;code&gt;extra_acked&lt;/code&gt; 最大值。这个值后续加到 &lt;code&gt;target_cwnd&lt;/code&gt; 上，为 ACK 聚合间隙预留 cwnd 余量。&lt;/p&gt;
+&lt;h4 id="-bbr_update_cycle_phase--probe_bw-增益循环推进"&gt;③ &lt;code&gt;bbr_update_cycle_phase()&lt;/code&gt; — PROBE_BW 增益循环推进
+&lt;/h4&gt;&lt;p&gt;仅在 &lt;code&gt;mode == BBR_PROBE_BW&lt;/code&gt; 时生效。调用 &lt;code&gt;bbr_is_next_cycle_phase()&lt;/code&gt; 判断是否切换到下一个 gain phase。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;各 phase 的切换条件不同&lt;/strong&gt;：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;Phase&lt;/th&gt;
+&lt;th&gt;Gain&lt;/th&gt;
+&lt;th&gt;切换条件&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;Phase 0&lt;/td&gt;
+&lt;td&gt;5/4&lt;/td&gt;
+&lt;td&gt;时间 ≥ RTprop &lt;strong&gt;且&lt;/strong&gt; (丢包 或 inflight ≥ 1.25×BDP)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Phase 1&lt;/td&gt;
+&lt;td&gt;3/4&lt;/td&gt;
+&lt;td&gt;时间 ≥ RTprop &lt;strong&gt;或&lt;/strong&gt; inflight ≤ BDP&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Phase 2-7&lt;/td&gt;
+&lt;td&gt;1.0&lt;/td&gt;
+&lt;td&gt;时间 ≥ RTprop&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;设计逻辑：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Phase 0（探测）：必须等到数据真正&amp;quot;堆&amp;quot;到队列里（inflight 够大）或出现丢包，才能确认探测完成。时间+inflight 双条件保证探测有效。&lt;/li&gt;
+&lt;li&gt;Phase 1（排空）：排空越快越好，要么时间到了，要么 inflight 已降到 BDP，任一满足即停。&lt;/li&gt;
+&lt;li&gt;Phase 2-7（巡航）：纯时间驱动，每 RTT 推进一步。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;重要细节&lt;/strong&gt;：Phase 0 切换时使用的 inflight 经过 EDT 修正 (&lt;code&gt;bbr_packets_in_net_at_edt&lt;/code&gt;)——fq 队列规则下，本地排队等待 pacing 的包尚未进入网络，不应算作&amp;quot;在途&amp;quot;。&lt;/p&gt;
+&lt;h4 id="-bbr_check_full_bw_reached--startup-管道填满检测"&gt;④ &lt;code&gt;bbr_check_full_bw_reached()&lt;/code&gt; — STARTUP 管道填满检测
+&lt;/h4&gt;&lt;p&gt;仅在 STARTUP 期间、每个新轮次起点、非 app_limited 时执行：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;span class="lnt"&gt;7
+&lt;/span&gt;&lt;span class="lnt"&gt;8
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;bw_thresh = full_bw × 1.25 // 上次记录的带宽 × 125%
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;if (bbr_max_bw &amp;gt;= bw_thresh)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; full_bw = bbr_max_bw // 还在增长，更新高水位
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; full_bw_cnt = 0 // 重置停滞计数
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;else
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; full_bw_cnt++ // 增长不足25%，停滞+1
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; if (full_bw_cnt &amp;gt;= 3)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; full_bw_reached = true // 连续3轮停滞 → 管道满了
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;为什么是 25% 和 3 轮？&lt;/strong&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;25%：低于此增幅说明带宽接近饱和（噪声级别的增长）&lt;/li&gt;
+&lt;li&gt;3 轮：排除接收端 rwin 自动调优的干扰——rwin 通常需要 1-2 轮才稳定，第 3 轮的样本才可靠&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h4 id="-bbr_check_drain--startup--drain--probe_bw-转换"&gt;⑤ &lt;code&gt;bbr_check_drain()&lt;/code&gt; — STARTUP → DRAIN → PROBE_BW 转换
+&lt;/h4&gt;&lt;p&gt;两步状态转换：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;if (mode == STARTUP &amp;amp;&amp;amp; full_bw_reached)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; mode = DRAIN // 管道满了，开始排空
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; snd_ssthresh = BDP // 设置统计值（BBR自身不用）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;if (mode == DRAIN &amp;amp;&amp;amp; inflight ≤ BDP)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; bbr_reset_probe_bw_mode() // 排空完成，进入稳态
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;为什么 DRAIN → PROBE_BW 用 inflight ≤ BDP？&lt;/strong&gt; BDP 就是&amp;quot;管道恰好满、队列恰好空&amp;quot;的 inflight 数据量。inflight 降到 BDP 以下说明 STARTUP 建立的队列已排完。&lt;/p&gt;
+&lt;h4 id="-bbr_update_min_rtt--rtprop-维护--probe_rtt-状态机"&gt;⑥ &lt;code&gt;bbr_update_min_rtt()&lt;/code&gt; — RTprop 维护 + PROBE_RTT 状态机
+&lt;/h4&gt;&lt;p&gt;&lt;strong&gt;A. 更新 min_rtt_us&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;if (rtt_us &amp;lt; min_rtt_us) // 更小 → 写入
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; min_rtt_us = rtt_us
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;elif (10s到期 &amp;amp;&amp;amp; !is_ack_delayed) // 到期 → 强制刷新
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; min_rtt_us = rtt_us // 允许变大，跟上网络变化
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;min_rtt_stamp = now // 重置10s计时器
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;为什么排除 &lt;code&gt;is_ack_delayed&lt;/code&gt;：delayed ACK 会人为增加 RTT（接收端攒 40ms 再回 ACK），用它刷新 min_rtt 会污染 RTprop 估计。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;B. 进入 PROBE_RTT&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;if (10s到期 &amp;amp;&amp;amp; !idle_restart &amp;amp;&amp;amp; mode != PROBE_RTT)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; mode = PROBE_RTT
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; 保存cwnd
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;为什么 &lt;code&gt;idle_restart&lt;/code&gt; 时不进入：刚从空闲恢复时管道本来就空，不需要再压 cwnd 排队。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;C. PROBE_RTT 内部两步退出&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;span class="lnt"&gt;7
+&lt;/span&gt;&lt;span class="lnt"&gt;8
+&lt;/span&gt;&lt;span class="lnt"&gt;9
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;步骤A：inflight 降到 ≤ 4 包
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 启动200ms计时器
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 清零round_done
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 对齐next_rtt_delivered
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;步骤B：200ms到期 + round_start（至少经过一个RTT）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 恢复cwnd
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 重置min_rtt_stamp
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 切回PROBE_BW或STARTUP
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;为什么需要等一个 round_start：200ms 是挂钟时间，但必须确保&amp;quot;cwnd=4 的包确实在管道里走了一个完整来回&amp;quot;才能量到排空后的真实 RTT。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;D. 标记 app_limited&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;PROBE_RTT 期间故意只发 4 包，&lt;code&gt;tp-&amp;gt;app_limited&lt;/code&gt; 被置位，防止 &lt;code&gt;bbr_update_bw()&lt;/code&gt; 把低速样本写入 BtlBw 的 max 滤波器。&lt;/p&gt;
+&lt;h4 id="-bbr_update_gains--设置增益因子"&gt;⑦ &lt;code&gt;bbr_update_gains()&lt;/code&gt; — 设置增益因子
+&lt;/h4&gt;&lt;p&gt;根据当前 mode 设置 &lt;code&gt;pacing_gain&lt;/code&gt; 和 &lt;code&gt;cwnd_gain&lt;/code&gt;：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;Mode&lt;/th&gt;
+&lt;th&gt;pacing_gain&lt;/th&gt;
+&lt;th&gt;cwnd_gain&lt;/th&gt;
+&lt;th&gt;说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;STARTUP&lt;/td&gt;
+&lt;td&gt;2.885&lt;/td&gt;
+&lt;td&gt;2.885&lt;/td&gt;
+&lt;td&gt;指数探测&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;DRAIN&lt;/td&gt;
+&lt;td&gt;0.347&lt;/td&gt;
+&lt;td&gt;2.885&lt;/td&gt;
+&lt;td&gt;低速排空，高cwnd防停发&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;PROBE_BW&lt;/td&gt;
+&lt;td&gt;gain_cycle[idx] 或 1.0(限速时)&lt;/td&gt;
+&lt;td&gt;2.0&lt;/td&gt;
+&lt;td&gt;稳态循环&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;PROBE_RTT&lt;/td&gt;
+&lt;td&gt;1.0&lt;/td&gt;
+&lt;td&gt;1.0&lt;/td&gt;
+&lt;td&gt;正常速率，cwnd在bbr_set_cwnd中压到4&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;PROBE_BW 被限速时&lt;/strong&gt;：如果 &lt;code&gt;lt_use_bw=1&lt;/code&gt;（检测到 token-bucket 限速器），&lt;code&gt;pacing_gain&lt;/code&gt; 强制为 1.0，不做 gain cycling——被限速时 gain&amp;gt;1 只会超速丢包。&lt;/p&gt;
+&lt;h3 id="52-中间步骤bbr_bw--获取有效带宽"&gt;5.2 中间步骤：&lt;code&gt;bbr_bw()&lt;/code&gt; — 获取有效带宽
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="n"&gt;bbr&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;lt_use_bw&lt;/span&gt; &lt;span class="o"&gt;?&lt;/span&gt; &lt;span class="n"&gt;bbr&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="nl"&gt;lt_bw&lt;/span&gt; &lt;span class="p"&gt;:&lt;/span&gt; &lt;span class="nf"&gt;bbr_max_bw&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;如果检测到限速器，使用 LT 采样得到的长期平均带宽；否则使用 BtlBw 的 max 滤波器输出。&lt;/p&gt;
+&lt;h3 id="53-第二步bbr_set_pacing_rate--设置发送速率"&gt;5.3 第二步：&lt;code&gt;bbr_set_pacing_rate()&lt;/code&gt; — 设置发送速率
+&lt;/h3&gt;&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;rate = bbr_bw_to_pacing_rate(bw, gain)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; = bw × gain × mss × (100-1%) / 100 // 含1%边际
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 转为 bytes/sec
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → min(rate, sk_max_pacing_rate) // 受用户上限约束
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;STARTUP 期间的特殊策略&lt;/strong&gt;：&lt;code&gt;full_bw_reached=0&lt;/code&gt; 时只允许速率上升，不下降。因为 STARTUP 在持续探测更高带宽，瞬时波动不应导致降速。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;首次 RTT 初始化&lt;/strong&gt;：连接初期还没有投递速率样本时，从 SRTT 估算初始 pacing_rate = &lt;code&gt;high_gain × init_cwnd / srtt&lt;/code&gt;。&lt;/p&gt;
+&lt;h3 id="54-第三步bbr_set_cwnd--设置拥塞窗口"&gt;5.4 第三步：&lt;code&gt;bbr_set_cwnd()&lt;/code&gt; — 设置拥塞窗口
+&lt;/h3&gt;&lt;p&gt;这是 BBR 的最后一步输出，分为两条路径：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;路径 A：丢包恢复路径&lt;/strong&gt; — &lt;code&gt;bbr_set_cwnd_to_recover_or_restore()&lt;/code&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;每个ACK：cwnd -= losses（先扣丢失的包）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;刚进入Recovery（第1轮）：
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; packet_conservation = 1
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; cwnd = inflight + acked // 裁剪到实际在途量
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; → 包守恒：每收P个ACK才允许发P个新包
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;退出Recovery：
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; cwnd = max(cwnd, prior_cwnd) // 恢复进入前的cwnd
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; packet_conservation = 0
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;路径 B：正常路径&lt;/strong&gt; — 三步计算 target_cwnd&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;target_cwnd = bbr_bdp(bw, cwnd_gain) // ①基础：gain × BDP
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;target_cwnd += bbr_ack_aggregation_cwnd() // ②加：ACK聚合余量
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;target_cwnd = bbr_quantization_budget(target) // ③加：TSO/GRO量化余量
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;① &lt;code&gt;bbr_bdp()&lt;/code&gt; — BDP 计算&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;w = bw × min_rtt_us // pkts × 2^24（usec相消）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;bdp = ceil(w × gain / BBR_UNIT / BW_UNIT)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;向上取整的原因：宁可多 0.x 个包（微量排队），也不少 0.x 个包（浪费带宽）。管道必须填满。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;② &lt;code&gt;bbr_ack_aggregation_cwnd()&lt;/code&gt; — ACK 聚合余量&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;extra = max(extra_acked[0], extra_acked[1]) // 双缓冲取较大值
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;return extra_acked_gain × extra // gain=1，即直接加上
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;③ &lt;code&gt;bbr_quantization_budget()&lt;/code&gt; — 量化余量&lt;/strong&gt;&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;cwnd += 3 × tso_segs_goal // Qdisc、TSO引擎、接收端各需1段缓冲
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;cwnd = 向上取偶数 // 减少delayed-ACK对奇数cwnd的不利影响
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;if (PROBE_BW Phase 0)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; cwnd += 2 // 确保小BDP时 gain cycling 也能推动inflight &amp;gt; BDP
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;cwnd 更新策略&lt;/strong&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;span class="lnt"&gt;7
+&lt;/span&gt;&lt;span class="lnt"&gt;8
+&lt;/span&gt;&lt;span class="lnt"&gt;9
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;if (full_bw_reached)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; cwnd = min(cwnd + acked, target_cwnd) // 受target封顶
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;else (STARTUP)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; cwnd += acked // 不封顶，指数增长
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;cwnd = max(cwnd, 4) // 最小4包
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;cwnd = min(cwnd, snd_cwnd_clamp) // 全局上限
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;if (PROBE_RTT)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; cwnd = min(cwnd, 4) // 强制压到4包
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;hr&gt;
+&lt;h2 id="六辅助机制"&gt;六、辅助机制
+&lt;/h2&gt;&lt;h3 id="61-token-bucket-限速器检测lt-采样"&gt;6.1 Token-Bucket 限速器检测（LT 采样）
+&lt;/h3&gt;&lt;p&gt;互联网中广泛部署 token-bucket 流量限速器。限速器允许短期突发（token 充满），但长期限制速率。BBR 的 BtlBw 估计会被突发阶段的高速率&amp;quot;污染&amp;quot;。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;三阶段状态机&lt;/strong&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;span class="lnt"&gt;5
+&lt;/span&gt;&lt;span class="lnt"&gt;6
+&lt;/span&gt;&lt;span class="lnt"&gt;7
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ 空闲等待 │ 丢包→ │ 采样测速 │ 确认→ │ 使用限速值 │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ (等token耗尽) │ ─────→ │ (量4~16 RTT) │ ─────→ │ (跑48 RTT) │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;└──────────────┘ └──────────────┘ └──────┬───────┘
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↑ │ 失败 │ 到期
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └────────────────────────┘ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ↑──────────────────────────────────────────────────┘
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;检测算法&lt;/strong&gt;（&lt;code&gt;bbr_lt_bw_sampling&lt;/code&gt; + &lt;code&gt;bbr_lt_bw_interval_done&lt;/code&gt;）：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;1. 空闲等待(lt_is_sampling=0)：等首次丢包（token耗尽信号）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;2. 开始采样(lt_is_sampling=1)：记录起点快照
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;3. 累计 4-16 RTT 后，等再次丢包结束区间
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;4. 检查 丢包率 = lost / delivered
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;5. 如果丢包率 ≥ 20% → 高丢包区间 → 计算平均投递速率
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;6. bbr_lt_bw_interval_done()：
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 首次(lt_bw=0)：记住bw，等下一区间
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── 有上一区间(lt_bw≠0)：比较两区间
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── 相近(差异≤12.5%或≤4Kbps) → lt_bw取平均，lt_use_bw=1
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── 不相近 → 覆盖lt_bw，重来
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;7. 使用中(lt_use_bw=1)：pacing用lt_bw替代BtlBw，48 RTT后重置
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;关键设计选择&lt;/strong&gt;：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;用&amp;quot;丢包到丢包&amp;quot;而非固定时间做区间——对齐 token-bucket 的自然消耗周期&lt;/li&gt;
+&lt;li&gt;双区间确认——避免偶发拥塞误判&lt;/li&gt;
+&lt;li&gt;相对阈值(12.5%) + 绝对阈值(4Kbps)——高速率和低速率都能正确判定&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3 id="62-ack-聚合补偿"&gt;6.2 ACK 聚合补偿
+&lt;/h3&gt;&lt;p&gt;网络设备 (LRO/GRO) 和 delayed-ACK 可能导致 ACK 聚合到达。在 ACK 间隙期间，如果 cwnd 不够大，发送端被迫停发。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;expected_acked = BtlBw × epoch_duration
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;extra_acked = actual_acked - expected_acked
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;target_cwnd += max(extra_acked, 过去 5-10 RTT)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;使用双缓冲实现近似滑动窗口，每 5 RTT 轮换一次。&lt;/p&gt;
+&lt;h3 id="63-丢包恢复packet-conservation"&gt;6.3 丢包恢复（Packet Conservation）
+&lt;/h3&gt;&lt;p&gt;BBR 不因丢包大幅砍 cwnd，而是使用温和的包守恒原则：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;恢复阶段&lt;/th&gt;
+&lt;th&gt;策略&lt;/th&gt;
+&lt;th&gt;效果&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;第 1 轮&lt;/td&gt;
+&lt;td&gt;cwnd = max(cwnd, inflight + acked)&lt;/td&gt;
+&lt;td&gt;严格一进一出&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;后续轮次&lt;/td&gt;
+&lt;td&gt;cwnd += acked (受 target_cwnd 封顶)&lt;/td&gt;
+&lt;td&gt;允许慢启动增长&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;退出恢复&lt;/td&gt;
+&lt;td&gt;cwnd = max(cwnd, prior_cwnd)&lt;/td&gt;
+&lt;td&gt;恢复之前保存的 cwnd&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;hr&gt;
+&lt;h2 id="七完整的一次-ack-处理时序例子"&gt;七、完整的一次 ACK 处理时序（例子）
+&lt;/h2&gt;&lt;p&gt;以一个处于 &lt;strong&gt;PROBE_BW Phase 2 (gain=1.0)&lt;/strong&gt; 稳态运行的连接为例，一个 ACK 到达时的完整执行流程：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;span class="lnt"&gt;21
+&lt;/span&gt;&lt;span class="lnt"&gt;22
+&lt;/span&gt;&lt;span class="lnt"&gt;23
+&lt;/span&gt;&lt;span class="lnt"&gt;24
+&lt;/span&gt;&lt;span class="lnt"&gt;25
+&lt;/span&gt;&lt;span class="lnt"&gt;26
+&lt;/span&gt;&lt;span class="lnt"&gt;27
+&lt;/span&gt;&lt;span class="lnt"&gt;28
+&lt;/span&gt;&lt;span class="lnt"&gt;29
+&lt;/span&gt;&lt;span class="lnt"&gt;30
+&lt;/span&gt;&lt;span class="lnt"&gt;31
+&lt;/span&gt;&lt;span class="lnt"&gt;32
+&lt;/span&gt;&lt;span class="lnt"&gt;33
+&lt;/span&gt;&lt;span class="lnt"&gt;34
+&lt;/span&gt;&lt;span class="lnt"&gt;35
+&lt;/span&gt;&lt;span class="lnt"&gt;36
+&lt;/span&gt;&lt;span class="lnt"&gt;37
+&lt;/span&gt;&lt;span class="lnt"&gt;38
+&lt;/span&gt;&lt;span class="lnt"&gt;39
+&lt;/span&gt;&lt;span class="lnt"&gt;40
+&lt;/span&gt;&lt;span class="lnt"&gt;41
+&lt;/span&gt;&lt;span class="lnt"&gt;42
+&lt;/span&gt;&lt;span class="lnt"&gt;43
+&lt;/span&gt;&lt;span class="lnt"&gt;44
+&lt;/span&gt;&lt;span class="lnt"&gt;45
+&lt;/span&gt;&lt;span class="lnt"&gt;46
+&lt;/span&gt;&lt;span class="lnt"&gt;47
+&lt;/span&gt;&lt;span class="lnt"&gt;48
+&lt;/span&gt;&lt;span class="lnt"&gt;49
+&lt;/span&gt;&lt;span class="lnt"&gt;50
+&lt;/span&gt;&lt;span class="lnt"&gt;51
+&lt;/span&gt;&lt;span class="lnt"&gt;52
+&lt;/span&gt;&lt;span class="lnt"&gt;53
+&lt;/span&gt;&lt;span class="lnt"&gt;54
+&lt;/span&gt;&lt;span class="lnt"&gt;55
+&lt;/span&gt;&lt;span class="lnt"&gt;56
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-fallback" data-lang="fallback"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;ACK到达，TCP栈调用 bbr_main(sk, rs)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;├── bbr_update_model(sk, rs)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_update_bw()
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── round_start=0（默认非轮次起点）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── rs-&amp;gt;delivered=5, interval_us=10000 → 有效样本
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── prior_delivered=8000, next_rtt_delivered=7800
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ │ !before(8000,7800)=true → 新轮次！
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ │ next_rtt_delivered=8005, rtt_cnt++, round_start=1
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── bbr_lt_bw_sampling() → lt_use_bw=0, 无丢包 → 直接return
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── bw = 5 × 2^24 / 10000 = 8388 (pkts/usec定点)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── !app_limited → minmax_running_max(bw=8388, window=10, t=rtt_cnt)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_update_ack_aggregation()
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── round_start=1 → extra_acked_win_rtts++
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── expected_acked=7000, actual=7500 → extra=500
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── extra_acked[idx] = max(extra_acked[idx], 500)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_update_cycle_phase()
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── mode=PROBE_BW → 检查是否切phase
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── gain=1.0(巡航) → 纯时间驱动
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── 时间 &amp;gt; min_rtt → 推进到Phase 3
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_check_full_bw_reached()
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── full_bw_reached=1 → 跳过（已经过了STARTUP）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_check_drain()
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── mode=PROBE_BW → 跳过（不是STARTUP也不是DRAIN）
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── bbr_update_min_rtt()
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── rtt_us=20100, min_rtt_us=20000 → 不更小，不更新
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ ├── filter_expired=false（还没到10s）→ 不进PROBE_RTT
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │ └── delivered&amp;gt;0 → idle_restart=0
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ │
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ └── bbr_update_gains()
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── mode=PROBE_BW
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── pacing_gain = gain_cycle[3] = BBR_UNIT (1.0)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ └── cwnd_gain = 2.0
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;├── bw = bbr_bw() = bbr_max_bw() = 8500 (滤波器当前最大值)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;├── bbr_set_pacing_rate(bw=8500, gain=1.0)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── rate = 8500 × 1.0 × mss × 0.99 → 转bytes/sec
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ ├── full_bw_reached=1 → 允许上下调整
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│ └── sk_pacing_rate = rate
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;│
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;└── bbr_set_cwnd(acked=5, bw=8500, gain=2.0)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── bbr_set_cwnd_to_recover_or_restore() → 不在Recovery → false
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── target = bbr_bdp(8500, 2.0)
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; │ = ceil(8500 × 20000 × 2.0 / 2^24 / 2^8) = 20 pkts
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── target += extra_acked = 20 + 2 = 22
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── target = quantization_budget(22) → 22 + 3×2 + 取偶 = 28
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── cwnd = min(cwnd+5, 28) = min(27, 28) = 27
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; ├── cwnd = max(27, 4) = 27
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; └── tcp_snd_cwnd_set(27)
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;hr&gt;
+&lt;h2 id="八关键设计选择总结"&gt;八、关键设计选择总结
+&lt;/h2&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;设计选择&lt;/th&gt;
+&lt;th&gt;原因&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;基于带宽而非丢包&lt;/td&gt;
+&lt;td&gt;避免 bufferbloat 和浅缓冲问题&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;BtlBw 取最大值&lt;/td&gt;
+&lt;td&gt;噪声只向下偏，取 max 过滤&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;RTprop 取最小值&lt;/td&gt;
+&lt;td&gt;排队只向上偏，取 min 过滤&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;pacing_rate 含 1% 边际&lt;/td&gt;
+&lt;td&gt;防止带宽高估导致队列持续积累&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;cwnd 不含 1% 边际&lt;/td&gt;
+&lt;td&gt;cwnd 是上限，需要宽松余量&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;BDP 向上取整&lt;/td&gt;
+&lt;td&gt;宁可多0.x包排队，不让管道欠载&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;high_gain = 2/ln(2)&lt;/td&gt;
+&lt;td&gt;使 paced 慢启动与传统慢启动增长速度匹配&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;drain_gain = 1/high_gain&lt;/td&gt;
+&lt;td&gt;排空数据量与 STARTUP 多注入量对称&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;DRAIN cwnd_gain 不降&lt;/td&gt;
+&lt;td&gt;防止突然停发，用 pacing 渐进排空&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;8 phase gain cycle&lt;/td&gt;
+&lt;td&gt;探测+排空+6轮巡航，带宽均衡&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;随机起始 phase&lt;/td&gt;
+&lt;td&gt;避免多流同步震荡&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Phase 0 时间+inflight双条件&lt;/td&gt;
+&lt;td&gt;保证探测有效性&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;Phase 1 时间或inflight任一&lt;/td&gt;
+&lt;td&gt;排空越快越好&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;10 RTT BtlBw 窗口&lt;/td&gt;
+&lt;td&gt;覆盖完整 gain cycle + 余量&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;10 秒 RTprop 窗口&lt;/td&gt;
+&lt;td&gt;适应路由变化&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;PROBE_RTT 200ms/10s&lt;/td&gt;
+&lt;td&gt;2% 开销换取准确的 RTprop&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;PROBE_RTT 排除 delayed ACK&lt;/td&gt;
+&lt;td&gt;防止人为高 RTT 污染 RTprop&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;PROBE_RTT 等一个 round_start&lt;/td&gt;
+&lt;td&gt;确保排空后的包走完一个来回&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;PROBE_RTT 标记 app_limited&lt;/td&gt;
+&lt;td&gt;保护 BtlBw 不被低速样本拉低&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;cwnd 最小 4 包&lt;/td&gt;
+&lt;td&gt;保证 delayed-ACK 下持续发送&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;LT 双区间确认&lt;/td&gt;
+&lt;td&gt;避免偶发拥塞误判为限速器&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;包守恒(packet conservation)&lt;/td&gt;
+&lt;td&gt;丢包恢复期间不向拥塞网络注入额外负载&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;hr&gt;
+&lt;h2 id="九与-linux-tcp-栈的衔接本树-51578"&gt;九、与 Linux TCP 栈的衔接（本树 5.15.78）
+&lt;/h2&gt;&lt;h3 id="91-拥塞控制入口每个-ack-一次"&gt;9.1 拥塞控制入口：每个 ACK 一次
+&lt;/h3&gt;&lt;p&gt;ACK 处理路径在生成 &lt;code&gt;rate_sample&lt;/code&gt; 后调用 &lt;code&gt;tcp_cong_control()&lt;/code&gt;。若当前算法实现了 &lt;code&gt;cong_control&lt;/code&gt;（BBR 如此），则&lt;strong&gt;只调用该回调&lt;/strong&gt;，不再走传统的 &lt;code&gt;tcp_cong_avoid()&lt;/code&gt; / &lt;code&gt;tcp_cwnd_reduction()&lt;/code&gt;，也&lt;strong&gt;不会&lt;/strong&gt;在该路径末尾执行 &lt;code&gt;tcp_update_pacing_rate()&lt;/code&gt;（BBR 自己在 &lt;code&gt;bbr_main&lt;/code&gt; 里设置 &lt;code&gt;sk_pacing_rate&lt;/code&gt;）。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-4228:4246:net/ipv4/tcp_input.c" data-lang="4228:4246:net/ipv4/tcp_input.c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;tcp_cong_control&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;sock&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;u32&lt;/span&gt; &lt;span class="n"&gt;ack&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;u32&lt;/span&gt; &lt;span class="n"&gt;acked_sacked&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;flag&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;rate_sample&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;rs&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;inet_connection_sock&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;icsk&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nf"&gt;inet_csk&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;icsk&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;icsk_ca_ops&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;cong_control&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;icsk&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;icsk_ca_ops&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="nf"&gt;cong_control&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;rs&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nf"&gt;tcp_in_cwnd_reduction&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* Reduce cwnd if state mandates */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;tcp_cwnd_reduction&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;acked_sacked&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;rs&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;losses&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;flag&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;else&lt;/span&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nf"&gt;tcp_may_raise_cwnd&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;flag&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* Advance cwnd if state allows */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;tcp_cong_avoid&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;ack&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;acked_sacked&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;tcp_update_pacing_rate&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;BBR 通过 &lt;code&gt;tcp_congestion_ops&lt;/code&gt; 注册 &lt;code&gt;.cong_control = bbr_main&lt;/code&gt;（见下文 §十一）。&lt;/p&gt;
+&lt;h3 id="92-发送侧pacing_rate-与-cwnd-如何生效"&gt;9.2 发送侧：pacing_rate 与 cwnd 如何&amp;quot;生效&amp;quot;
+&lt;/h3&gt;&lt;p&gt;拥塞算法更新 &lt;code&gt;snd_cwnd&lt;/code&gt; 与 &lt;code&gt;sk_pacing_rate&lt;/code&gt; 后，&lt;strong&gt;是否发得出去&lt;/strong&gt;仍由发送引擎综合判断：&lt;code&gt;tcp_write_xmit()&lt;/code&gt; 中依次受 &lt;strong&gt;pacing&lt;/strong&gt;、&lt;strong&gt;拥塞窗口配额&lt;/strong&gt;、&lt;strong&gt;对端接收窗口&lt;/strong&gt;、Nagle/TSO 推迟、small-queue 等约束。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;span class="lnt"&gt;21
+&lt;/span&gt;&lt;span class="lnt"&gt;22
+&lt;/span&gt;&lt;span class="lnt"&gt;23
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-3435:3457:net/ipv4/tcp_output.c" data-lang="3435:3457:net/ipv4/tcp_output.c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* TCP pacing检查：控制发送速率，避免突发流量 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nf"&gt;tcp_pacing_check&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sk&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;break&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="cm"&gt;/* 发送速率受限，暂停发送 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* 初始化TSO段数 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;tso_segs&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nf"&gt;tcp_init_tso_segs&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;mss_now&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;BUG_ON&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;!&lt;/span&gt;&lt;span class="n"&gt;tso_segs&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* 拥塞窗口测试：检查是否有足够的拥塞窗口配额 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;cwnd_quota&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nf"&gt;tcp_cwnd_test&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;tp&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;!&lt;/span&gt;&lt;span class="n"&gt;cwnd_quota&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;push_one&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* 强制发送loss probe包（用于快速丢包检测） */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;cwnd_quota&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;else&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;break&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="cm"&gt;/* 拥塞窗口已满，停止发送 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* 接收窗口测试：检查对端是否有足够的接收空间 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nf"&gt;unlikely&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;!&lt;/span&gt;&lt;span class="nf"&gt;tcp_snd_wnd_test&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;tp&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;mss_now&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;is_rwnd_limited&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nb"&gt;true&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="cm"&gt;/* 接收窗口限制 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;break&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;&lt;strong&gt;要点&lt;/strong&gt;：BBR 侧 &lt;code&gt;pacing_rate&lt;/code&gt; 管注入节奏，&lt;code&gt;cwnd&lt;/code&gt; 管在途上限；栈侧还有 &lt;strong&gt;rwnd、应用 sndbuf&lt;/strong&gt; 等外层限制。&lt;/p&gt;
+&lt;h3 id="93-部署提示与源码注释一致"&gt;9.3 部署提示（与源码注释一致）
+&lt;/h3&gt;&lt;p&gt;&lt;code&gt;tcp_bbr.c&lt;/code&gt; 文件头建议：&lt;strong&gt;尽量配合 fq qdisc&lt;/strong&gt;（&lt;code&gt;man tc-fq&lt;/code&gt;），以便由队列规则做 pacing；否则栈内为每连接软件 pacing（定时器），CPU 开销更高。见 &lt;code&gt;net/ipv4/tcp_bbr.c&lt;/code&gt; 顶部注释（约 L178–180）。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="十内核关键常量速查tcp_bbrc"&gt;十、内核关键常量速查（&lt;code&gt;tcp_bbr.c&lt;/code&gt;）
+&lt;/h2&gt;&lt;p&gt;以下符号均为 &lt;code&gt;static const&lt;/code&gt;，行号对应本仓库 &lt;strong&gt;5.15.78&lt;/strong&gt; 版本，便于对照与升级内核时 diff。&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;符号&lt;/th&gt;
+&lt;th&gt;含义&lt;/th&gt;
+&lt;th&gt;典型值 / 说明&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;CYCLE_LEN&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;PROBE_BW 下 pacing_gain 循环长度&lt;/td&gt;
+&lt;td&gt;8（L291）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_bw_rtts&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;BtlBw 滤波窗口（RTT 轮数）&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;CYCLE_LEN + 2&lt;/code&gt; = 10（L303）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_min_rtt_win_sec&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;RTprop / min_rtt 过期判据&lt;/td&gt;
+&lt;td&gt;10 秒 → 触发 PROBE_RTT（L308）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_probe_rtt_mode_ms&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;PROBE_RTT 最短持续时间&lt;/td&gt;
+&lt;td&gt;200 ms（L313）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_pacing_margin_percent&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;pacing 相对 BtlBw 的下修比例&lt;/td&gt;
+&lt;td&gt;1%（L324）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_high_gain&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;STARTUP pacing/cwnd 增益&lt;/td&gt;
+&lt;td&gt;≈ 2/ln(2)（定点，L341）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_drain_gain&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;DRAIN pacing 增益&lt;/td&gt;
+&lt;td&gt;≈ 1/high_gain（L355）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_cwnd_gain&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;PROBE_BW 下 cwnd 增益&lt;/td&gt;
+&lt;td&gt;2.0（L363）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_pacing_gain[]&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;PROBE_BW 八相位表&lt;/td&gt;
+&lt;td&gt;5/4, 3/4, 1×6（L380–385）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_cycle_rand&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;进入 PROBE_BW 时起始相位随机上界&lt;/td&gt;
+&lt;td&gt;7（L392）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_cwnd_min_target&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;最小 cwnd（包）&lt;/td&gt;
+&lt;td&gt;4（L400）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_full_bw_thresh&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;STARTUP 管道满判定增长阈值&lt;/td&gt;
+&lt;td&gt;25%（L411）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_full_bw_cnt&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;STARTUP 连续停滞轮数判定&lt;/td&gt;
+&lt;td&gt;3（L418）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_lt_intvl_min_rtts&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;LT 采样区间最小 RTT 轮数&lt;/td&gt;
+&lt;td&gt;4（L432）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_lt_loss_thresh&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;LT 高丢包率判定阈值&lt;/td&gt;
+&lt;td&gt;50/256 ≈ 20%（L438）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_lt_bw_ratio&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;LT 带宽一致性相对阈值&lt;/td&gt;
+&lt;td&gt;1/8 = 12.5%（L442）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_lt_bw_diff&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;LT 带宽一致性绝对阈值&lt;/td&gt;
+&lt;td&gt;4Kbps = 500 bytes/sec（L447）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;bbr_lt_bw_max_rtts&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;LT lt_bw 使用期限&lt;/td&gt;
+&lt;td&gt;48 轮（L451）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;带宽定点：&lt;code&gt;BW_SCALE&lt;/code&gt;、&lt;code&gt;BW_UNIT&lt;/code&gt;（约 L199–200）；增益定点：&lt;code&gt;BBR_SCALE&lt;/code&gt;、&lt;code&gt;BBR_UNIT&lt;/code&gt;（约 L209–210）。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="十一源码导航tcp_bbrc"&gt;十一、源码导航（&lt;code&gt;tcp_bbr.c&lt;/code&gt;）
+&lt;/h2&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;区域&lt;/th&gt;
+&lt;th&gt;函数 / 符号&lt;/th&gt;
+&lt;th&gt;作用&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;状态与模型&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;enum bbr_mode&lt;/code&gt;，&lt;code&gt;struct bbr&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;每连接私有状态，存于 &lt;code&gt;icsk_ca_priv&lt;/code&gt;（约 L216 起）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;主循环&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_main()&lt;/code&gt; → &lt;code&gt;bbr_update_model()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;每 ACK：更新模型 → &lt;code&gt;bbr_set_pacing_rate()&lt;/code&gt; → &lt;code&gt;bbr_set_cwnd()&lt;/code&gt;（约 L1822–1868）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;带宽&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_update_bw()&lt;/code&gt;，&lt;code&gt;bbr_bw()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;投递速率采样 + &lt;code&gt;minmax&lt;/code&gt; 最大窗（BtlBw）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;RTT&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_update_min_rtt()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;min RTT 窗、PROBE_RTT 进出&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;状态机&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_check_full_bw_reached()&lt;/code&gt;，&lt;code&gt;bbr_check_drain()&lt;/code&gt;，&lt;code&gt;bbr_update_cycle_phase()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;STARTUP/DRAIN/PROBE_BW/PROBE_RTT 迁移&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;LT 限速器&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_lt_bw_sampling()&lt;/code&gt;，&lt;code&gt;bbr_lt_bw_interval_done()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;token-bucket 限速场景（与丢包区间配合）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;cwnd 控制&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_set_cwnd()&lt;/code&gt;，&lt;code&gt;bbr_bdp()&lt;/code&gt;，&lt;code&gt;bbr_quantization_budget()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;BDP 计算、量化预算、丢包恢复&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;pacing 控制&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_set_pacing_rate()&lt;/code&gt;，&lt;code&gt;bbr_bw_to_pacing_rate()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;速率设置、定点转换、1% 边际&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;ACK 聚合&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_update_ack_aggregation()&lt;/code&gt;，&lt;code&gt;bbr_ack_aggregation_cwnd()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;双缓冲追踪、cwnd 补偿&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;增益设置&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_update_gains()&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;根据 mode 设置 pacing_gain / cwnd_gain&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;栈回调&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;bbr_init&lt;/code&gt;，&lt;code&gt;bbr_ssthresh&lt;/code&gt;，&lt;code&gt;bbr_undo_cwnd&lt;/code&gt;，&lt;code&gt;bbr_cwnd_event&lt;/code&gt;，&lt;code&gt;bbr_set_state&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;初始化、&lt;code&gt;snd_ssthresh=∞&lt;/code&gt;、恢复/空闲/RTO 等&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;模块注册&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;tcp_bbr_cong_ops&lt;/code&gt;，&lt;code&gt;bbr_register&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;.name = &amp;quot;bbr&amp;quot;&lt;/code&gt;，&lt;code&gt;.cong_control = bbr_main&lt;/code&gt;（约 L2104–2127）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;诊断：&lt;code&gt;bbr_get_info()&lt;/code&gt; → &lt;code&gt;ss&lt;/code&gt;/INET_DIAG 可见 &lt;code&gt;bbr_bw*&lt;/code&gt;，&lt;code&gt;bbr_min_rtt&lt;/code&gt;，&lt;code&gt;bbr_pacing_gain&lt;/code&gt;，&lt;code&gt;bbr_cwnd_gain&lt;/code&gt;（约 L2015–2045）。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="十二维护与核对清单"&gt;十二、维护与核对清单
+&lt;/h2&gt;&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;升级内核版本&lt;/strong&gt;：优先 diff &lt;code&gt;tcp_bbr.c&lt;/code&gt; 中 §十所列常量与 &lt;code&gt;bbr_main&lt;/code&gt; 调用链，再同步本文档表格与流程描述。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;区分论文与实现&lt;/strong&gt;：队列规则、ECN、与 CUBIC 共存等以&lt;strong&gt;当前内核行为&lt;/strong&gt;为准。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;与通用 TCP 文档配合&lt;/strong&gt;：拥塞插件接口见 &lt;code&gt;include/net/tcp.h&lt;/code&gt; 中 &lt;code&gt;struct tcp_congestion_ops&lt;/code&gt;；ACK 总入口见 &lt;code&gt;net/ipv4/tcp_input.c&lt;/code&gt; 中 &lt;code&gt;tcp_ack()&lt;/code&gt; → &lt;code&gt;tcp_cong_control()&lt;/code&gt;。&lt;/li&gt;
+&lt;/ol&gt;
+&lt;hr&gt;
+&lt;h2 id="十三参考文献"&gt;十三、参考文献
+&lt;/h2&gt;&lt;ul&gt;
+&lt;li&gt;Neal Cardwell, Yuchung Cheng, C. Stephen Gunn, Soheil Hassas Yeganeh, Van Jacobson.
+&amp;ldquo;BBR: Congestion-Based Congestion Control&amp;rdquo;, ACM Queue, Vol. 14 No. 5, Sep-Oct 2016.&lt;/li&gt;
+&lt;li&gt;Linux 内核源码: &lt;code&gt;net/ipv4/tcp_bbr.c&lt;/code&gt; (v5.15.78)&lt;/li&gt;
+&lt;li&gt;BBR 开发讨论邮件列表: &lt;a class="link" href="https://groups.google.com/forum/#!forum/bbr-dev" target="_blank" rel="noopener"
+&gt;https://groups.google.com/forum/#!forum/bbr-dev&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;</description></item></channel></rss>

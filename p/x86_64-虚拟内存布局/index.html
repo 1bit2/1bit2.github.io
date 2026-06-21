@@ -1,0 +1,477 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="x86_64 虚拟内存布局 Linux 5.15.78 x86_64 架构下的虚拟地址空间完整布局：从用户空间到内核空间的每一个区域，所有地址和大小均来自源码定义。\n前置阅读：内存管理完全指南 — mm_struct、VMA、进程地址空间的基本概念。 相关文档：CPU 页表与缓存机制 — 4 级/5 级页表结构的详细遍历。\n一、总体架构 x86_64 使用 48 位虚拟地址（4 级页表）或 57 位虚拟地址（5 级页表），地址空间分为用户空间和内核空间，中间是不可访问的非规范地址空洞。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 高地址 ┌─────────────────────────────────────────────────────────┐ │ ffffffffffffffff │ 内核空间 │ │ ... │ 所有进程共享 │ │ ffff800000000000 │ │ ├─────────────────────────────────────────────────────────┤ │ ffff7fffffffffff │ 非规范地址空洞 │ │ ... │ 访问触发 #GP 异常 │ │ 0000800000000000 │ │ ├─────────────────────────────────────────────────────────┤ │ 00007fffffffffff │ 用户空间 │ │ ... │ 每个进程独立 │ │ 0000000000000000 │ │ └─────────────────────────────────────────────────────────┘ 低地址 源码定义（arch/x86/include/asm/page_64_types.h）：\n"><title>x86_64 虚拟内存布局</title><link rel=canonical href=https://1bit2.github.io/p/x86_64-%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%B8%83%E5%B1%80/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="x86_64 虚拟内存布局"><meta property='og:description' content="x86_64 虚拟内存布局 Linux 5.15.78 x86_64 架构下的虚拟地址空间完整布局：从用户空间到内核空间的每一个区域，所有地址和大小均来自源码定义。\n前置阅读：内存管理完全指南 — mm_struct、VMA、进程地址空间的基本概念。 相关文档：CPU 页表与缓存机制 — 4 级/5 级页表结构的详细遍历。\n一、总体架构 x86_64 使用 48 位虚拟地址（4 级页表）或 57 位虚拟地址（5 级页表），地址空间分为用户空间和内核空间，中间是不可访问的非规范地址空洞。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 高地址 ┌─────────────────────────────────────────────────────────┐ │ ffffffffffffffff │ 内核空间 │ │ ... │ 所有进程共享 │ │ ffff800000000000 │ │ ├─────────────────────────────────────────────────────────┤ │ ffff7fffffffffff │ 非规范地址空洞 │ │ ... │ 访问触发 #GP 异常 │ │ 0000800000000000 │ │ ├─────────────────────────────────────────────────────────┤ │ 00007fffffffffff │ 用户空间 │ │ ... │ 每个进程独立 │ │ 0000000000000000 │ │ └─────────────────────────────────────────────────────────┘ 低地址 源码定义（arch/x86/include/asm/page_64_types.h）：\n"><meta property='og:url' content='https://1bit2.github.io/p/x86_64-%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%B8%83%E5%B1%80/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='虚拟内存'><meta property='article:tag' content='x86_64'><meta property='article:tag' content='PAGE_OFFSET'><meta property='article:tag' content='vmalloc'><meta property='article:tag' content='vmemmap'><meta property='article:tag' content='KASLR'><meta property='article:tag' content='直接映射'><meta property='article:tag' content='内核代码'><meta property='article:tag' content='模块空间'><meta property='article:tag' content='fixmap'><meta property='article:published_time' content='2026-06-10T00:00:00+00:00'><meta property='article:modified_time' content='2026-06-10T00:00:00+00:00'><meta name=twitter:title content="x86_64 虚拟内存布局"><meta name=twitter:description content="x86_64 虚拟内存布局 Linux 5.15.78 x86_64 架构下的虚拟地址空间完整布局：从用户空间到内核空间的每一个区域，所有地址和大小均来自源码定义。\n前置阅读：内存管理完全指南 — mm_struct、VMA、进程地址空间的基本概念。 相关文档：CPU 页表与缓存机制 — 4 级/5 级页表结构的详细遍历。\n一、总体架构 x86_64 使用 48 位虚拟地址（4 级页表）或 57 位虚拟地址（5 级页表），地址空间分为用户空间和内核空间，中间是不可访问的非规范地址空洞。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 高地址 ┌─────────────────────────────────────────────────────────┐ │ ffffffffffffffff │ 内核空间 │ │ ... │ 所有进程共享 │ │ ffff800000000000 │ │ ├─────────────────────────────────────────────────────────┤ │ ffff7fffffffffff │ 非规范地址空洞 │ │ ... │ 访问触发 #GP 异常 │ │ 0000800000000000 │ │ ├─────────────────────────────────────────────────────────┤ │ 00007fffffffffff │ 用户空间 │ │ ... │ 每个进程独立 │ │ 0000000000000000 │ │ └─────────────────────────────────────────────────────────┘ 低地址 源码定义（arch/x86/include/asm/page_64_types.h）：\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一总体架构>一、总体架构</a></li><li><a href=#二用户空间布局-0--128-tb>二、用户空间布局 (0 ~ 128 TB)</a><ol><li><a href=#21-mmap-基址计算>2.1 mmap 基址计算</a></li><li><a href=#22-data-段与-bss-段的本质区别>2.2 data 段与 BSS 段的本质区别</a></li></ol></li><li><a href=#三内核空间布局4-级页表48-位地址>三、内核空间布局（4 级页表，48 位地址）</a></li><li><a href=#四核心区域详解>四、核心区域详解</a><ol><li><a href=#41-物理内存直接映射-64-tb>4.1 物理内存直接映射 (64 TB)</a></li><li><a href=#42-vmallocioremap-32-tb>4.2 vmalloc/ioremap (32 TB)</a></li><li><a href=#43-vmemmap--虚拟内存映射-1-tb>4.3 vmemmap — 虚拟内存映射 (1 TB)</a></li><li><a href=#44-内核代码映射-512-mb--1-gb>4.4 内核代码映射 (512 MB / 1 GB)</a></li><li><a href=#45-模块映射空间-1520-mb>4.5 模块映射空间 (1520 MB)</a></li><li><a href=#46-fixmap--固定映射>4.6 fixmap — 固定映射</a></li><li><a href=#47-cpu_entry_area-512-gb>4.7 cpu_entry_area (512 GB)</a></li><li><a href=#48-kasan-影子内存-16-tb>4.8 KASAN 影子内存 (16 TB)</a></li><li><a href=#49-vsyscall-4-kb>4.9 vsyscall (4 KB)</a></li></ol></li><li><a href=#五kaslr-对布局的影响>五、KASLR 对布局的影响</a></li><li><a href=#六5-级页表扩展-57-位虚拟地址>六、5 级页表扩展 (57 位虚拟地址)</a></li><li><a href=#七地址转换关系总结>七、地址转换关系总结</a></li><li><a href=#八参考资料>八、参考资料</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E5%86%85%E5%AD%98/ style=background-color:#4285f4;color:#fff>内存</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/x86_64-%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%B8%83%E5%B1%80/>x86_64 虚拟内存布局</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Jun 10, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>9 minute read</time></div></footer></div></header><section class=article-content><h1 id=x86_64-虚拟内存布局>x86_64 虚拟内存布局</h1><blockquote><p>Linux 5.15.78 x86_64 架构下的虚拟地址空间完整布局：从用户空间到内核空间的每一个区域，所有地址和大小均来自源码定义。</p><p>前置阅读：<a class=link href=%e5%86%85%e5%ad%98%e7%ae%a1%e7%90%86%e5%ae%8c%e5%85%a8%e6%8c%87%e5%8d%97.md>内存管理完全指南</a> — mm_struct、VMA、进程地址空间的基本概念。
+相关文档：<a class=link href=CPU%e9%a1%b5%e8%a1%a8%e4%b8%8e%e7%bc%93%e5%ad%98%e6%9c%ba%e5%88%b6.md>CPU 页表与缓存机制</a> — 4 级/5 级页表结构的详细遍历。</p></blockquote><hr><h2 id=一总体架构>一、总体架构</h2><p>x86_64 使用 48 位虚拟地址（4 级页表）或 57 位虚拟地址（5 级页表），地址空间分为<strong>用户空间</strong>和<strong>内核空间</strong>，中间是不可访问的<strong>非规范地址空洞</strong>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>  高地址
+</span></span><span class=line><span class=cl>  ┌─────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>  │  ffffffffffffffff  │  内核空间                         │
+</span></span><span class=line><span class=cl>  │        ...         │  所有进程共享                       │
+</span></span><span class=line><span class=cl>  │  ffff800000000000  │                                    │
+</span></span><span class=line><span class=cl>  ├─────────────────────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>  │  ffff7fffffffffff  │  非规范地址空洞                    │
+</span></span><span class=line><span class=cl>  │        ...         │  访问触发 #GP 异常                  │
+</span></span><span class=line><span class=cl>  │  0000800000000000  │                                    │
+</span></span><span class=line><span class=cl>  ├─────────────────────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>  │  00007fffffffffff  │  用户空间                          │
+</span></span><span class=line><span class=cl>  │        ...         │  每个进程独立                       │
+</span></span><span class=line><span class=cl>  │  0000000000000000  │                                    │
+</span></span><span class=line><span class=cl>  └─────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  低地址
+</span></span></code></pre></td></tr></table></div></div><p>源码定义（<code>arch/x86/include/asm/page_64_types.h</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 4 级页表：47 位用户虚拟地址 → 128 TB
+</span></span></span><span class=line><span class=cl><span class=cp>#define __VIRTUAL_MASK_SHIFT    47
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// 5 级页表：56 位用户虚拟地址 → 64 PB
+</span></span></span><span class=line><span class=cl><span class=c1>// #define __VIRTUAL_MASK_SHIFT  56
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#define task_size_max()     ((_AC(1,UL) &lt;&lt; __VIRTUAL_MASK_SHIFT) - PAGE_SIZE)
+</span></span></span><span class=line><span class=cl><span class=cp>#define TASK_SIZE_MAX       task_size_max()
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// 内核空间起始：符号扩展后的最高位区域
+</span></span></span><span class=line><span class=cl><span class=cp>#define __PAGE_OFFSET_BASE_L4   _AC(0xffff888000000000, UL)  </span><span class=c1>// 直接映射基址
+</span></span></span><span class=line><span class=cl><span class=cp>#define __START_KERNEL_map      _AC(0xffffffff80000000, UL)  </span><span class=c1>// 内核代码基址
+</span></span></span></code></pre></td></tr></table></div></div><p>非规范地址空洞的存在是因为 x86_64 的地址是<strong>符号扩展</strong>的：48 位地址的第 47 位被复制到高位 63~47，使得用户地址的高位全为 0，内核地址的高位全为 1，中间的值无法表示。</p><hr><h2 id=二用户空间布局-0--128-tb>二、用户空间布局 (0 ~ 128 TB)</h2><p>每个进程拥有独立的用户空间（<code>mm_struct</code> 管理），典型布局如下：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>  高地址 (TASK_SIZE_MAX = 0x00007fffffffffff)
+</span></span><span class=line><span class=cl>  ┌──────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>  │  stack (向下增长)                         │ ← STACK_TOP_MAX
+</span></span><span class=line><span class=cl>  │    ├─ ASLR 随机偏移 (最大 ~8 MB)          │   47位: 0x00007ffffffff000
+</span></span><span class=line><span class=cl>  │    └─ rlimit 限制                         │
+</span></span><span class=line><span class=cl>  ├──────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>  │  mmap 区域 (自顶向下增长)                 │ ← mm-&gt;mmap_base
+</span></span><span class=line><span class=cl>  │    ├─ 共享库 (libc.so 等)                 │   = TASK_SIZE - gap - random
+</span></span><span class=line><span class=cl>  │    ├─ 匿名映射 (mmap)                     │
+</span></span><span class=line><span class=cl>  │    └─ 与 stack 间隔 ≥128 MB              │
+</span></span><span class=line><span class=cl>  ├──────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>  │  heap (brk, 向上增长)                     │ ← mm-&gt;brk
+</span></span><span class=line><span class=cl>  ├──────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>  │  BSS 段 (未初始化全局变量)                │
+</span></span><span class=line><span class=cl>  ├──────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>  │  data 段 (已初始化全局变量)               │
+</span></span><span class=line><span class=cl>  ├──────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>  │  text 段 (代码, 可执行)                   │
+</span></span><span class=line><span class=cl>  ├──────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>  │  ELF 解释器 (ld-linux) / VDSO / VVAR     │
+</span></span><span class=line><span class=cl>  └──────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  低地址 (0x0)
+</span></span></code></pre></td></tr></table></div></div><h3 id=21-mmap-基址计算>2.1 mmap 基址计算</h3><p><code>mmap_base</code> 决定了共享库和匿名映射的起始位置，从地址空间顶部向下计算（<code>arch/x86/mm/mmap.c:82</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=nf>mmap_base</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>rnd</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>task_size</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                               <span class=k>struct</span> <span class=n>rlimit</span> <span class=o>*</span><span class=n>rlim_stack</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>gap</span> <span class=o>=</span> <span class=n>rlim_stack</span><span class=o>-&gt;</span><span class=n>rlim_cur</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>pad</span> <span class=o>=</span> <span class=nf>stack_maxrandom_size</span><span class=p>(</span><span class=n>task_size</span><span class=p>)</span> <span class=o>+</span> <span class=n>stack_guard_gap</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>gap</span> <span class=o>+</span> <span class=n>pad</span> <span class=o>&gt;</span> <span class=n>gap</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>gap</span> <span class=o>+=</span> <span class=n>pad</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* gap 限制在 [128MB, task_size*5/6] 范围内
+</span></span></span><span class=line><span class=cl><span class=cm>     * 最小 128MB：保证 mmap 与 stack 有足够间隔
+</span></span></span><span class=line><span class=cl><span class=cm>     * 最大 5/6：防止 stack 限制过大导致 mmap 空间被挤压 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>gap_min</span> <span class=o>=</span> <span class=n>SIZE_128M</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>gap_max</span> <span class=o>=</span> <span class=p>(</span><span class=n>task_size</span> <span class=o>/</span> <span class=mi>6</span><span class=p>)</span> <span class=o>*</span> <span class=mi>5</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>gap</span> <span class=o>&lt;</span> <span class=n>gap_min</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>gap</span> <span class=o>=</span> <span class=n>gap_min</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>gap</span> <span class=o>&gt;</span> <span class=n>gap_max</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>gap</span> <span class=o>=</span> <span class=n>gap_max</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>PAGE_ALIGN</span><span class=p>(</span><span class=n>task_size</span> <span class=o>-</span> <span class=n>gap</span> <span class=o>-</span> <span class=n>rnd</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>设计思考</strong>：mmap 从顶向下分配，与 stack 保持 128 MB 最小间隔，这是为了在 stack ASLR 随机化后仍有安全距离。<code>5/6</code> 的上限保证 mmap 区域至少有 <code>task_size/6</code> 的空间可用。</p><h3 id=22-data-段与-bss-段的本质区别>2.2 data 段与 BSS 段的本质区别</h3><p>ELF 文件中 <code>.data</code> 和 <code>.bss</code> 的区别源于<strong>存储效率</strong>：</p><div class=table-wrapper><table><thead><tr><th>段</th><th>ELF 类型</th><th>磁盘存储</th><th>加载行为</th><th>典型内容</th></tr></thead><tbody><tr><td><code>.data</code></td><td><code>PROGBITS</code></td><td>存储初始值字节</td><td>直接映射文件内容</td><td><code>int x = 42;</code></td></tr><tr><td><code>.bss</code></td><td><code>NOBITS</code></td><td>仅记录大小</td><td>分配内存并清零</td><td><code>int buf[10000];</code></td></tr></tbody></table></div><p>C 标准保证：未显式初始化的全局/静态变量自动为零。既然值一定为零，就没有必要在文件中存储一大片零 —— <code>.bss</code> 只需在 ELF 头中记录"大小 = N 字节"，加载时由内核清零即可。这使得 <code>char buf[65536]</code> 不会让可执行文件膨胀 64 KB。</p><hr><h2 id=三内核空间布局4-级页表48-位地址>三、内核空间布局（4 级页表，48 位地址）</h2><p>内核空间所有进程共享。以下是完整布局，地址和大小来自 <code>Documentation/x86/x86_64/mm.rst</code> 和头文件宏定义。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>  高地址
+</span></span><span class=line><span class=cl>  ┌───────────────────────────────────┬──────────────────┬──────────┐
+</span></span><span class=line><span class=cl>  │ 虚拟地址范围                       │ 偏移              │ 大小     │
+</span></span><span class=line><span class=cl>  ├───────────────────────────────────┼──────────────────┼──────────┤
+</span></span><span class=line><span class=cl>  │ ffffffffffe00000 ~ ffffffffffffff │    -2 MB ~ 0     │   2 MB   │ 未使用空洞
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffffffff600000 ~ ffffffffff600fff │   -10 MB         │   4 KB   │ vsyscall
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ FIXADDR_START  ~ ffffffffff5fffff │   ~-11 MB        │ ~0.5 MB  │ fixmap 固定映射
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffffffff000000 ~ FIXADDR_START  │   -16 MB~-11 MB  │  ~5 MB   │ 未使用
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffffffa0000000 ~ fffffffffeffff │  -1536 MB~-16 MB │ 1520 MB  │ 模块映射空间
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffffff80000000 ~ ffffffff9fffff │   -2 GB~-1536 MB │  512 MB  │ 内核代码映射
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffffff00000000 ~ ffffffff7fffff │   -4 GB ~ -2 GB  │    2 GB  │ 未使用空洞
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffffef00000000 ~ fffffffeffffff │  -68 GB ~ -4 GB  │   64 GB  │ EFI 区域映射
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffff8000000000 ~ ffffffeeffffff │ -512 GB ~ -68 GB │  444 GB  │ 未使用空洞
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffff0000000000 ~ ffffff7fffffff │   -1 TB ~ -512GB │  512 GB  │ ESP fixup 栈
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ fffffe8000000000 ~ fffffeffffffff │ -1.5 TB ~ -1 TB  │  512 GB  │ 未使用空洞
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ fffffe0000000000 ~ fffffe7fffffff │   -2 TB ~ -1.5TB │  512 GB  │ cpu_entry_area
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ fffffc0000000000 ~ fffffdffffffff │   -4 TB ~ -2 TB  │    2 TB  │ 未使用(KASLR边界)
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffec0000000000 ~ fffffbffffffff │  -20 TB ~ -4 TB  │   16 TB  │ KASAN 影子内存
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffeb0000000000 ~ ffffebffffffff │  -21 TB ~ -20 TB │    1 TB  │ 未使用空洞
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffea0000000000 ~ ffffeaffffffff │  -22 TB ~ -21 TB │    1 TB  │ vmemmap
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffe90000000000 ~ ffffe9ffffffff │  -23 TB ~ -22 TB │    1 TB  │ 未使用空洞
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffc90000000000 ~ ffffe8ffffffff │  -55 TB ~ -23 TB │   32 TB  │ vmalloc/ioremap
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffffc88000000000 ~ ffffc8ffffffff │ -55.5 TB~-55 TB  │  0.5 TB  │ 未使用空洞
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffff888000000000 ~ ffffc87fffffff │ -119.5 TB~-55.5TB│   64 TB  │ 物理内存直接映射
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffff880000000000 ~ ffff887fffffff │ -120 TB~-119.5TB │  0.5 TB  │ LDT remap (PTI)
+</span></span><span class=line><span class=cl>  │                                   │                  │          │
+</span></span><span class=line><span class=cl>  │ ffff800000000000 ~ ffff87ffffffff │  -128 TB~-120 TB │    8 TB  │ 保护空洞(虚拟化保留)
+</span></span><span class=line><span class=cl>  └───────────────────────────────────┴──────────────────┴──────────┘
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四核心区域详解>四、核心区域详解</h2><h3 id=41-物理内存直接映射-64-tb>4.1 物理内存直接映射 (64 TB)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/page_64_types.h:42
+</span></span></span><span class=line><span class=cl><span class=cp>#define __PAGE_OFFSET_BASE_L4   _AC(0xffff888000000000, UL)
+</span></span></span><span class=line><span class=cl><span class=c1>// 运行时变量（KASLR 时随机偏移）
+</span></span></span><span class=line><span class=cl><span class=cp>#define __PAGE_OFFSET           page_offset_base
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>这是内核最重要的映射区域</strong>：所有物理内存被线性映射到一段连续的虚拟地址空间。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>虚拟地址 = 物理地址 + PAGE_OFFSET
+</span></span></code></pre></td></tr></table></div></div><ul><li><code>kmalloc()</code> 分配的内存就在此区域</li><li><code>phys_to_virt()</code> / <code>virt_to_phys()</code> 通过简单加减 <code>PAGE_OFFSET</code> 互相转换</li><li>映射大小 64 TB，对应 <code>MAX_PHYSMEM_BITS = 46</code>（<code>arch/x86/include/asm/sparsemem.h:27</code>）</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/sparsemem.h:27
+</span></span></span><span class=line><span class=cl><span class=cp># define MAX_PHYSMEM_BITS   (pgtable_l5_enabled() ? 52 : 46)
+</span></span></span><span class=line><span class=cl><span class=c1>// 4 级页表: 2^46 = 64 TB 物理内存上限
+</span></span></span><span class=line><span class=cl><span class=c1>// 5 级页表: 2^52 = 4 PB 物理内存上限
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>设计思考</strong>：直接映射使内核访问物理内存只需一次加法，无需查页表。<code>PAGE_OFFSET</code> 选择 <code>0xffff888000000000</code> 而非 <code>0xffff800000000000</code> 是为了在前方留出 8 TB 保护空洞（给 Xen 等虚拟化使用）和 0.5 TB LDT 映射空间。</p><h3 id=42-vmallocioremap-32-tb>4.2 vmalloc/ioremap (32 TB)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/pgtable_64_types.h:123-126,142
+</span></span></span><span class=line><span class=cl><span class=cp>#define __VMALLOC_BASE_L4   0xffffc90000000000UL
+</span></span></span><span class=line><span class=cl><span class=cp>#define VMALLOC_SIZE_TB_L4  32UL
+</span></span></span><span class=line><span class=cl><span class=cp>#define VMALLOC_END         (VMALLOC_START + (VMALLOC_SIZE_TB &lt;&lt; 40) - 1)
+</span></span></span></code></pre></td></tr></table></div></div><p>与直接映射的关键区别：<strong>物理页不要求连续</strong>。</p><div class=table-wrapper><table><thead><tr><th>特性</th><th>直接映射</th><th>vmalloc</th></tr></thead><tbody><tr><td>物理页连续性</td><td>天然连续</td><td>不连续</td></tr><tr><td>虚拟地址连续</td><td>是</td><td>是</td></tr><tr><td>用途</td><td><code>kmalloc</code>、普通内核访问</td><td><code>vmalloc</code>、<code>ioremap</code>、模块加载</td></tr><tr><td>映射建立时机</td><td>启动时一次性建立</td><td>按需逐页建立</td></tr></tbody></table></div><ul><li><code>vmalloc()</code> 分配大块虚拟连续、物理不连续的内存</li><li><code>ioremap()</code> 将设备 MMIO 物理地址映射到此区域</li><li>模块加载（<code>module_alloc</code>）也使用此区域的特殊映射</li></ul><h3 id=43-vmemmap--虚拟内存映射-1-tb>4.3 vmemmap — 虚拟内存映射 (1 TB)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/pgtable_64_types.h:129
+</span></span></span><span class=line><span class=cl><span class=cp>#define __VMEMMAP_BASE_L4   0xffffea0000000000UL
+</span></span></span></code></pre></td></tr></table></div></div><p>每个物理页帧对应一个 <code>struct page</code>（64 字节）。vmemmap 将所有 <code>struct page</code> 映射为虚拟连续：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>64 TB 物理内存 / 4KB 页大小 = 2^34 个页帧
+</span></span><span class=line><span class=cl>每个页帧一个 struct page (64 字节)
+</span></span><span class=line><span class=cl>总大小 = 2^34 × 64 = 2^40 = 1 TB
+</span></span></code></pre></td></tr></table></div></div><p><strong>设计思考</strong>：<code>virt_to_page()</code> 利用 vmemmap 的线性关系，通过一次减法 + 移位即可得到 <code>struct page*</code>，无需查表：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 简化逻辑：
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>page</span> <span class=o>*</span><span class=nf>virt_to_page</span><span class=p>(</span><span class=kt>void</span> <span class=o>*</span><span class=n>addr</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>pfn</span> <span class=o>=</span> <span class=nf>__pa</span><span class=p>(</span><span class=n>addr</span><span class=p>)</span> <span class=o>&gt;&gt;</span> <span class=n>PAGE_SHIFT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>vmemmap_base</span> <span class=o>+</span> <span class=n>pfn</span><span class=p>;</span>  <span class=c1>// 虚拟地址连续，直接索引
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=44-内核代码映射-512-mb--1-gb>4.4 内核代码映射 (512 MB / 1 GB)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/page_64_types.h:50
+</span></span></span><span class=line><span class=cl><span class=cp>#define __START_KERNEL_map  _AC(0xffffffff80000000, UL)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/page_64_types.h:84-98
+</span></span></span><span class=line><span class=cl><span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm> * KERNEL_IMAGE_SIZE 是内核代码虚拟地址的上限（不是实际大小限制）。
+</span></span></span><span class=line><span class=cl><span class=cm> * KASLR 启用时用 1 GB，为模块留 1 GB；
+</span></span></span><span class=line><span class=cl><span class=cm> * KASLR 禁用时用 512 MB，模块空间增大到 1.5 GB。
+</span></span></span><span class=line><span class=cl><span class=cm> */</span>
+</span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_RANDOMIZE_BASE
+</span></span></span><span class=line><span class=cl><span class=cp>#define KERNEL_IMAGE_SIZE   (1024 * 1024 * 1024)  </span><span class=c1>// 1 GB
+</span></span></span><span class=line><span class=cl><span class=cp>#else
+</span></span></span><span class=line><span class=cl><span class=cp>#define KERNEL_IMAGE_SIZE   (512 * 1024 * 1024)   </span><span class=c1>// 512 MB
+</span></span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span></code></pre></td></tr></table></div></div><ul><li>映射到物理地址 0 开始的内核映像（vmlinux）</li><li>包含内核 .text / .data / .bss / .rodata 段</li><li>KASLR 启用时代码基址在 1 GB 范围内随机偏移</li></ul><h3 id=45-模块映射空间-1520-mb>4.5 模块映射空间 (1520 MB)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/pgtable_64_types.h:144-151
+</span></span></span><span class=line><span class=cl><span class=cp>#define MODULES_VADDR   (__START_KERNEL_map + KERNEL_IMAGE_SIZE)
+</span></span></span><span class=line><span class=cl><span class=c1>// 无 KASLR: 0xffffffff80000000 + 512MB = 0xffffffffa0000000
+</span></span></span><span class=line><span class=cl><span class=c1>// 有 KASLR: 0xffffffff80000000 + 1GB  = 0xffffffffc0000000
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#define MODULES_END     _AC(0xffffffffff000000, UL)
+</span></span></span><span class=line><span class=cl><span class=cp>#define MODULES_LEN     (MODULES_END - MODULES_VADDR)
+</span></span></span><span class=line><span class=cl><span class=c1>// 无 KASLR: 1520 MB; 有 KASLR: ~512 MB
+</span></span></span></code></pre></td></tr></table></div></div><ul><li>内核模块（<code>.ko</code>）加载到此区域</li><li>与内核代码区相邻，使得模块可以直接调用内核函数（相对跳转 / PLT）</li></ul><p><strong>设计思考</strong>：模块空间紧跟内核代码之后，是因为 x86_64 的 <code>CALL</code>/<code>JMP</code> 指令使用 32 位相对偏移（±2 GB），模块必须在内核代码 ±2 GB 范围内才能使用直接跳转，否则需要 PLT 间接跳转（性能更差）。</p><h3 id=46-fixmap--固定映射>4.6 fixmap — 固定映射</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/fixmap.h:150-151
+</span></span></span><span class=line><span class=cl><span class=cp>#define FIXADDR_SIZE    (__end_of_permanent_fixed_addresses &lt;&lt; PAGE_SHIFT)
+</span></span></span><span class=line><span class=cl><span class=cp>#define FIXADDR_START   (FIXADDR_TOP - FIXADDR_SIZE)
+</span></span></span></code></pre></td></tr></table></div></div><ul><li>编译时确定虚拟地址，运行时才绑定物理页</li><li>用于 APIC、ACPI 表、early_ioremap 等需要固定地址的硬件映射</li><li><code>kmap_atomic()</code> 使用 fixmap 临时映射高端内存页</li><li><code>FIXADDR_TOP</code> 紧跟 vsyscall 页面下方</li></ul><h3 id=47-cpu_entry_area-512-gb>4.7 cpu_entry_area (512 GB)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/pgtable_64_types.h:156-157
+</span></span></span><span class=line><span class=cl><span class=cp>#define CPU_ENTRY_AREA_PGD  _AC(-4, UL)
+</span></span></span><span class=line><span class=cl><span class=cp>#define CPU_ENTRY_AREA_BASE (CPU_ENTRY_AREA_PGD &lt;&lt; P4D_SHIFT)
+</span></span></span><span class=line><span class=cl><span class=c1>// = -4 × 512GB = -2TB → 0xfffffe0000000000
+</span></span></span></code></pre></td></tr></table></div></div><ul><li>每个 CPU 的异常栈、IST（Interrupt Stack Table）</li><li>GDT、IDT 等 CPU 私有数据</li><li>KPTI（Kernel Page Table Isolation）的用户态 trampoline 页面</li><li>占用整个 PGD 条目（512 GB），确保与其他区域隔离</li></ul><h3 id=48-kasan-影子内存-16-tb>4.8 KASAN 影子内存 (16 TB)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/kasan.h:7,15-24
+</span></span></span><span class=line><span class=cl><span class=cp>#define KASAN_SHADOW_SCALE_SHIFT  3
+</span></span></span><span class=line><span class=cl><span class=c1>// 影子大小 = 内核地址空间 / 8
+</span></span></span><span class=line><span class=cl><span class=c1>// 47 位地址: (1 &lt;&lt; 47) / 8 = 16 TB
+</span></span></span><span class=line><span class=cl><span class=c1>// 56 位地址: (1 &lt;&lt; 56) / 8 = 2^53 = 8 PB
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#define KASAN_SHADOW_START  (KASAN_SHADOW_OFFSET + \
+</span></span></span><span class=line><span class=cl><span class=cp>        ((-1UL &lt;&lt; __VIRTUAL_MASK_SHIFT) &gt;&gt; KASAN_SHADOW_SCALE_SHIFT))
+</span></span></span></code></pre></td></tr></table></div></div><ul><li>每 8 字节内核内存对应 1 字节影子内存</li><li>用于检测 use-after-free、buffer-overflow 等内存错误</li><li>KASAN 启用时 KASLR 被禁用（地址冲突）</li></ul><h3 id=49-vsyscall-4-kb>4.9 vsyscall (4 KB)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/uapi/asm/vsyscall.h:11
+</span></span></span><span class=line><span class=cl><span class=cp>#define VSYSCALL_ADDR   (-10UL &lt;&lt; 20)  </span><span class=c1>// 0xffffffffff600000
+</span></span></span></code></pre></td></tr></table></div></div><ul><li>遗留的 ABI 兼容页面，提供 <code>gettimeofday</code> 等快速系统调用</li><li>现代系统使用 vDSO 替代，vsyscall 仅作兼容</li><li>固定地址，不可重定位</li></ul><hr><h2 id=五kaslr-对布局的影响>五、KASLR 对布局的影响</h2><p>启用 <code>CONFIG_RANDOMIZE_BASE</code> 和 <code>CONFIG_RANDOMIZE_MEMORY</code> 时，关键区域的基址在启动早期随机偏移：</p><div class=table-wrapper><table><thead><tr><th>区域</th><th>随机化</th><th>说明</th></tr></thead><tbody><tr><td>内核代码</td><td>在 <code>KERNEL_IMAGE_SIZE</code>(1 GB) 内偏移</td><td><code>__START_KERNEL_map</code> + random</td></tr><tr><td>直接映射</td><td><code>PAGE_OFFSET</code> 随机偏移</td><td><code>page_offset_base</code> 运行时确定</td></tr><tr><td>vmalloc</td><td>随机偏移</td><td><code>vmalloc_base</code> 运行时确定</td></tr><tr><td>vmemmap</td><td>随机偏移</td><td><code>vmemmap_base</code> 运行时确定</td></tr></tbody></table></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/page_64_types.h:44-48
+</span></span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_DYNAMIC_MEMORY_LAYOUT
+</span></span></span><span class=line><span class=cl><span class=cp>#define __PAGE_OFFSET       page_offset_base   </span><span class=c1>// 运行时变量
+</span></span></span><span class=line><span class=cl><span class=cp>#else
+</span></span></span><span class=line><span class=cl><span class=cp>#define __PAGE_OFFSET       __PAGE_OFFSET_BASE_L4  </span><span class=c1>// 编译时常量
+</span></span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/pgtable_64_types.h:132-139
+</span></span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_DYNAMIC_MEMORY_LAYOUT
+</span></span></span><span class=line><span class=cl><span class=cp># define VMALLOC_START      vmalloc_base       </span><span class=c1>// 运行时变量
+</span></span></span><span class=line><span class=cl><span class=cp># define VMEMMAP_START      vmemmap_base       </span><span class=c1>// 运行时变量
+</span></span></span><span class=line><span class=cl><span class=cp>#else
+</span></span></span><span class=line><span class=cl><span class=cp># define VMALLOC_START      __VMALLOC_BASE_L4
+</span></span></span><span class=line><span class=cl><span class=cp># define VMEMMAP_START      __VMEMMAP_BASE_L4
+</span></span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>设计思考</strong>：三个区域（直接映射、vmalloc、vmemmap）的相对顺序保持不变，只是整体基址随机偏移。这使得区域间的相对偏移计算仍然有效，同时增加了攻击者猜测内核地址的难度。</p><hr><h2 id=六5-级页表扩展-57-位虚拟地址>六、5 级页表扩展 (57 位虚拟地址)</h2><p>启用 <code>CONFIG_X86_5LEVEL</code> 时，增加一级 P4D 页表，虚拟地址从 48 位扩展到 57 位：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/page_64_types.h:41
+</span></span></span><span class=line><span class=cl><span class=cp>#define __PAGE_OFFSET_BASE_L5   _AC(0xff11000000000000, UL)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/pgtable_64_types.h:124,127,130
+</span></span></span><span class=line><span class=cl><span class=cp>#define __VMALLOC_BASE_L5       0xffa0000000000000UL
+</span></span></span><span class=line><span class=cl><span class=cp>#define VMALLOC_SIZE_TB_L5      12800UL    </span><span class=c1>// 12.5 PB
+</span></span></span><span class=line><span class=cl><span class=cp>#define __VMEMMAP_BASE_L5       0xffd4000000000000UL
+</span></span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>区域</th><th>4 级 (48 位)</th><th>5 级 (57 位)</th></tr></thead><tbody><tr><td>用户空间</td><td>128 TB</td><td><strong>64 PB</strong> (×512)</td></tr><tr><td>保护空洞</td><td>8 TB</td><td>4 PB</td></tr><tr><td>直接映射</td><td>64 TB</td><td><strong>32 PB</strong></td></tr><tr><td>vmalloc</td><td>32 TB</td><td><strong>12.5 PB</strong></td></tr><tr><td>vmemmap</td><td>1 TB</td><td><strong>0.5 PB</strong></td></tr><tr><td>KASAN 影子</td><td>16 TB</td><td><strong>~8 PB</strong></td></tr><tr><td>内核代码+模块</td><td>不变</td><td><strong>不变</strong></td></tr></tbody></table></div><p><strong>从 <code>0xfffffc0000000000</code> (-4 TB) 往上，4 级和 5 级的布局完全相同。</strong> 这是因为内核代码、模块、fixmap 等区域的大小不随物理内存规模变化，不需要扩展。</p><hr><h2 id=七地址转换关系总结>七、地址转换关系总结</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间虚拟地址
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    │  页表查找 (每进程独立 PGD, CR3 指向)
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>物理地址 ──┬── 直接映射区: phys + PAGE_OFFSET
+</span></span><span class=line><span class=cl>           │    特点: 一次加法，无需查表
+</span></span><span class=line><span class=cl>           │    用途: kmalloc、内核普通访问
+</span></span><span class=line><span class=cl>           │
+</span></span><span class=line><span class=cl>           ├── vmalloc 区: 虚拟连续、物理不连续
+</span></span><span class=line><span class=cl>           │    特点: 每页独立映射
+</span></span><span class=line><span class=cl>           │    用途: vmalloc、ioremap、模块
+</span></span><span class=line><span class=cl>           │
+</span></span><span class=line><span class=cl>           └── vmemmap 区: struct page 数组
+</span></span><span class=line><span class=cl>                特点: 虚拟连续，按 pfn 索引
+</span></span><span class=line><span class=cl>                用途: virt_to_page() 直接计算
+</span></span></code></pre></td></tr></table></div></div><p>内核内部地址转换：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 直接映射区：虚拟地址 ↔ 物理地址（无需页表查找）
+</span></span></span><span class=line><span class=cl><span class=cp>#define __va(x)  ((void *)((unsigned long)(x) + PAGE_OFFSET))
+</span></span></span><span class=line><span class=cl><span class=cp>#define __pa(x)  ((unsigned long)(x) - PAGE_OFFSET)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// 直接映射区：虚拟地址 → struct page（利用 vmemmap 线性关系）
+</span></span></span><span class=line><span class=cl><span class=cp>#define virt_to_page(kaddr) \
+</span></span></span><span class=line><span class=cl><span class=cp>    (vmemmap + ((unsigned long)(kaddr) - PAGE_OFFSET) &gt;&gt; PAGE_SHIFT)
+</span></span></span></code></pre></td></tr></table></div></div><hr><h2 id=八参考资料>八、参考资料</h2><ul><li>内核文档: <code>Documentation/x86/x86_64/mm.rst</code> — 官方虚拟内存布局表</li><li>头文件: <code>arch/x86/include/asm/page_64_types.h</code> — 地址常量定义</li><li>头文件: <code>arch/x86/include/asm/pgtable_64_types.h</code> — vmalloc/vmemmap/模块地址</li><li>头文件: <code>arch/x86/include/asm/kasan.h</code> — KASAN 影子内存计算</li><li>头文件: <code>arch/x86/include/asm/fixmap.h</code> — fixmap 固定映射</li><li>用户空间布局: <code>arch/x86/mm/mmap.c</code> — mmap_base 计算</li></ul></section><footer class=article-footer><section class=article-tags><a href=/tags/%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98/>虚拟内存</a>
+<a href=/tags/x86_64/>X86_64</a>
+<a href=/tags/page_offset/>PAGE_OFFSET</a>
+<a href=/tags/vmalloc/>Vmalloc</a>
+<a href=/tags/vmemmap/>Vmemmap</a>
+<a href=/tags/kaslr/>KASLR</a>
+<a href=/tags/%E7%9B%B4%E6%8E%A5%E6%98%A0%E5%B0%84/>直接映射</a>
+<a href=/tags/%E5%86%85%E6%A0%B8%E4%BB%A3%E7%A0%81/>内核代码</a>
+<a href=/tags/%E6%A8%A1%E5%9D%97%E7%A9%BA%E9%97%B4/>模块空间</a>
+<a href=/tags/fixmap/>Fixmap</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/cpu-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E4%B8%8E%E5%86%85%E6%A0%B8%E6%A0%88%E8%BF%9B%E7%A8%8B%E6%98%AF%E6%80%8E%E4%B9%88%E8%A2%AB-cpu-%E6%89%A7%E8%A1%8C%E7%9A%84/><div class=article-details><h2 class=article-title>CPU 上下文切换与内核栈——进程是怎么被 CPU 执行的</h2></div></a></article><article><a href=/p/cpu-%E8%AE%BF%E9%97%AE%E5%86%85%E5%AD%98%E7%9A%84%E7%A1%AC%E4%BB%B6%E8%B7%AF%E5%BE%84%E5%9C%B0%E5%9D%80%E6%80%BB%E7%BA%BF%E6%95%B0%E6%8D%AE%E6%80%BB%E7%BA%BF%E4%B8%8E%E7%BC%93%E5%AD%98%E8%A1%8C%E7%AA%81%E5%8F%91%E4%BC%A0%E8%BE%93/><div class=article-details><h2 class=article-title>CPU 访问内存的硬件路径——地址总线、数据总线与缓存行突发传输</h2></div></a></article><article><a href=/p/%E5%85%B1%E4%BA%AB%E5%BA%93%E5%8A%A0%E8%BD%BD%E4%B8%8E%E5%86%85%E5%AD%98%E5%85%B1%E4%BA%AB%E6%9C%BA%E5%88%B6/><div class=article-details><h2 class=article-title>共享库加载与内存共享机制</h2></div></a></article><article><a href=/p/linux-%E5%86%85%E6%A0%B8%E5%86%85%E5%AD%98%E5%AF%B9%E9%BD%90%E6%9C%BA%E5%88%B6%E4%BB%8E-slab-%E5%88%B0-false-sharing-%E9%98%B2%E6%8A%A4/><div class=article-details><h2 class=article-title>Linux 内核内存对齐机制——从 Slab 到 False Sharing 防护</h2></div></a></article><article><a href=/p/x86-64-%E9%A1%B5%E8%A1%A8%E9%81%8D%E5%8E%86%E4%B8%8E-cpu-%E7%BC%93%E5%AD%98%E6%9C%BA%E5%88%B6%E4%BB%8E-cr3-%E5%88%B0-cache-miss-%E4%BC%98%E5%8C%96/><div class=article-details><h2 class=article-title>x86-64 页表遍历与 CPU 缓存机制——从 CR3 到 Cache Miss 优化</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

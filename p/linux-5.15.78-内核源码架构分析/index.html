@@ -1,0 +1,948 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="Linux 5.15.78 内核源码架构分析 一、整体架构分层 Linux 内核采用宏内核(Monolithic)架构，所有核心服务运行在同一特权级(Ring 0)的同一地址空间，通过函数调用而非 IPC 通信，兼具高性能和模块可加载的灵活性。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 ┌─────────────────────────────────────────────────────────────────┐ │ 用户空间 (Ring 3) │ │ 应用程序 │ glibc │ init/systemd │ shell │ daemon │ ├─────────────────────── 系统调用接口 ────────────────────────────┤ │ 内核空间 (Ring 0) │ │ │ │ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │ │ │ 进程管理 │ │ 内存管理 │ │ 文件系统 │ │ 网络协议栈│ │ │ │ (kernel/) │ │ (mm/) │ │ (fs/) │ │ (net/) │ │ │ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │ │ │ │ │ │ │ │ ┌────┴────────────┴────────────┴────────────┴──────┐ │ │ │ 设备驱动框架 (drivers/) │ │ │ └──────────────────────┬───────────────────────────┘ │ │ │ │ │ ┌──────────────────────┴───────────────────────────┐ │ │ │ 体系结构相关层 (arch/x86, arch/arm64, ...) │ │ │ └──────────────────────────────────────────────────┘ │ ├─────────────────────────────────────────────────────────────────┤ │ 硬件 (CPU / 内存 / 外设) │ └─────────────────────────────────────────────────────────────────┘ 二、目录结构与子系统对应关系 目录 子系统 核心职责 arch/ 体系结构 CPU 引导、页表、中断入口、系统调用表、上下文切换汇编 kernel/ 进程管理 调度器、fork、信号、workqueue、RCU、锁、cgroup mm/ 内存管理 伙伴系统、slab、vmalloc、mmap、缺页处理、页回收 fs/ 文件系统 VFS 框架、具体文件系统(ext4/proc/sysfs)、块层接口 net/ 网络 socket 接口、IPv4/IPv6、TCP/UDP、Netfilter、驱动接口 drivers/ 设备驱动 字符/块/网络/平台设备、总线(PCI/USB/I2C)、Android Binder include/ 头文件 内核 API 和数据结构定义（子目录对应各子系统） init/ 启动 start_kernel()、initcall 机制、PID 1 创建 ipc/ 进程间通信 System V IPC (共享内存/信号量/消息队列) security/ 安全 LSM 框架、SELinux、AppArmor crypto/ 密码学 内核加密 API、算法实现 lib/ 通用库 数据结构(rbtree/list/xarray)、字符串、压缩 block/ 块设备层 I/O 调度、bio/request、多队列(blk-mq) sound/ 音频 ALSA 框架 tools/ 工具 perf、bpftool 等用户态工具 scripts/ 构建脚本 Kconfig、Kbuild、模块签名 三、内核启动全流程 3.1 从上电到 C 语言入口 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 电源 → CPU 复位 │ ├─ x86_64 路径: │ BIOS/UEFI → GRUB → 加载 bzImage │ → arch/x86/boot/header.S (实模式 16 位) │ → arch/x86/boot/compressed/head_64.S (解压内核) │ → arch/x86/kernel/head_64.S: startup_64 (恒等映射、GDT、栈) │ → arch/x86/kernel/head64.c: x86_64_start_kernel() │ → start_kernel() │ └─ ARM64 路径: 固件/引导加载器 → x0 = FDT 地址 → arch/arm64/kernel/head.S: primary_entry → 建页表 → __primary_switch → __primary_switched → 切 init_task 栈、清 BSS → bl start_kernel 3.2 start_kernel() — 子系统初始化精确顺序 从 init/main.c 第 956 行开始，初始化严格分为 5 个阶段：\n"><title>Linux 5.15.78 内核源码架构分析</title><link rel=canonical href=https://1bit2.github.io/p/linux-5.15.78-%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E6%9E%B6%E6%9E%84%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Linux 5.15.78 内核源码架构分析"><meta property='og:description' content="Linux 5.15.78 内核源码架构分析 一、整体架构分层 Linux 内核采用宏内核(Monolithic)架构，所有核心服务运行在同一特权级(Ring 0)的同一地址空间，通过函数调用而非 IPC 通信，兼具高性能和模块可加载的灵活性。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 ┌─────────────────────────────────────────────────────────────────┐ │ 用户空间 (Ring 3) │ │ 应用程序 │ glibc │ init/systemd │ shell │ daemon │ ├─────────────────────── 系统调用接口 ────────────────────────────┤ │ 内核空间 (Ring 0) │ │ │ │ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │ │ │ 进程管理 │ │ 内存管理 │ │ 文件系统 │ │ 网络协议栈│ │ │ │ (kernel/) │ │ (mm/) │ │ (fs/) │ │ (net/) │ │ │ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │ │ │ │ │ │ │ │ ┌────┴────────────┴────────────┴────────────┴──────┐ │ │ │ 设备驱动框架 (drivers/) │ │ │ └──────────────────────┬───────────────────────────┘ │ │ │ │ │ ┌──────────────────────┴───────────────────────────┐ │ │ │ 体系结构相关层 (arch/x86, arch/arm64, ...) │ │ │ └──────────────────────────────────────────────────┘ │ ├─────────────────────────────────────────────────────────────────┤ │ 硬件 (CPU / 内存 / 外设) │ └─────────────────────────────────────────────────────────────────┘ 二、目录结构与子系统对应关系 目录 子系统 核心职责 arch/ 体系结构 CPU 引导、页表、中断入口、系统调用表、上下文切换汇编 kernel/ 进程管理 调度器、fork、信号、workqueue、RCU、锁、cgroup mm/ 内存管理 伙伴系统、slab、vmalloc、mmap、缺页处理、页回收 fs/ 文件系统 VFS 框架、具体文件系统(ext4/proc/sysfs)、块层接口 net/ 网络 socket 接口、IPv4/IPv6、TCP/UDP、Netfilter、驱动接口 drivers/ 设备驱动 字符/块/网络/平台设备、总线(PCI/USB/I2C)、Android Binder include/ 头文件 内核 API 和数据结构定义（子目录对应各子系统） init/ 启动 start_kernel()、initcall 机制、PID 1 创建 ipc/ 进程间通信 System V IPC (共享内存/信号量/消息队列) security/ 安全 LSM 框架、SELinux、AppArmor crypto/ 密码学 内核加密 API、算法实现 lib/ 通用库 数据结构(rbtree/list/xarray)、字符串、压缩 block/ 块设备层 I/O 调度、bio/request、多队列(blk-mq) sound/ 音频 ALSA 框架 tools/ 工具 perf、bpftool 等用户态工具 scripts/ 构建脚本 Kconfig、Kbuild、模块签名 三、内核启动全流程 3.1 从上电到 C 语言入口 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 电源 → CPU 复位 │ ├─ x86_64 路径: │ BIOS/UEFI → GRUB → 加载 bzImage │ → arch/x86/boot/header.S (实模式 16 位) │ → arch/x86/boot/compressed/head_64.S (解压内核) │ → arch/x86/kernel/head_64.S: startup_64 (恒等映射、GDT、栈) │ → arch/x86/kernel/head64.c: x86_64_start_kernel() │ → start_kernel() │ └─ ARM64 路径: 固件/引导加载器 → x0 = FDT 地址 → arch/arm64/kernel/head.S: primary_entry → 建页表 → __primary_switch → __primary_switched → 切 init_task 栈、清 BSS → bl start_kernel 3.2 start_kernel() — 子系统初始化精确顺序 从 init/main.c 第 956 行开始，初始化严格分为 5 个阶段：\n"><meta property='og:url' content='https://1bit2.github.io/p/linux-5.15.78-%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E6%9E%B6%E6%9E%84%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='内核架构'><meta property='article:tag' content='start_kernel'><meta property='article:tag' content='子系统'><meta property='article:tag' content='分层'><meta property='article:tag' content='netfilter'><meta property='article:tag' content='NF_HOOK'><meta property='article:tag' content='收包路径'><meta property='article:tag' content='发包路径'><meta property='article:tag' content='VRF'><meta property='article:tag' content='l3mdev'><meta property='article:published_time' content='2026-04-16T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-16T00:00:00+00:00'><meta name=twitter:title content="Linux 5.15.78 内核源码架构分析"><meta name=twitter:description content="Linux 5.15.78 内核源码架构分析 一、整体架构分层 Linux 内核采用宏内核(Monolithic)架构，所有核心服务运行在同一特权级(Ring 0)的同一地址空间，通过函数调用而非 IPC 通信，兼具高性能和模块可加载的灵活性。\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 ┌─────────────────────────────────────────────────────────────────┐ │ 用户空间 (Ring 3) │ │ 应用程序 │ glibc │ init/systemd │ shell │ daemon │ ├─────────────────────── 系统调用接口 ────────────────────────────┤ │ 内核空间 (Ring 0) │ │ │ │ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │ │ │ 进程管理 │ │ 内存管理 │ │ 文件系统 │ │ 网络协议栈│ │ │ │ (kernel/) │ │ (mm/) │ │ (fs/) │ │ (net/) │ │ │ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │ │ │ │ │ │ │ │ ┌────┴────────────┴────────────┴────────────┴──────┐ │ │ │ 设备驱动框架 (drivers/) │ │ │ └──────────────────────┬───────────────────────────┘ │ │ │ │ │ ┌──────────────────────┴───────────────────────────┐ │ │ │ 体系结构相关层 (arch/x86, arch/arm64, ...) │ │ │ └──────────────────────────────────────────────────┘ │ ├─────────────────────────────────────────────────────────────────┤ │ 硬件 (CPU / 内存 / 外设) │ └─────────────────────────────────────────────────────────────────┘ 二、目录结构与子系统对应关系 目录 子系统 核心职责 arch/ 体系结构 CPU 引导、页表、中断入口、系统调用表、上下文切换汇编 kernel/ 进程管理 调度器、fork、信号、workqueue、RCU、锁、cgroup mm/ 内存管理 伙伴系统、slab、vmalloc、mmap、缺页处理、页回收 fs/ 文件系统 VFS 框架、具体文件系统(ext4/proc/sysfs)、块层接口 net/ 网络 socket 接口、IPv4/IPv6、TCP/UDP、Netfilter、驱动接口 drivers/ 设备驱动 字符/块/网络/平台设备、总线(PCI/USB/I2C)、Android Binder include/ 头文件 内核 API 和数据结构定义（子目录对应各子系统） init/ 启动 start_kernel()、initcall 机制、PID 1 创建 ipc/ 进程间通信 System V IPC (共享内存/信号量/消息队列) security/ 安全 LSM 框架、SELinux、AppArmor crypto/ 密码学 内核加密 API、算法实现 lib/ 通用库 数据结构(rbtree/list/xarray)、字符串、压缩 block/ 块设备层 I/O 调度、bio/request、多队列(blk-mq) sound/ 音频 ALSA 框架 tools/ 工具 perf、bpftool 等用户态工具 scripts/ 构建脚本 Kconfig、Kbuild、模块签名 三、内核启动全流程 3.1 从上电到 C 语言入口 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 电源 → CPU 复位 │ ├─ x86_64 路径: │ BIOS/UEFI → GRUB → 加载 bzImage │ → arch/x86/boot/header.S (实模式 16 位) │ → arch/x86/boot/compressed/head_64.S (解压内核) │ → arch/x86/kernel/head_64.S: startup_64 (恒等映射、GDT、栈) │ → arch/x86/kernel/head64.c: x86_64_start_kernel() │ → start_kernel() │ └─ ARM64 路径: 固件/引导加载器 → x0 = FDT 地址 → arch/arm64/kernel/head.S: primary_entry → 建页表 → __primary_switch → __primary_switched → 切 init_task 栈、清 BSS → bl start_kernel 3.2 start_kernel() — 子系统初始化精确顺序 从 init/main.c 第 956 行开始，初始化严格分为 5 个阶段：\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一整体架构分层>一、整体架构分层</a></li><li><a href=#二目录结构与子系统对应关系>二、目录结构与子系统对应关系</a></li><li><a href=#三内核启动全流程>三、内核启动全流程</a><ol><li><a href=#31-从上电到-c-语言入口>3.1 从上电到 C 语言入口</a></li><li><a href=#32-start_kernel--子系统初始化精确顺序>3.2 start_kernel() — 子系统初始化精确顺序</a></li><li><a href=#33-rest_init--用户空间>3.3 rest_init() → 用户空间</a></li><li><a href=#34-initcall-层次体系>3.4 Initcall 层次体系</a></li></ol></li><li><a href=#四六大核心子系统架构>四、六大核心子系统架构</a><ol><li><a href=#41-进程管理kernel>4.1 进程管理（kernel/）</a></li><li><a href=#42-内存管理mm>4.2 内存管理（mm/）</a></li><li><a href=#43-文件系统fs>4.3 文件系统（fs/）</a></li><li><a href=#44-网络协议栈net>4.4 网络协议栈（net/）</a></li><li><a href=#45-设备驱动模型drivers>4.5 设备驱动模型（drivers/）</a></li><li><a href=#46-中断与同步机制>4.6 中断与同步机制</a></li></ol></li><li><a href=#五子系统依赖关系图>五、子系统依赖关系图</a></li><li><a href=#六三个特殊进程>六、三个特殊进程</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E5%85%B6%E4%BB%96/ style=background-color:#607d8b;color:#fff>其他</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/linux-5.15.78-%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E6%9E%B6%E6%9E%84%E5%88%86%E6%9E%90/>Linux 5.15.78 内核源码架构分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 16, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>12 minute read</time></div></footer></div></header><section class=article-content><h1 id=linux-51578-内核源码架构分析>Linux 5.15.78 内核源码架构分析</h1><h2 id=一整体架构分层>一、整体架构分层</h2><p>Linux 内核采用<strong>宏内核(Monolithic)架构</strong>，所有核心服务运行在同一特权级(Ring 0)的同一地址空间，通过函数调用而非 IPC 通信，兼具高性能和模块可加载的灵活性。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                        用户空间 (Ring 3)                         │
+</span></span><span class=line><span class=cl>│    应用程序  │  glibc  │  init/systemd  │  shell  │  daemon     │
+</span></span><span class=line><span class=cl>├─────────────────────── 系统调用接口 ────────────────────────────┤
+</span></span><span class=line><span class=cl>│                        内核空间 (Ring 0)                         │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │
+</span></span><span class=line><span class=cl>│  │ 进程管理  │ │ 内存管理  │ │ 文件系统  │ │ 网络协议栈│           │
+</span></span><span class=line><span class=cl>│  │ (kernel/) │ │  (mm/)   │ │  (fs/)   │ │  (net/)  │           │
+</span></span><span class=line><span class=cl>│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘           │
+</span></span><span class=line><span class=cl>│       │            │            │            │                  │
+</span></span><span class=line><span class=cl>│  ┌────┴────────────┴────────────┴────────────┴──────┐           │
+</span></span><span class=line><span class=cl>│  │          设备驱动框架 (drivers/)                    │           │
+</span></span><span class=line><span class=cl>│  └──────────────────────┬───────────────────────────┘           │
+</span></span><span class=line><span class=cl>│                         │                                       │
+</span></span><span class=line><span class=cl>│  ┌──────────────────────┴───────────────────────────┐           │
+</span></span><span class=line><span class=cl>│  │      体系结构相关层 (arch/x86, arch/arm64, ...)    │           │
+</span></span><span class=line><span class=cl>│  └──────────────────────────────────────────────────┘           │
+</span></span><span class=line><span class=cl>├─────────────────────────────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>│                        硬件 (CPU / 内存 / 外设)                  │
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h2 id=二目录结构与子系统对应关系>二、目录结构与子系统对应关系</h2><div class=table-wrapper><table><thead><tr><th>目录</th><th>子系统</th><th>核心职责</th></tr></thead><tbody><tr><td><code>arch/</code></td><td>体系结构</td><td>CPU 引导、页表、中断入口、系统调用表、上下文切换汇编</td></tr><tr><td><code>kernel/</code></td><td>进程管理</td><td>调度器、fork、信号、workqueue、RCU、锁、cgroup</td></tr><tr><td><code>mm/</code></td><td>内存管理</td><td>伙伴系统、slab、vmalloc、mmap、缺页处理、页回收</td></tr><tr><td><code>fs/</code></td><td>文件系统</td><td>VFS 框架、具体文件系统(ext4/proc/sysfs)、块层接口</td></tr><tr><td><code>net/</code></td><td>网络</td><td>socket 接口、IPv4/IPv6、TCP/UDP、Netfilter、驱动接口</td></tr><tr><td><code>drivers/</code></td><td>设备驱动</td><td>字符/块/网络/平台设备、总线(PCI/USB/I2C)、Android Binder</td></tr><tr><td><code>include/</code></td><td>头文件</td><td>内核 API 和数据结构定义（子目录对应各子系统）</td></tr><tr><td><code>init/</code></td><td>启动</td><td><code>start_kernel()</code>、initcall 机制、PID 1 创建</td></tr><tr><td><code>ipc/</code></td><td>进程间通信</td><td>System V IPC (共享内存/信号量/消息队列)</td></tr><tr><td><code>security/</code></td><td>安全</td><td>LSM 框架、SELinux、AppArmor</td></tr><tr><td><code>crypto/</code></td><td>密码学</td><td>内核加密 API、算法实现</td></tr><tr><td><code>lib/</code></td><td>通用库</td><td>数据结构(rbtree/list/xarray)、字符串、压缩</td></tr><tr><td><code>block/</code></td><td>块设备层</td><td>I/O 调度、bio/request、多队列(blk-mq)</td></tr><tr><td><code>sound/</code></td><td>音频</td><td>ALSA 框架</td></tr><tr><td><code>tools/</code></td><td>工具</td><td>perf、bpftool 等用户态工具</td></tr><tr><td><code>scripts/</code></td><td>构建脚本</td><td>Kconfig、Kbuild、模块签名</td></tr></tbody></table></div><h2 id=三内核启动全流程>三、内核启动全流程</h2><h3 id=31-从上电到-c-语言入口>3.1 从上电到 C 语言入口</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>电源 → CPU 复位
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├─ x86_64 路径:
+</span></span><span class=line><span class=cl>  │    BIOS/UEFI → GRUB → 加载 bzImage
+</span></span><span class=line><span class=cl>  │    → arch/x86/boot/header.S (实模式 16 位)
+</span></span><span class=line><span class=cl>  │    → arch/x86/boot/compressed/head_64.S (解压内核)
+</span></span><span class=line><span class=cl>  │    → arch/x86/kernel/head_64.S: startup_64 (恒等映射、GDT、栈)
+</span></span><span class=line><span class=cl>  │    → arch/x86/kernel/head64.c: x86_64_start_kernel()
+</span></span><span class=line><span class=cl>  │    → start_kernel()
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  └─ ARM64 路径:
+</span></span><span class=line><span class=cl>       固件/引导加载器 → x0 = FDT 地址
+</span></span><span class=line><span class=cl>       → arch/arm64/kernel/head.S: primary_entry
+</span></span><span class=line><span class=cl>       → 建页表 → __primary_switch → __primary_switched
+</span></span><span class=line><span class=cl>       → 切 init_task 栈、清 BSS
+</span></span><span class=line><span class=cl>       → bl start_kernel
+</span></span></code></pre></td></tr></table></div></div><h3 id=32-start_kernel--子系统初始化精确顺序>3.2 start_kernel() — 子系统初始化精确顺序</h3><p>从 <code>init/main.c</code> 第 956 行开始，初始化严格分为 5 个阶段：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl><span class=err>阶段</span> <span class=mi>1</span><span class=p>:</span> <span class=err>早期初始化（中断禁止，单</span> <span class=n>CPU</span><span class=err>，无内存分配器）</span>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl>  <span class=n>set_task_stack_end_magic</span><span class=p>()</span>    <span class=err>栈溢出魔数</span>
+</span></span><span class=line><span class=cl>  <span class=n>smp_setup_processor_id</span><span class=p>()</span>     <span class=n>Boot</span> <span class=n>CPU</span> <span class=n>ID</span>
+</span></span><span class=line><span class=cl>  <span class=n>cgroup_init_early</span><span class=p>()</span>          <span class=n>cgroup</span> <span class=err>根初始化</span>
+</span></span><span class=line><span class=cl>  <span class=n>local_irq_disable</span><span class=p>()</span>          <span class=err>←</span> <span class=err>关中断</span>
+</span></span><span class=line><span class=cl>  <span class=n>boot_cpu_init</span><span class=p>()</span>              <span class=n>CPU</span> <span class=err>位掩码</span>
+</span></span><span class=line><span class=cl>  <span class=n>setup_arch</span><span class=p>()</span>                 <span class=err>★</span> <span class=err>体系结构初始化（设备树</span><span class=o>/</span><span class=err>内存布局</span><span class=o>/</span><span class=err>命令行）</span>
+</span></span><span class=line><span class=cl>  <span class=n>setup_per_cpu_areas</span><span class=p>()</span>        <span class=n>Per</span><span class=o>-</span><span class=n>CPU</span> <span class=err>变量分配</span>
+</span></span><span class=line><span class=cl>  <span class=n>smp_prepare_boot_cpu</span><span class=p>()</span>       <span class=n>Boot</span> <span class=n>CPU</span> <span class=err>体系结构初始化</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl><span class=err>阶段</span> <span class=mi>2</span><span class=p>:</span> <span class=err>内存子系统初始化</span>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl>  <span class=n>build_all_zonelists</span><span class=p>()</span>        <span class=err>★</span> <span class=err>建立</span> <span class=n>zone</span> <span class=err>空闲页链表</span>
+</span></span><span class=line><span class=cl>  <span class=n>page_alloc_init</span><span class=p>()</span>            <span class=err>页分配器</span> <span class=n>per</span><span class=o>-</span><span class=n>CPU</span> <span class=err>缓存</span>
+</span></span><span class=line><span class=cl>  <span class=n>vfs_caches_init_early</span><span class=p>()</span>      <span class=n>dcache</span> <span class=o>/</span> <span class=n>inode</span> <span class=err>哈希表（早期）</span>
+</span></span><span class=line><span class=cl>  <span class=n>mm_init</span><span class=p>()</span>                    <span class=err>★</span> <span class=n>slab</span> <span class=o>/</span> <span class=n>vmalloc</span> <span class=o>/</span> <span class=n>mem_init</span> <span class=o>/</span> <span class=n>kmem_cache</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl><span class=err>阶段</span> <span class=mi>3</span><span class=p>:</span> <span class=err>调度器、中断、定时器</span>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl>  <span class=n>sched_init</span><span class=p>()</span>                 <span class=err>★</span> <span class=err>调度器（</span><span class=n>CFS</span><span class=o>/</span><span class=n>RT</span><span class=o>/</span><span class=n>DL</span> <span class=err>运行队列）</span>
+</span></span><span class=line><span class=cl>  <span class=n>workqueue_init_early</span><span class=p>()</span>       <span class=err>工作队列框架</span>
+</span></span><span class=line><span class=cl>  <span class=n>rcu_init</span><span class=p>()</span>                   <span class=err>★</span> <span class=n>RCU</span> <span class=err>机制</span>
+</span></span><span class=line><span class=cl>  <span class=n>early_irq_init</span><span class=p>()</span>             <span class=n>IRQ</span> <span class=err>描述符</span>
+</span></span><span class=line><span class=cl>  <span class=n>init_IRQ</span><span class=p>()</span>                   <span class=err>★</span> <span class=err>中断控制器</span>
+</span></span><span class=line><span class=cl>  <span class=n>tick_init</span><span class=p>()</span>                  <span class=err>时钟</span> <span class=n>tick</span>
+</span></span><span class=line><span class=cl>  <span class=n>init_timers</span><span class=p>()</span>                <span class=err>低精度定时器</span>
+</span></span><span class=line><span class=cl>  <span class=n>hrtimers_init</span><span class=p>()</span>              <span class=err>高精度定时器</span>
+</span></span><span class=line><span class=cl>  <span class=n>softirq_init</span><span class=p>()</span>               <span class=err>★</span> <span class=err>软中断（网络</span><span class=o>/</span><span class=err>块</span> <span class=n>I</span><span class=o>/</span><span class=n>O</span> <span class=err>的基础）</span>
+</span></span><span class=line><span class=cl>  <span class=n>timekeeping_init</span><span class=p>()</span>           <span class=err>时间管理</span>
+</span></span><span class=line><span class=cl>  <span class=n>time_init</span><span class=p>()</span>                  <span class=err>体系结构时间源</span>
+</span></span><span class=line><span class=cl>  <span class=n>local_irq_enable</span><span class=p>()</span>           <span class=err>←</span> <span class=err>开中断（从此可响应中断）</span>
+</span></span><span class=line><span class=cl>  <span class=n>console_init</span><span class=p>()</span>               <span class=err>★</span> <span class=err>控制台（从此可打印输出）</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl><span class=err>阶段</span> <span class=mi>4</span><span class=p>:</span> <span class=err>各子系统初始化</span>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl>  <span class=n>pid_idr_init</span><span class=p>()</span>               <span class=n>PID</span> <span class=err>分配器</span>
+</span></span><span class=line><span class=cl>  <span class=n>fork_init</span><span class=p>()</span>                  <span class=err>★</span> <span class=err>进程创建（</span><span class=n>task_struct</span> <span class=n>slab</span> <span class=o>/</span> <span class=err>线程数上限）</span>
+</span></span><span class=line><span class=cl>  <span class=n>proc_caches_init</span><span class=p>()</span>           <span class=err>进程相关</span> <span class=n>slab</span> <span class=err>缓存</span>
+</span></span><span class=line><span class=cl>  <span class=n>cred_init</span><span class=p>()</span>                  <span class=err>凭证子系统</span>
+</span></span><span class=line><span class=cl>  <span class=n>security_init</span><span class=p>()</span>              <span class=err>★</span> <span class=n>LSM</span> <span class=err>安全框架</span>
+</span></span><span class=line><span class=cl>  <span class=n>net_ns_init</span><span class=p>()</span>                <span class=err>★</span> <span class=err>网络命名空间（网络栈基础）</span>
+</span></span><span class=line><span class=cl>  <span class=n>vfs_caches_init</span><span class=p>()</span>            <span class=err>★</span> <span class=n>VFS</span> <span class=err>完整初始化（</span><span class=n>super_block</span><span class=o>/</span><span class=n>inode</span><span class=o>/</span><span class=n>dentry</span><span class=o>/</span><span class=n>file</span><span class=err>）</span>
+</span></span><span class=line><span class=cl>  <span class=n>signals_init</span><span class=p>()</span>               <span class=err>信号子系统</span>
+</span></span><span class=line><span class=cl>  <span class=n>proc_root_init</span><span class=p>()</span>             <span class=o>/</span><span class=n>proc</span> <span class=err>文件系统</span>
+</span></span><span class=line><span class=cl>  <span class=n>cgroup_init</span><span class=p>()</span>                <span class=n>cgroup</span> <span class=err>完整初始化</span>
+</span></span><span class=line><span class=cl>  <span class=n>check_bugs</span><span class=p>()</span>                 <span class=n>CPU</span> <span class=n>bug</span> <span class=err>检测与</span> <span class=n>workaround</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl><span class=err>阶段</span> <span class=mi>5</span><span class=p>:</span> <span class=err>启动</span> <span class=n>init</span> <span class=err>进程</span>
+</span></span><span class=line><span class=cl><span class=err>═══════════════════════════════════════════════════════════════</span>
+</span></span><span class=line><span class=cl>  <span class=n>arch_call_rest_init</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>    <span class=err>→</span> <span class=n>rest_init</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>        <span class=err>→</span> <span class=n>kernel_thread</span><span class=p>(</span><span class=n>kernel_init</span><span class=p>)</span>    <span class=err>创建</span> <span class=n>PID</span> <span class=mi>1</span>
+</span></span><span class=line><span class=cl>        <span class=err>→</span> <span class=n>kernel_thread</span><span class=p>(</span><span class=n>kthreadd</span><span class=p>)</span>       <span class=err>创建</span> <span class=n>PID</span> <span class=mi>2</span>
+</span></span><span class=line><span class=cl>        <span class=err>→</span> <span class=n>cpu_startup_entry</span><span class=p>()</span>           <span class=n>PID</span> <span class=mi>0</span> <span class=err>进入</span> <span class=n>idle</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=33-rest_init--用户空间>3.3 rest_init() → 用户空间</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>rest_init() [PID 0 上下文]
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├── kernel_thread(kernel_init)  ──→  PID 1
+</span></span><span class=line><span class=cl>  │     │
+</span></span><span class=line><span class=cl>  │     ├── kernel_init_freeable()
+</span></span><span class=line><span class=cl>  │     │     ├── smp_init()           启动所有 secondary CPU
+</span></span><span class=line><span class=cl>  │     │     ├── sched_init_smp()     SMP 调度器完整初始化
+</span></span><span class=line><span class=cl>  │     │     ├── do_basic_setup()
+</span></span><span class=line><span class=cl>  │     │     │     ├── driver_init()  设备驱动框架初始化
+</span></span><span class=line><span class=cl>  │     │     │     ├── do_ctors()     全局构造函数
+</span></span><span class=line><span class=cl>  │     │     │     └── do_initcalls() ★ 执行全部 initcall (level 0-7)
+</span></span><span class=line><span class=cl>  │     │     ├── 打开 /dev/console
+</span></span><span class=line><span class=cl>  │     │     └── 挂载根文件系统
+</span></span><span class=line><span class=cl>  │     │
+</span></span><span class=line><span class=cl>  │     └── kernel_execve(&#34;/sbin/init&#34;)  ──→  用户态 init 进程
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├── kernel_thread(kthreadd)  ──→  PID 2 (所有内核线程的父线程)
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  └── cpu_startup_entry()  ──→  PID 0 成为 idle 进程
+</span></span></code></pre></td></tr></table></div></div><h3 id=34-initcall-层次体系>3.4 Initcall 层次体系</h3><p><code>do_initcalls()</code> 按段地址顺序执行 8 个级别的初始化函数：</p><div class=table-wrapper><table><thead><tr><th>级别</th><th>宏</th><th>段名</th><th>用途</th><th>典型注册者</th></tr></thead><tbody><tr><td>0</td><td><code>pure_initcall</code></td><td><code>.initcall0</code></td><td>纯变量初始化，不依赖任何子系统</td><td>少数底层设施</td></tr><tr><td>1</td><td><code>core_initcall</code></td><td><code>.initcall1</code></td><td>内核核心依赖</td><td>内存、中断、基础设施</td></tr><tr><td>2</td><td><code>postcore_initcall</code></td><td><code>.initcall2</code></td><td>依赖 core 的后续逻辑</td><td>kobject、irq_domain</td></tr><tr><td>3</td><td><code>arch_initcall</code></td><td><code>.initcall3</code></td><td>体系结构特定初始化</td><td>IOMMU、ACPI、平台</td></tr><tr><td>4</td><td><code>subsys_initcall</code></td><td><code>.initcall4</code></td><td>大型子系统框架</td><td>PCI、USB、I2C 总线</td></tr><tr><td>5</td><td><code>fs_initcall</code></td><td><code>.initcall5</code></td><td>文件系统/协议族注册</td><td>ext4、inet_init()、proc</td></tr><tr><td>6</td><td><code>device_initcall</code></td><td><code>.initcall6</code></td><td>设备驱动注册（<code>module_init()</code> 默认）</td><td>各种驱动程序</td></tr><tr><td>7</td><td><code>late_initcall</code></td><td><code>.initcall7</code></td><td>启动尾声，依赖面最广</td><td>调优、可选特性</td></tr></tbody></table></div><p>另有 <code>early_initcall</code> 在 SMP 之前由 <code>do_pre_smp_initcalls()</code> 单独执行。</p><h2 id=四六大核心子系统架构>四、六大核心子系统架构</h2><h3 id=41-进程管理kernel>4.1 进程管理（kernel/）</h3><p><strong>核心数据结构 <code>struct task_struct</code>（约 700+ 字段）：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=n>struct</span> <span class=n>task_struct</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=o>//</span> <span class=err>───</span> <span class=err>调度相关</span> <span class=err>───</span>
+</span></span><span class=line><span class=cl>    <span class=n>__state</span>                     <span class=err>运行状态</span> <span class=p>(</span><span class=n>RUNNING</span><span class=o>/</span><span class=n>INTERRUPTIBLE</span><span class=o>/...</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>prio</span> <span class=o>/</span> <span class=n>static_prio</span>          <span class=err>优先级</span>
+</span></span><span class=line><span class=cl>    <span class=n>sched_class</span>                 <span class=err>调度类指针</span> <span class=p>(</span><span class=n>stop</span><span class=o>/</span><span class=n>dl</span><span class=o>/</span><span class=n>rt</span><span class=o>/</span><span class=n>fair</span><span class=o>/</span><span class=n>idle</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>se</span> <span class=p>(</span><span class=n>sched_entity</span><span class=p>)</span>           <span class=n>CFS</span> <span class=err>调度实体</span> <span class=p>(</span><span class=err>含</span> <span class=n>vruntime</span> <span class=o>/</span> <span class=n>rb_node</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>rt</span> <span class=p>(</span><span class=n>sched_rt_entity</span><span class=p>)</span>        <span class=n>RT</span> <span class=err>调度实体</span>
+</span></span><span class=line><span class=cl>    <span class=n>on_rq</span>                       <span class=err>是否在运行队列</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=o>//</span> <span class=err>───</span> <span class=err>内存</span> <span class=err>───</span>
+</span></span><span class=line><span class=cl>    <span class=n>mm</span> <span class=o>/</span> <span class=n>active_mm</span>              <span class=err>用户地址空间</span> <span class=o>/</span> <span class=err>活跃</span><span class=n>mm</span><span class=p>(</span><span class=err>内核线程借用</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=o>//</span> <span class=err>───</span> <span class=err>文件系统</span> <span class=err>───</span>
+</span></span><span class=line><span class=cl>    <span class=n>fs</span> <span class=p>(</span><span class=n>fs_struct</span><span class=p>)</span>              <span class=err>当前目录</span><span class=o>/</span><span class=err>根目录</span><span class=o>/</span><span class=n>umask</span>
+</span></span><span class=line><span class=cl>    <span class=n>files</span> <span class=p>(</span><span class=n>files_struct</span><span class=p>)</span>        <span class=err>打开文件表</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=o>//</span> <span class=err>───</span> <span class=err>信号</span> <span class=err>───</span>
+</span></span><span class=line><span class=cl>    <span class=k>signal</span> <span class=p>(</span><span class=n>signal_struct</span><span class=p>)</span>      <span class=err>线程组共享信号状态</span>
+</span></span><span class=line><span class=cl>    <span class=n>sighand</span>                     <span class=err>信号处理函数表</span>
+</span></span><span class=line><span class=cl>    <span class=n>pending</span>                     <span class=err>私有待处理信号队列</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=o>//</span> <span class=err>───</span> <span class=err>标识</span> <span class=err>───</span>
+</span></span><span class=line><span class=cl>    <span class=n>pid</span>                         <span class=err>线程</span> <span class=n>ID</span>
+</span></span><span class=line><span class=cl>    <span class=n>tgid</span>                        <span class=err>线程组</span> <span class=n>ID</span><span class=err>（用户态看到的</span><span class=s2>&#34;进程 ID&#34;</span><span class=err>）</span>
+</span></span><span class=line><span class=cl>    <span class=n>stack</span>                       <span class=err>内核栈指针</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>进程创建流程：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户 fork() / clone() / vfork()
+</span></span><span class=line><span class=cl>  → sys_clone / sys_clone3
+</span></span><span class=line><span class=cl>    → kernel_clone()
+</span></span><span class=line><span class=cl>      → copy_process()
+</span></span><span class=line><span class=cl>      │   ├── dup_task_struct()      复制 task_struct + 分配内核栈
+</span></span><span class=line><span class=cl>      │   ├── copy_files()           共享或复制文件描述符表
+</span></span><span class=line><span class=cl>      │   ├── copy_fs()              共享或复制 fs_struct
+</span></span><span class=line><span class=cl>      │   ├── copy_mm()              ★ COW 复制地址空间
+</span></span><span class=line><span class=cl>      │   ├── copy_sighand()         共享或复制信号处理表
+</span></span><span class=line><span class=cl>      │   ├── copy_thread()          设置子进程内核栈和返回地址
+</span></span><span class=line><span class=cl>      │   └── alloc_pid()            分配 PID
+</span></span><span class=line><span class=cl>      └── wake_up_new_task()         将子进程放入调度器运行队列
+</span></span></code></pre></td></tr></table></div></div><p><strong>CFS 调度器工作原理：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>per-CPU 运行队列 (struct rq)
+</span></span><span class=line><span class=cl>  └── cfs_rq
+</span></span><span class=line><span class=cl>        └── 红黑树 (按 vruntime 排序)
+</span></span><span class=line><span class=cl>              ├── task A (vruntime=100)
+</span></span><span class=line><span class=cl>              ├── task B (vruntime=120)  ← 最左节点 = 下一个运行
+</span></span><span class=line><span class=cl>              └── task C (vruntime=150)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>调度循环:
+</span></span><span class=line><span class=cl>  schedule() → __schedule()
+</span></span><span class=line><span class=cl>    → pick_next_task()
+</span></span><span class=line><span class=cl>      → pick_next_task_fair()
+</span></span><span class=line><span class=cl>        → pick_next_entity()    取 vruntime 最小的实体
+</span></span><span class=line><span class=cl>    → context_switch()
+</span></span><span class=line><span class=cl>        ├── switch_mm()         切换页表 (CR3/TTBR0)
+</span></span><span class=line><span class=cl>        └── switch_to()         切换寄存器和栈（汇编）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>每次运行时 update_curr():
+</span></span><span class=line><span class=cl>  vruntime += delta_exec × (NICE_0_WEIGHT / task_weight)
+</span></span><span class=line><span class=cl>  → 高权重任务 vruntime 增长慢，获得更多 CPU 时间
+</span></span></code></pre></td></tr></table></div></div><p><strong>进程状态转换：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                 fork()
+</span></span><span class=line><span class=cl>                   │
+</span></span><span class=line><span class=cl>                   ▼
+</span></span><span class=line><span class=cl>    ┌──────── TASK_RUNNING ◄─────── try_to_wake_up()
+</span></span><span class=line><span class=cl>    │          (可运行/正在运行)              ▲
+</span></span><span class=line><span class=cl>    │              │                        │
+</span></span><span class=line><span class=cl>    │    schedule() / 阻塞                    │ 事件到达
+</span></span><span class=line><span class=cl>    │              │                        │
+</span></span><span class=line><span class=cl>    │              ▼                        │
+</span></span><span class=line><span class=cl>    │    TASK_INTERRUPTIBLE ────信号────► TASK_RUNNING
+</span></span><span class=line><span class=cl>    │    TASK_UNINTERRUPTIBLE ──完成───► TASK_RUNNING
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    │    do_exit()
+</span></span><span class=line><span class=cl>    │       │
+</span></span><span class=line><span class=cl>    │       ▼
+</span></span><span class=line><span class=cl>    │   EXIT_ZOMBIE ──── wait() ──→ 回收
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    └──→ __TASK_STOPPED (SIGSTOP)
+</span></span><span class=line><span class=cl>         __TASK_TRACED (ptrace)
+</span></span></code></pre></td></tr></table></div></div><h3 id=42-内存管理mm>4.2 内存管理（mm/）</h3><p><strong>分层架构：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间 mmap()/brk()/malloc()
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  VMA 层: vm_area_struct + mm_struct      │  mm/mmap.c
+</span></span><span class=line><span class=cl>│  管理进程虚拟地址空间 [vm_start, vm_end) │  延迟分配：创建 VMA，不分物理页
+</span></span><span class=line><span class=cl>└───────────────────┬─────────────────────┘
+</span></span><span class=line><span class=cl>                    │ 首次访问 → 缺页异常
+</span></span><span class=line><span class=cl>                    ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  缺页处理: handle_mm_fault()             │  mm/memory.c
+</span></span><span class=line><span class=cl>│  → do_anonymous_page() (匿名页)          │  分配物理页 + 建立页表映射
+</span></span><span class=line><span class=cl>│  → do_fault() (文件映射页)               │
+</span></span><span class=line><span class=cl>│  → do_wp_page() (COW 写时复制)           │
+</span></span><span class=line><span class=cl>│  → do_swap_page() (换入)                 │
+</span></span><span class=line><span class=cl>└───────────────────┬─────────────────────┘
+</span></span><span class=line><span class=cl>                    │ 需要物理页
+</span></span><span class=line><span class=cl>                    ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  Slab 层: kmalloc() / kmem_cache_alloc() │  mm/slub.c
+</span></span><span class=line><span class=cl>│  小对象分配器 (per-CPU 快速路径)          │  对象级缓存
+</span></span><span class=line><span class=cl>└───────────────────┬─────────────────────┘
+</span></span><span class=line><span class=cl>                    │ 需要整页
+</span></span><span class=line><span class=cl>                    ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  伙伴系统: __alloc_pages()               │  mm/page_alloc.c
+</span></span><span class=line><span class=cl>│  物理页帧分配器 (order 0~10)             │  get_page_from_freelist()
+</span></span><span class=line><span class=cl>│  zone: DMA → DMA32 → NORMAL → HIGHMEM   │  → __alloc_pages_slowpath()
+</span></span><span class=line><span class=cl>└───────────────────┬─────────────────────┘
+</span></span><span class=line><span class=cl>                    │ 内存不足
+</span></span><span class=line><span class=cl>                    ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  页回收: kswapd / direct reclaim         │  mm/vmscan.c
+</span></span><span class=line><span class=cl>│  shrink_node() → LRU 扫描 → 换出/丢弃    │  try_to_free_pages()
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><p><strong>内存区域(Zone)划分：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>物理内存地址空间:
+</span></span><span class=line><span class=cl>┌──────────────┬────────────────┬──────────────────┬─────────────┐
+</span></span><span class=line><span class=cl>│  ZONE_DMA    │  ZONE_DMA32    │   ZONE_NORMAL    │ ZONE_HIGHMEM│
+</span></span><span class=line><span class=cl>│  0~16MB      │  16MB~4GB      │   可直接映射区域  │ (仅32位)    │
+</span></span><span class=line><span class=cl>│  ISA DMA     │  32位 DMA      │   内核正常使用    │             │
+</span></span><span class=line><span class=cl>└──────────────┴────────────────┴──────────────────┴─────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=43-文件系统fs>4.3 文件系统（fs/）</h3><p><strong>VFS 抽象层架构：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户: open(&#34;/etc/passwd&#34;, O_RDONLY)
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>┌────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  VFS 层 (fs/)                                          │
+</span></span><span class=line><span class=cl>│                                                        │
+</span></span><span class=line><span class=cl>│  struct file  ←───→  struct dentry  ←───→  struct inode│
+</span></span><span class=line><span class=cl>│  (打开文件实例)      (目录项缓存)          (文件元数据)  │
+</span></span><span class=line><span class=cl>│  f_op = ext4 ops     d_inode              i_op/i_fop   │
+</span></span><span class=line><span class=cl>│  f_pos               d_parent/d_name      i_size       │
+</span></span><span class=line><span class=cl>│                      d_sb                 i_mapping    │
+</span></span><span class=line><span class=cl>│                           │                            │
+</span></span><span class=line><span class=cl>│                      struct super_block                │
+</span></span><span class=line><span class=cl>│                      (挂载的文件系统实例)               │
+</span></span><span class=line><span class=cl>│                      s_op, s_type, s_root              │
+</span></span><span class=line><span class=cl>└───────────────────────┬────────────────────────────────┘
+</span></span><span class=line><span class=cl>                        │  调用具体文件系统的操作函数
+</span></span><span class=line><span class=cl>                        ▼
+</span></span><span class=line><span class=cl>┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+</span></span><span class=line><span class=cl>│   ext4   │ │  procfs  │ │  sysfs   │ │  tmpfs   │ ...
+</span></span><span class=line><span class=cl>└──────────┘ └──────────┘ └──────────┘ └──────────┘
+</span></span></code></pre></td></tr></table></div></div><p><strong>路径查找流程（fs/namei.c）：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>filename_lookup()
+</span></span><span class=line><span class=cl>  → path_lookupat()
+</span></span><span class=line><span class=cl>    → path_init()           确定起点 (root / cwd / dirfd)
+</span></span><span class=line><span class=cl>    → link_path_walk()      逐分量遍历
+</span></span><span class=line><span class=cl>    │   对每个分量:
+</span></span><span class=line><span class=cl>    │   ├── 权限检查
+</span></span><span class=line><span class=cl>    │   ├── hash 计算
+</span></span><span class=line><span class=cl>    │   ├── walk_component()  查 dcache → 未命中则 real_lookup → 调 i_op-&gt;lookup
+</span></span><span class=line><span class=cl>    │   └── 处理挂载点穿越 / 符号链接跟随
+</span></span><span class=line><span class=cl>    → lookup_last()         处理最终分量
+</span></span><span class=line><span class=cl>    → complete_walk()       完成查找
+</span></span></code></pre></td></tr></table></div></div><p><strong>读写流程：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>read(fd, buf, count)
+</span></span><span class=line><span class=cl>  → ksys_read() → vfs_read()
+</span></span><span class=line><span class=cl>    → file-&gt;f_op-&gt;read()         直接读
+</span></span><span class=line><span class=cl>       或 file-&gt;f_op-&gt;read_iter()  迭代器读
+</span></span><span class=line><span class=cl>         → 具体文件系统实现
+</span></span><span class=line><span class=cl>           → 页缓存命中？ 直接拷贝
+</span></span><span class=line><span class=cl>           → 未命中？ 触发 readahead → 块 I/O → DMA → 拷贝到用户
+</span></span></code></pre></td></tr></table></div></div><h3 id=44-网络协议栈net>4.4 网络协议栈（net/）</h3><p><strong>分层架构：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间: socket() / bind() / connect() / send() / recv()
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  Socket 层 (net/socket.c)                            │
+</span></span><span class=line><span class=cl>│  struct socket (BSD 接口) → struct sock (协议控制块)  │
+</span></span><span class=line><span class=cl>│  ops = inet_stream_ops / inet_dgram_ops              │
+</span></span><span class=line><span class=cl>│  向上提供 socket/bind/connect/sendmsg/recvmsg 系统调用│
+</span></span><span class=line><span class=cl>│  向下通过 proto_ops 分发到具体协议                     │
+</span></span><span class=line><span class=cl>└───────────────────────┬─────────────────────────────┘
+</span></span><span class=line><span class=cl>                        │
+</span></span><span class=line><span class=cl>┌───────────────────────▼─────────────────────────────┐
+</span></span><span class=line><span class=cl>│  传输层 (net/ipv4/tcp*.c, udp.c)                     │
+</span></span><span class=line><span class=cl>│  TCP: 连接管理/拥塞控制(BBR/CUBIC)/重传/流控           │
+</span></span><span class=line><span class=cl>│  UDP: 无连接/校验和/多播                              │
+</span></span><span class=line><span class=cl>└───────────────────────┬─────────────────────────────┘
+</span></span><span class=line><span class=cl>                        │
+</span></span><span class=line><span class=cl>┌───────────────────────▼─────────────────────────────┐
+</span></span><span class=line><span class=cl>│  网络层 / IP 层 (net/ipv4/)                           │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────────────────────────────┐ │
+</span></span><span class=line><span class=cl>│  │ Netfilter 钩子（嵌入在 IP 层内部，非独立模块）    │ │
+</span></span><span class=line><span class=cl>│  │                                                 │ │
+</span></span><span class=line><span class=cl>│  │ 收包: ip_rcv() ──[PREROUTING]──→ 路由判定        │ │
+</span></span><span class=line><span class=cl>│  │          ├→ 本机: ──[INPUT]──→ 传输层             │ │
+</span></span><span class=line><span class=cl>│  │          └→ 转发: ──[FORWARD]──→ [POSTROUTING]    │ │
+</span></span><span class=line><span class=cl>│  │ 发包: 传输层 → ip_output() ──[OUTPUT]──→ 路由     │ │
+</span></span><span class=line><span class=cl>│  │          → ──[POSTROUTING]──→ 出口                │ │
+</span></span><span class=line><span class=cl>│  └─────────────────────────────────────────────────┘ │
+</span></span><span class=line><span class=cl>│  路由查找: FIB rule → fib_table_lookup()              │
+</span></span><span class=line><span class=cl>│  L3 master (VRF): l3mdev_update_flow() 自动选路由表   │
+</span></span><span class=line><span class=cl>│  分片/重组: ip_fragment() / ip_defrag()               │
+</span></span><span class=line><span class=cl>└───────────────────────┬─────────────────────────────┘
+</span></span><span class=line><span class=cl>                        │
+</span></span><span class=line><span class=cl>┌───────────────────────▼─────────────────────────────┐
+</span></span><span class=line><span class=cl>│  邻居子系统 (net/core/neighbour.c)                    │
+</span></span><span class=line><span class=cl>│  ARP/NDP: IP → MAC 地址解析                           │
+</span></span><span class=line><span class=cl>│  neigh_output() → 将 L3 包交给 L2 发送                │
+</span></span><span class=line><span class=cl>└───────────────────────┬─────────────────────────────┘
+</span></span><span class=line><span class=cl>                        │
+</span></span><span class=line><span class=cl>┌───────────────────────▼─────────────────────────────┐
+</span></span><span class=line><span class=cl>│  设备子系统 (net/core/dev.c)                          │
+</span></span><span class=line><span class=cl>│  struct net_device / struct sk_buff                  │
+</span></span><span class=line><span class=cl>│  dev_queue_xmit() (发送) / netif_receive_skb() (接收)│
+</span></span><span class=line><span class=cl>│  NAPI 收包 / Qdisc 发包 / TSO/GSO/GRO 卸载           │
+</span></span><span class=line><span class=cl>└───────────────────────┬─────────────────────────────┘
+</span></span><span class=line><span class=cl>                        │
+</span></span><span class=line><span class=cl>┌───────────────────────▼─────────────────────────────┐
+</span></span><span class=line><span class=cl>│  网卡驱动 (drivers/net/)                              │
+</span></span><span class=line><span class=cl>│  DMA ring buffer / 中断 / NAPI poll                  │
+</span></span><span class=line><span class=cl>└───────────────────────┬─────────────────────────────┘
+</span></span><span class=line><span class=cl>                        │
+</span></span><span class=line><span class=cl>                   物理网口 (NIC)
+</span></span></code></pre></td></tr></table></div></div><p><strong>Netfilter 5 个钩子点的源码位置：</strong></p><div class=table-wrapper><table><thead><tr><th>钩子</th><th>源码位置</th><th>上下文</th></tr></thead><tbody><tr><td><code>NF_INET_PRE_ROUTING</code></td><td><code>net/ipv4/ip_input.c:599</code></td><td><code>ip_rcv()</code> 尾部，路由判定之前</td></tr><tr><td><code>NF_INET_LOCAL_IN</code></td><td><code>net/ipv4/ip_input.c:307</code></td><td><code>ip_local_deliver()</code> 交给传输层之前</td></tr><tr><td><code>NF_INET_FORWARD</code></td><td><code>net/ipv4/ip_forward.c:157</code></td><td><code>ip_forward()</code> 转发判定完成后</td></tr><tr><td><code>NF_INET_LOCAL_OUT</code></td><td><code>net/ipv4/ip_output.c</code></td><td>本机发出包，路由查找之后</td></tr><tr><td><code>NF_INET_POST_ROUTING</code></td><td><code>net/ipv4/ip_output.c:643</code></td><td><code>ip_output()</code> 出口，发往驱动之前</td></tr></tbody></table></div><p><strong>收包完整路径（含 VRF 介入点）：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>网卡 DMA → 硬中断 → NAPI poll → napi_gro_receive()
+</span></span><span class=line><span class=cl>  → netif_receive_skb()
+</span></span><span class=line><span class=cl>    → __netif_receive_skb_core()
+</span></span><span class=line><span class=cl>      → packet_type 分发 (ip_packet_type → ip_rcv)
+</span></span><span class=line><span class=cl>        → ip_rcv_core()         校验IP头, IPCB(skb)-&gt;iif = skb-&gt;skb_iif
+</span></span><span class=line><span class=cl>        → NF_HOOK(PRE_ROUTING)
+</span></span><span class=line><span class=cl>        → ip_rcv_finish()
+</span></span><span class=line><span class=cl>          → l3mdev_ip_rcv()     ★ VRF 介入: skb-&gt;dev 改为 VRF master
+</span></span><span class=line><span class=cl>          → ip_rcv_finish_core()
+</span></span><span class=line><span class=cl>            → ip_route_input_noref()  路由查找
+</span></span><span class=line><span class=cl>              → __fib_lookup()
+</span></span><span class=line><span class=cl>                → l3mdev_update_flow()      iif 改为 VRF master
+</span></span><span class=line><span class=cl>                → fib_rules_lookup()
+</span></span><span class=line><span class=cl>                  → l3mdev_fib_rule_match() 自动选 VRF 路由表
+</span></span><span class=line><span class=cl>          → 本机: ip_local_deliver() → NF_HOOK(INPUT) → tcp_v4_rcv()
+</span></span><span class=line><span class=cl>          → 转发: ip_forward() → NF_HOOK(FORWARD) → ip_output()
+</span></span></code></pre></td></tr></table></div></div><p><strong>发包完整路径：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>send(fd, buf, len)
+</span></span><span class=line><span class=cl>  → sock-&gt;ops-&gt;sendmsg()  (inet_sendmsg)
+</span></span><span class=line><span class=cl>    → tcp_sendmsg() / udp_sendmsg()
+</span></span><span class=line><span class=cl>      → ip_queue_xmit() / ip_send_skb()
+</span></span><span class=line><span class=cl>        → __ip_queue_xmit()
+</span></span><span class=line><span class=cl>          → ip_route_output_flow()  路由查找（出口方向）
+</span></span><span class=line><span class=cl>            → __fib_lookup()
+</span></span><span class=line><span class=cl>              → l3mdev_update_flow()  ★ oif 改为 VRF master
+</span></span><span class=line><span class=cl>              → l3mdev_fib_rule_match() 选 VRF 路由表
+</span></span><span class=line><span class=cl>          → NF_HOOK(OUTPUT)
+</span></span><span class=line><span class=cl>        → ip_output()
+</span></span><span class=line><span class=cl>          → NF_HOOK(POST_ROUTING)
+</span></span><span class=line><span class=cl>            → ip_finish_output()
+</span></span><span class=line><span class=cl>              → neigh_output()      邻居子系统: ARP 解析
+</span></span><span class=line><span class=cl>                → dev_queue_xmit()  设备子系统: Qdisc 入队
+</span></span><span class=line><span class=cl>                  → ndo_start_xmit()  驱动发送
+</span></span><span class=line><span class=cl>                    → DMA → 物理网口
+</span></span></code></pre></td></tr></table></div></div><p><strong>inet_init() 注册机制（fs_initcall 级别）：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>inet_init()                               // net/ipv4/af_inet.c
+</span></span><span class=line><span class=cl>  ├── proto_register(tcp/udp/raw/ping_prot)    注册协议
+</span></span><span class=line><span class=cl>  ├── sock_register(&amp;inet_family_ops)          注册 AF_INET 族
+</span></span><span class=line><span class=cl>  ├── inet_add_protocol(icmp/udp/tcp)          注册 L4 协议处理
+</span></span><span class=line><span class=cl>  ├── inet_register_protosw(inetsw_array[])    注册 socket 类型
+</span></span><span class=line><span class=cl>  ├── arp_init() / ip_init() / tcp_init() / udp_init()
+</span></span><span class=line><span class=cl>  └── dev_add_pack(&amp;ip_packet_type)            注册 L2→L3 分发
+</span></span></code></pre></td></tr></table></div></div><h3 id=45-设备驱动模型drivers>4.5 设备驱动模型（drivers/）</h3><p><strong>核心对象关系：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>struct bus_type (总线类型)
+</span></span><span class=line><span class=cl>  ├── match()          匹配设备与驱动
+</span></span><span class=line><span class=cl>  ├── probe()          绑定后初始化
+</span></span><span class=line><span class=cl>  ├── devices klist    挂载的设备链表
+</span></span><span class=line><span class=cl>  └── drivers klist    注册的驱动链表
+</span></span><span class=line><span class=cl>       │                      │
+</span></span><span class=line><span class=cl>       ▼                      ▼
+</span></span><span class=line><span class=cl>struct device              struct device_driver
+</span></span><span class=line><span class=cl>  ├── bus                    ├── bus
+</span></span><span class=line><span class=cl>  ├── driver ──────────────→ ├── probe()
+</span></span><span class=line><span class=cl>  ├── parent                 ├── remove()
+</span></span><span class=line><span class=cl>  ├── kobj (sysfs)           └── of_match_table
+</span></span><span class=line><span class=cl>  └── of_node (设备树)
+</span></span></code></pre></td></tr></table></div></div><p><strong>注册流程：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>设备注册:                          驱动注册:
+</span></span><span class=line><span class=cl>device_register()                 driver_register()
+</span></span><span class=line><span class=cl>  → device_initialize()             → bus_add_driver()
+</span></span><span class=line><span class=cl>  → device_add()                      → driver_attach()
+</span></span><span class=line><span class=cl>    → bus_add_device()                  → 遍历 bus 上所有设备
+</span></span><span class=line><span class=cl>    → bus_probe_device()                → bus-&gt;match() 匹配
+</span></span><span class=line><span class=cl>      → device_initial_probe()          → driver_probe_device()
+</span></span><span class=line><span class=cl>        → 遍历 bus 上所有驱动              → really_probe()
+</span></span><span class=line><span class=cl>        → bus-&gt;match()                     → driver-&gt;probe() 初始化
+</span></span><span class=line><span class=cl>        → driver-&gt;probe()
+</span></span></code></pre></td></tr></table></div></div><h3 id=46-中断与同步机制>4.6 中断与同步机制</h3><p><strong>中断处理分层：</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>硬件中断
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  Top Half (硬中断上下文)              │
+</span></span><span class=line><span class=cl>│  - 中断控制器应答                     │
+</span></span><span class=line><span class=cl>│  - 最少必要处理（读寄存器/清标志）     │
+</span></span><span class=line><span class=cl>│  - 调度 Bottom Half                  │
+</span></span><span class=line><span class=cl>│  - 不可睡眠，不可抢占                 │
+</span></span><span class=line><span class=cl>└───────────────────┬──────────────────┘
+</span></span><span class=line><span class=cl>                    │ 延迟处理
+</span></span><span class=line><span class=cl>                    ▼
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  Bottom Half (软中断/tasklet/workqueue)│
+</span></span><span class=line><span class=cl>│                                      │
+</span></span><span class=line><span class=cl>│  softirq_init() 注册：               │
+</span></span><span class=line><span class=cl>│    NET_TX_SOFTIRQ  网络发送           │
+</span></span><span class=line><span class=cl>│    NET_RX_SOFTIRQ  网络接收           │
+</span></span><span class=line><span class=cl>│    BLOCK_SOFTIRQ   块 I/O 完成        │
+</span></span><span class=line><span class=cl>│    TIMER_SOFTIRQ   定时器             │
+</span></span><span class=line><span class=cl>│    SCHED_SOFTIRQ   调度器负载均衡      │
+</span></span><span class=line><span class=cl>│    RCU_SOFTIRQ     RCU 回调           │
+</span></span><span class=line><span class=cl>│                                      │
+</span></span><span class=line><span class=cl>│  workqueue: 可睡眠的异步工作           │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h2 id=五子系统依赖关系图>五、子系统依赖关系图</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl>                    <span class=err>┌──────────┐</span>
+</span></span><span class=line><span class=cl>                    <span class=err>│</span> <span class=err>体系结构层│</span>
+</span></span><span class=line><span class=cl>                    <span class=err>│</span> <span class=p>(</span><span class=n>arch</span><span class=o>/</span><span class=p>)</span>  <span class=err>│</span>
+</span></span><span class=line><span class=cl>                    <span class=err>└────┬─────┘</span>
+</span></span><span class=line><span class=cl>                         <span class=err>│</span> <span class=err>提供</span><span class=p>:</span> <span class=err>页表</span><span class=o>/</span><span class=err>中断入口</span><span class=o>/</span><span class=err>上下文切换</span><span class=o>/</span><span class=err>系统调用</span>
+</span></span><span class=line><span class=cl>              <span class=err>┌──────────┼──────────┐</span>
+</span></span><span class=line><span class=cl>              <span class=err>│</span>          <span class=err>│</span>          <span class=err>│</span>
+</span></span><span class=line><span class=cl>              <span class=err>▼</span>          <span class=err>▼</span>          <span class=err>▼</span>
+</span></span><span class=line><span class=cl>        <span class=err>┌──────────┐</span> <span class=err>┌──────┐</span> <span class=err>┌─────────┐</span>
+</span></span><span class=line><span class=cl>        <span class=err>│</span> <span class=err>内存管理</span>  <span class=err>│</span> <span class=err>│</span> <span class=err>中断</span>  <span class=err>│</span> <span class=err>│</span> <span class=err>定时器</span>   <span class=err>│</span>
+</span></span><span class=line><span class=cl>        <span class=err>│</span>  <span class=p>(</span><span class=n>mm</span><span class=o>/</span><span class=p>)</span>   <span class=err>│</span> <span class=err>│</span>      <span class=err>│</span> <span class=err>│</span>         <span class=err>│</span>
+</span></span><span class=line><span class=cl>        <span class=err>└──┬───────┘</span> <span class=err>└──┬───┘</span> <span class=err>└────┬────┘</span>
+</span></span><span class=line><span class=cl>           <span class=err>│</span>            <span class=err>│</span>          <span class=err>│</span>
+</span></span><span class=line><span class=cl>     <span class=err>┌─────┴─────┐</span>      <span class=err>│</span>          <span class=err>│</span>
+</span></span><span class=line><span class=cl>     <span class=err>│</span>           <span class=err>│</span>      <span class=err>│</span>          <span class=err>│</span>
+</span></span><span class=line><span class=cl>     <span class=err>▼</span>           <span class=err>▼</span>      <span class=err>▼</span>          <span class=err>▼</span>
+</span></span><span class=line><span class=cl><span class=err>┌────────┐</span>  <span class=err>┌────────┐</span> <span class=err>┌──────────────┐</span>
+</span></span><span class=line><span class=cl><span class=err>│</span> <span class=n>Slab</span>   <span class=err>│</span>  <span class=err>│</span>  <span class=n>VMA</span>   <span class=err>│</span> <span class=err>│</span>   <span class=err>调度器</span>      <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│分配器</span>  <span class=err>│</span>  <span class=err>│</span> <span class=err>缺页</span>   <span class=err>│</span> <span class=err>│</span> <span class=p>(</span><span class=n>kernel</span><span class=o>/</span><span class=n>sched</span><span class=p>)</span><span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>└───┬────┘</span>  <span class=err>└───┬────┘</span> <span class=err>└──────┬───────┘</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>           <span class=err>│</span>              <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>     <span class=err>┌─────┴──────┐</span>       <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>     <span class=err>│</span>            <span class=err>│</span>       <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>▼</span>     <span class=err>▼</span>            <span class=err>▼</span>       <span class=err>▼</span>
+</span></span><span class=line><span class=cl><span class=err>┌───────────┐</span>    <span class=err>┌──────────────────┐</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>   <span class=n>VFS</span>     <span class=err>│</span>    <span class=err>│</span>   <span class=err>进程管理</span>        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=p>(</span><span class=n>fs</span><span class=o>/</span><span class=p>)</span>    <span class=err>│</span>    <span class=err>│</span>  <span class=n>fork</span><span class=o>/</span><span class=k>signal</span><span class=o>/</span><span class=n>exit</span><span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>dentry</span>   <span class=err>│</span>    <span class=err>│</span>                  <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>inode</span>    <span class=err>│</span>    <span class=err>│</span>                  <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>file</span>     <span class=err>│</span>    <span class=err>│</span>                  <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>└─────┬─────┘</span>    <span class=err>└────────┬─────────┘</span>
+</span></span><span class=line><span class=cl>      <span class=err>│</span>                   <span class=err>│</span>
+</span></span><span class=line><span class=cl>      <span class=err>├─────────┬─────────┘</span>
+</span></span><span class=line><span class=cl>      <span class=err>│</span>         <span class=err>│</span>
+</span></span><span class=line><span class=cl>      <span class=err>▼</span>         <span class=err>▼</span>
+</span></span><span class=line><span class=cl><span class=err>┌──────────────────────┐</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>     <span class=err>网络协议栈</span>        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>     <span class=p>(</span><span class=n>net</span><span class=o>/</span><span class=p>)</span>           <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>socket</span> <span class=err>→</span> <span class=n>TCP</span><span class=o>/</span><span class=n>UDP</span>    <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>→</span> <span class=ne>IP</span> <span class=err>→</span> <span class=n>dev</span> <span class=err>→</span> <span class=err>驱动</span>   <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>└──────────┬───────────┘</span>
+</span></span><span class=line><span class=cl>           <span class=err>│</span>
+</span></span><span class=line><span class=cl>           <span class=err>▼</span>
+</span></span><span class=line><span class=cl><span class=err>┌──────────────────────┐</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>    <span class=err>设备驱动框架</span>       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>    <span class=p>(</span><span class=n>drivers</span><span class=o>/</span><span class=p>)</span>        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>bus</span><span class=o>/</span><span class=n>device</span><span class=o>/</span><span class=n>driver</span>   <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>platform</span> <span class=o>/</span> <span class=n>PCI</span> <span class=o>/</span> <span class=n>USB</span><span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>└──────────────────────┘</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>依赖方向说明：</strong></p><div class=table-wrapper><table><thead><tr><th>被依赖者</th><th>依赖者</th><th>依赖内容</th></tr></thead><tbody><tr><td>体系结构层</td><td>所有子系统</td><td>页表操作、中断机制、原子操作、屏障指令</td></tr><tr><td>内存管理</td><td>几乎所有子系统</td><td>kmalloc/slab、页分配、vmalloc、mmap</td></tr><tr><td>中断机制</td><td>调度器、网络、驱动、定时器</td><td>硬中断处理、softirq、workqueue</td></tr><tr><td>调度器</td><td>所有需要阻塞/唤醒的子系统</td><td>schedule()、wait_event、wake_up</td></tr><tr><td>VFS</td><td>网络(socket文件)、procfs、sysfs、驱动</td><td>file_operations、inode、dentry</td></tr><tr><td>进程管理</td><td>用户态所有程序</td><td>fork、exec、信号、退出</td></tr><tr><td>网络协议栈</td><td>Socket 用户、网络驱动</td><td>sk_buff、协议处理、路由</td></tr><tr><td>设备驱动框架</td><td>所有硬件驱动</td><td>probe/remove、sysfs、电源管理</td></tr></tbody></table></div><h2 id=六三个特殊进程>六、三个特殊进程</h2><div class=table-wrapper><table><thead><tr><th>PID</th><th>名称</th><th>创建方式</th><th>职责</th></tr></thead><tbody><tr><td>0</td><td>swapper/idle</td><td>静态定义 <code>init_task</code>（init/init_task.c），非动态创建</td><td>执行 start_kernel() 全部初始化，然后永久进入 cpu_startup_entry() 的 idle 循环</td></tr><tr><td>1</td><td>init</td><td>rest_init() 中 kernel_thread(kernel_init)</td><td>执行 do_initcalls()，然后 kernel_execve("/sbin/init") 变身为用户态 init 进程，是所有用户进程的祖先</td></tr><tr><td>2</td><td>kthreadd</td><td>rest_init() 中 kernel_thread(kthreadd)</td><td>内核线程守护进程，所有内核线程（kworker/ksoftirqd/kswapd 等）的创建都由它代理完成</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/%E5%86%85%E6%A0%B8%E6%9E%B6%E6%9E%84/>内核架构</a>
+<a href=/tags/start_kernel/>Start_kernel</a>
+<a href=/tags/%E5%AD%90%E7%B3%BB%E7%BB%9F/>子系统</a>
+<a href=/tags/%E5%88%86%E5%B1%82/>分层</a>
+<a href=/tags/netfilter/>Netfilter</a>
+<a href=/tags/nf_hook/>NF_HOOK</a>
+<a href=/tags/%E6%94%B6%E5%8C%85%E8%B7%AF%E5%BE%84/>收包路径</a>
+<a href=/tags/%E5%8F%91%E5%8C%85%E8%B7%AF%E5%BE%84/>发包路径</a>
+<a href=/tags/vrf/>VRF</a>
+<a href=/tags/l3mdev/>L3mdev</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/namespacecgroupvrf-%E6%9C%BA%E5%88%B6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Namespace、Cgroup、VRF 机制分析</h2></div></a></article><article><a href=/p/linux-%E5%86%85%E6%A0%B8%E5%A6%82%E4%BD%95%E6%8E%A5%E7%AE%A1-cpu-%E4%B8%8E%E5%86%85%E5%AD%98%E4%BB%8E%E4%B8%8A%E7%94%B5%E5%88%B0%E5%AE%8C%E5%85%A8%E6%8E%8C%E6%8E%A7%E7%A1%AC%E4%BB%B6/><div class=article-details><h2 class=article-title>Linux 内核如何接管 CPU 与内存——从上电到完全掌控硬件</h2></div></a></article><article><a href=/p/netfilter-%E6%A1%86%E6%9E%B6%E4%B8%8E%E9%92%A9%E5%AD%90%E6%9C%BA%E5%88%B6/><div class=article-details><h2 class=article-title>Netfilter 框架与钩子机制</h2></div></a></article><article><a href=/p/rcu-%E4%B8%8E%E9%94%81%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>RCU 与锁机制源码深度分析</h2></div></a></article><article><a href=/p/ebpf-%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E5%88%86%E6%9E%90%E5%9F%BA%E4%BA%8E-linux-5.15.78-%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81/><div class=article-details><h2 class=article-title>eBPF 实现原理分析（基于 Linux 5.15.78 内核源码）</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

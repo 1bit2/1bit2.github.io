@@ -1,0 +1,1585 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="TCP 三次握手源码分析 基于 Linux 5.15.78，专注分析 connect() 触发的 TCP 三次握手全过程。 Socket 创建参见 socket创建与fd分配，Bind 参见 TCP-bind操作，Listen 参见 TCP-listen操作。 半连接/全连接队列、SYN Cookie、溢出排查详见 TCP-listen操作 五~七节。\n三次握手时序图（点击跳转） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 时间 客户端 服务器 │ │ connect() │ ├─> __sys_connect() ─────────── ① Connect入口 │ ├─> tcp_v4_connect() │ │ ├─> 路由查找/选端口/生成ISN │ │ └─> tcp_connect() │ │ │ │ ─── [SYN, seq=x] ──────────> ② 客户端发送SYN │ │ tcp_v4_rcv() │ │ └─> tcp_rcv_state_process() │ │ ├─> tcp_v4_conn_request() │ │ ├─> tcp_conn_request() │ │ │ ├─> 创建request_sock │ │ │ ├─> 加入半连接队列 │ │ │ └─> tcp_v4_send_synack() │ │ │ │ <──── [SYN-ACK, seq=y, ack=x+1] ──── ③ 服务端收SYN发SYN-ACK │ │ │ tcp_v4_rcv() │ └─> tcp_rcv_state_process() │ ├─> tcp_rcv_synsent_state_process() │ ├─> tcp_finish_connect() │ │ └─> 状态: ESTABLISHED │ └─> tcp_send_ack() │ │ ─── [ACK, ack=y+1] ──────────────> ④ 客户端收SYN-ACK发ACK │ tcp_v4_rcv() │ └─> tcp_check_req() │ ├─> tcp_v4_syn_recv_sock() │ │ └─> 创建完整sock │ ├─> 加入accept队列 ── ⑤ 服务端收ACK │ │ └─> 状态: ESTABLISHED │ └─> sk->sk_data_ready() │ │ 连接建立完成，双方状态: ESTABLISHED 步骤 方向 详细分析（点击跳转） ① Connect 入口 — 一、Connect 入口 ② 客户端发送 SYN Client → Server 三、客户端发送 SYN（tcp_v4_connect → tcp_connect） ③ 服务端收 SYN 发 SYN-ACK Server → Client 四、服务端收 SYN 发 SYN-ACK（tcp_conn_request → tcp_v4_send_synack） ④ 客户端收 SYN-ACK 发 ACK Client → Server 五、客户端收 SYN-ACK 发 ACK（tcp_rcv_synsent_state_process） ⑤ 服务端收 ACK 完成握手 Server 5.3 服务端收最终 ACK（tcp_check_req） 安全机制 — 八、安全机制（SYN Cookie / ISN 防预测） 选项协商 — 七、TCP 选项协商（MSS / WScale / SACK / Timestamps） "><title>TCP 三次握手源码分析</title><link rel=canonical href=https://1bit2.github.io/p/tcp-%E4%B8%89%E6%AC%A1%E6%8F%A1%E6%89%8B%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP 三次握手源码分析"><meta property='og:description' content="TCP 三次握手源码分析 基于 Linux 5.15.78，专注分析 connect() 触发的 TCP 三次握手全过程。 Socket 创建参见 socket创建与fd分配，Bind 参见 TCP-bind操作，Listen 参见 TCP-listen操作。 半连接/全连接队列、SYN Cookie、溢出排查详见 TCP-listen操作 五~七节。\n三次握手时序图（点击跳转） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 时间 客户端 服务器 │ │ connect() │ ├─> __sys_connect() ─────────── ① Connect入口 │ ├─> tcp_v4_connect() │ │ ├─> 路由查找/选端口/生成ISN │ │ └─> tcp_connect() │ │ │ │ ─── [SYN, seq=x] ──────────> ② 客户端发送SYN │ │ tcp_v4_rcv() │ │ └─> tcp_rcv_state_process() │ │ ├─> tcp_v4_conn_request() │ │ ├─> tcp_conn_request() │ │ │ ├─> 创建request_sock │ │ │ ├─> 加入半连接队列 │ │ │ └─> tcp_v4_send_synack() │ │ │ │ <──── [SYN-ACK, seq=y, ack=x+1] ──── ③ 服务端收SYN发SYN-ACK │ │ │ tcp_v4_rcv() │ └─> tcp_rcv_state_process() │ ├─> tcp_rcv_synsent_state_process() │ ├─> tcp_finish_connect() │ │ └─> 状态: ESTABLISHED │ └─> tcp_send_ack() │ │ ─── [ACK, ack=y+1] ──────────────> ④ 客户端收SYN-ACK发ACK │ tcp_v4_rcv() │ └─> tcp_check_req() │ ├─> tcp_v4_syn_recv_sock() │ │ └─> 创建完整sock │ ├─> 加入accept队列 ── ⑤ 服务端收ACK │ │ └─> 状态: ESTABLISHED │ └─> sk->sk_data_ready() │ │ 连接建立完成，双方状态: ESTABLISHED 步骤 方向 详细分析（点击跳转） ① Connect 入口 — 一、Connect 入口 ② 客户端发送 SYN Client → Server 三、客户端发送 SYN（tcp_v4_connect → tcp_connect） ③ 服务端收 SYN 发 SYN-ACK Server → Client 四、服务端收 SYN 发 SYN-ACK（tcp_conn_request → tcp_v4_send_synack） ④ 客户端收 SYN-ACK 发 ACK Client → Server 五、客户端收 SYN-ACK 发 ACK（tcp_rcv_synsent_state_process） ⑤ 服务端收 ACK 完成握手 Server 5.3 服务端收最终 ACK（tcp_check_req） 安全机制 — 八、安全机制（SYN Cookie / ISN 防预测） 选项协商 — 七、TCP 选项协商（MSS / WScale / SACK / Timestamps） "><meta property='og:url' content='https://1bit2.github.io/p/tcp-%E4%B8%89%E6%AC%A1%E6%8F%A1%E6%89%8B%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='三次握手'><meta property='article:tag' content='connect'><meta property='article:tag' content='SYN'><meta property='article:tag' content='SYN-ACK'><meta property='article:published_time' content='2026-04-16T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-16T00:00:00+00:00'><meta name=twitter:title content="TCP 三次握手源码分析"><meta name=twitter:description content="TCP 三次握手源码分析 基于 Linux 5.15.78，专注分析 connect() 触发的 TCP 三次握手全过程。 Socket 创建参见 socket创建与fd分配，Bind 参见 TCP-bind操作，Listen 参见 TCP-listen操作。 半连接/全连接队列、SYN Cookie、溢出排查详见 TCP-listen操作 五~七节。\n三次握手时序图（点击跳转） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 时间 客户端 服务器 │ │ connect() │ ├─> __sys_connect() ─────────── ① Connect入口 │ ├─> tcp_v4_connect() │ │ ├─> 路由查找/选端口/生成ISN │ │ └─> tcp_connect() │ │ │ │ ─── [SYN, seq=x] ──────────> ② 客户端发送SYN │ │ tcp_v4_rcv() │ │ └─> tcp_rcv_state_process() │ │ ├─> tcp_v4_conn_request() │ │ ├─> tcp_conn_request() │ │ │ ├─> 创建request_sock │ │ │ ├─> 加入半连接队列 │ │ │ └─> tcp_v4_send_synack() │ │ │ │ <──── [SYN-ACK, seq=y, ack=x+1] ──── ③ 服务端收SYN发SYN-ACK │ │ │ tcp_v4_rcv() │ └─> tcp_rcv_state_process() │ ├─> tcp_rcv_synsent_state_process() │ ├─> tcp_finish_connect() │ │ └─> 状态: ESTABLISHED │ └─> tcp_send_ack() │ │ ─── [ACK, ack=y+1] ──────────────> ④ 客户端收SYN-ACK发ACK │ tcp_v4_rcv() │ └─> tcp_check_req() │ ├─> tcp_v4_syn_recv_sock() │ │ └─> 创建完整sock │ ├─> 加入accept队列 ── ⑤ 服务端收ACK │ │ └─> 状态: ESTABLISHED │ └─> sk->sk_data_ready() │ │ 连接建立完成，双方状态: ESTABLISHED 步骤 方向 详细分析（点击跳转） ① Connect 入口 — 一、Connect 入口 ② 客户端发送 SYN Client → Server 三、客户端发送 SYN（tcp_v4_connect → tcp_connect） ③ 服务端收 SYN 发 SYN-ACK Server → Client 四、服务端收 SYN 发 SYN-ACK（tcp_conn_request → tcp_v4_send_synack） ④ 客户端收 SYN-ACK 发 ACK Client → Server 五、客户端收 SYN-ACK 发 ACK（tcp_rcv_synsent_state_process） ⑤ 服务端收 ACK 完成握手 Server 5.3 服务端收最终 ACK（tcp_check_req） 安全机制 — 八、安全机制（SYN Cookie / ISN 防预测） 选项协商 — 七、TCP 选项协商（MSS / WScale / SACK / Timestamps） "><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#三次握手时序图点击跳转>三次握手时序图（点击跳转）</a></li><li><a href=#一connect-入口>一、Connect 入口</a><ol><li><a href=#11-调用链>1.1 调用链</a></li><li><a href=#12-__sys_connect>1.2 <code>__sys_connect()</code></a></li><li><a href=#13-connect-的前置条件阻塞-socket-状态机与路由绑定>1.3 Connect 的前置条件：阻塞 socket 状态机与路由绑定</a><ol><li><a href=#阻塞-socket-能否同时-connect-两个地址>阻塞 socket 能否同时 connect 两个地址？</a></li><li><a href=#bind-不绑定路由>bind 不绑定路由</a></li><li><a href=#路由绑定的时机>路由绑定的时机</a></li></ol></li></ol></li><li><a href=#二三次握手报文格式>二、三次握手报文格式</a></li><li><a href=#三第一步客户端发送-syn>三、第一步：客户端发送 SYN</a><ol><li><a href=#31-调用链>3.1 调用链</a></li><li><a href=#32-tcp_v4_connect>3.2 <code>tcp_v4_connect()</code></a></li><li><a href=#33-tcp_connect>3.3 <code>tcp_connect()</code></a></li></ol></li><li><a href=#四第二步服务端接收-syn-并发送-syn-ack>四、第二步：服务端接收 SYN 并发送 SYN-ACK</a><ol><li><a href=#41-调用链>4.1 调用链</a></li><li><a href=#42-tcp_v4_conn_request>4.2 <code>tcp_v4_conn_request()</code></a></li><li><a href=#43-tcp_conn_request>4.3 <code>tcp_conn_request()</code></a></li><li><a href=#44-tcp_v4_send_synack>4.4 <code>tcp_v4_send_synack()</code></a></li></ol></li><li><a href=#五第三步客户端接收-syn-ack-并发送-ack>五、第三步：客户端接收 SYN-ACK 并发送 ACK</a><ol><li><a href=#51-调用链>5.1 调用链</a></li><li><a href=#52-tcp_rcv_synsent_state_process>5.2 <code>tcp_rcv_synsent_state_process()</code></a></li><li><a href=#53-服务端接收最终-ack--tcp_check_req>5.3 服务端接收最终 ACK — <code>tcp_check_req()</code></a></li></ol></li><li><a href=#六tcp-选项协商>六、TCP 选项协商</a><ol><li><a href=#61-mss-maximum-segment-size>6.1 MSS (Maximum Segment Size)</a></li><li><a href=#62-window-scale>6.2 Window Scale</a></li><li><a href=#63-sack-selective-acknowledgment>6.3 SACK (Selective Acknowledgment)</a></li><li><a href=#64-timestamps>6.4 Timestamps</a></li></ol></li><li><a href=#七安全机制>七、安全机制</a><ol><li><a href=#71-syn-cookie>7.1 SYN Cookie</a></li><li><a href=#72-半连接队列与全连接队列>7.2 半连接队列与全连接队列</a></li><li><a href=#73-isn-防预测>7.3 ISN 防预测</a></li></ol></li><li><a href=#八tcp-fast-open>八、TCP Fast Open</a></li><li><a href=#九错误处理>九、错误处理</a><ol><li><a href=#91-syn-超时重传>9.1 SYN 超时重传</a></li><li><a href=#92-连接拒绝rst>9.2 连接拒绝（RST）</a></li><li><a href=#93-网络不可达>9.3 网络不可达</a></li></ol></li><li><a href=#十相关系统参数>十、相关系统参数</a></li><li><a href=#十一调试工具>十一、调试工具</a></li><li><a href=#十二状态转换总结>十二、状态转换总结</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-%E4%B8%89%E6%AC%A1%E6%8F%A1%E6%89%8B%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/>TCP 三次握手源码分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 16, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>17 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp-三次握手源码分析>TCP 三次握手源码分析</h1><blockquote><p>基于 Linux 5.15.78，专注分析 <code>connect()</code> 触发的 TCP 三次握手全过程。
+Socket 创建参见 <a class=link href=socket%e5%88%9b%e5%bb%ba%e4%b8%8efd%e5%88%86%e9%85%8d.md>socket创建与fd分配</a>，Bind 参见 <a class=link href=TCP-bind%e6%93%8d%e4%bd%9c.md>TCP-bind操作</a>，Listen 参见 <a class=link href=TCP-listen%e6%93%8d%e4%bd%9c.md>TCP-listen操作</a>。
+半连接/全连接队列、SYN Cookie、溢出排查详见 <a class=link href=TCP-listen%e6%93%8d%e4%bd%9c.md>TCP-listen操作</a> 五~七节。</p></blockquote><hr><h2 id=三次握手时序图点击跳转>三次握手时序图（点击跳转）</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时间   客户端                                   服务器
+</span></span><span class=line><span class=cl> │
+</span></span><span class=line><span class=cl> │     connect()
+</span></span><span class=line><span class=cl> │     ├─&gt; __sys_connect() ─────────── ① Connect入口
+</span></span><span class=line><span class=cl> │     ├─&gt; tcp_v4_connect()
+</span></span><span class=line><span class=cl> │     │   ├─&gt; 路由查找/选端口/生成ISN
+</span></span><span class=line><span class=cl> │     │   └─&gt; tcp_connect()
+</span></span><span class=line><span class=cl> │     │
+</span></span><span class=line><span class=cl> │     │   ─── [SYN, seq=x] ──────────&gt; ② 客户端发送SYN
+</span></span><span class=line><span class=cl> │     │                                     tcp_v4_rcv()
+</span></span><span class=line><span class=cl> │     │                                     └─&gt; tcp_rcv_state_process()
+</span></span><span class=line><span class=cl> │     │                                         ├─&gt; tcp_v4_conn_request()
+</span></span><span class=line><span class=cl> │     │                                         ├─&gt; tcp_conn_request()
+</span></span><span class=line><span class=cl> │     │                                         │   ├─&gt; 创建request_sock
+</span></span><span class=line><span class=cl> │     │                                         │   ├─&gt; 加入半连接队列
+</span></span><span class=line><span class=cl> │     │                                         │   └─&gt; tcp_v4_send_synack()
+</span></span><span class=line><span class=cl> │     │
+</span></span><span class=line><span class=cl> │     │   &lt;──── [SYN-ACK, seq=y, ack=x+1] ──── ③ 服务端收SYN发SYN-ACK
+</span></span><span class=line><span class=cl> │     │
+</span></span><span class=line><span class=cl> │     tcp_v4_rcv()
+</span></span><span class=line><span class=cl> │     └─&gt; tcp_rcv_state_process()
+</span></span><span class=line><span class=cl> │         ├─&gt; tcp_rcv_synsent_state_process()
+</span></span><span class=line><span class=cl> │         ├─&gt; tcp_finish_connect()
+</span></span><span class=line><span class=cl> │         │   └─&gt; 状态: ESTABLISHED
+</span></span><span class=line><span class=cl> │         └─&gt; tcp_send_ack()
+</span></span><span class=line><span class=cl> │
+</span></span><span class=line><span class=cl> │         ─── [ACK, ack=y+1] ──────────────&gt; ④ 客户端收SYN-ACK发ACK
+</span></span><span class=line><span class=cl> │                                             tcp_v4_rcv()
+</span></span><span class=line><span class=cl> │                                             └─&gt; tcp_check_req()
+</span></span><span class=line><span class=cl> │                                                 ├─&gt; tcp_v4_syn_recv_sock()
+</span></span><span class=line><span class=cl> │                                                 │   └─&gt; 创建完整sock
+</span></span><span class=line><span class=cl> │                                                 ├─&gt; 加入accept队列  ── ⑤ 服务端收ACK
+</span></span><span class=line><span class=cl> │                                                 │   └─&gt; 状态: ESTABLISHED
+</span></span><span class=line><span class=cl> │                                                 └─&gt; sk-&gt;sk_data_ready()
+</span></span><span class=line><span class=cl> │
+</span></span><span class=line><span class=cl> │     连接建立完成，双方状态: ESTABLISHED
+</span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>步骤</th><th>方向</th><th>详细分析（点击跳转）</th></tr></thead><tbody><tr><td>① Connect 入口</td><td>—</td><td><a class=link href=#sec-connect>一、Connect 入口</a></td></tr><tr><td>② 客户端发送 SYN</td><td>Client → Server</td><td><a class=link href=#sec-syn>三、客户端发送 SYN</a>（<a class=link href=#sec-tcp_v4_connect><code>tcp_v4_connect</code></a> → <a class=link href=#sec-tcp_connect><code>tcp_connect</code></a>）</td></tr><tr><td>③ 服务端收 SYN 发 SYN-ACK</td><td>Server → Client</td><td><a class=link href=#sec-synack>四、服务端收 SYN 发 SYN-ACK</a>（<a class=link href=#sec-tcp_conn_request><code>tcp_conn_request</code></a> → <a class=link href=#sec-tcp_v4_send_synack><code>tcp_v4_send_synack</code></a>）</td></tr><tr><td>④ 客户端收 SYN-ACK 发 ACK</td><td>Client → Server</td><td><a class=link href=#sec-ack>五、客户端收 SYN-ACK 发 ACK</a>（<a class=link href=#sec-tcp_rcv_synsent><code>tcp_rcv_synsent_state_process</code></a>）</td></tr><tr><td>⑤ 服务端收 ACK 完成握手</td><td>Server</td><td><a class=link href=#sec-tcp_check_req>5.3 服务端收最终 ACK</a>（<a class=link href=#sec-tcp_check_req><code>tcp_check_req</code></a>）</td></tr><tr><td>安全机制</td><td>—</td><td><a class=link href=#sec-security>八、安全机制</a>（SYN Cookie / ISN 防预测）</td></tr><tr><td>选项协商</td><td>—</td><td><a class=link href=#sec-options>七、TCP 选项协商</a>（MSS / WScale / SACK / Timestamps）</td></tr></tbody></table></div><hr><p><a id=sec-connect></a></p><h2 id=一connect-入口>一、Connect 入口</h2><h3 id=11-调用链>1.1 调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户态: connect(sockfd, addr, addrlen)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>SYSCALL_DEFINE3(connect)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>__sys_connect()                        [net/socket.c:2034]
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>__sys_connect_file()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock-&gt;ops-&gt;connect()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>inet_stream_connect()                  [net/ipv4/af_inet.c]
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_v4_connect()                       [net/ipv4/tcp_ipv4.c:402]
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_connect()                          [net/ipv4/tcp_output.c:4895]  → 发送 SYN
+</span></span></code></pre></td></tr></table></div></div><h3 id=12-__sys_connect>1.2 <code>__sys_connect()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/socket.c:2034
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>__sys_connect</span><span class=p>(</span><span class=kt>int</span> <span class=n>fd</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sockaddr</span> <span class=n>__user</span> <span class=o>*</span><span class=n>uservaddr</span><span class=p>,</span> <span class=kt>int</span> <span class=n>addrlen</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>ret</span> <span class=o>=</span> <span class=o>-</span><span class=n>EBADF</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fd</span> <span class=n>f</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 通过fd获取file结构（同时增加引用计数） */</span>
+</span></span><span class=line><span class=cl>    <span class=n>f</span> <span class=o>=</span> <span class=nf>fdget</span><span class=p>(</span><span class=n>fd</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>f</span><span class=p>.</span><span class=n>file</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>struct</span> <span class=n>sockaddr_storage</span> <span class=n>address</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 将用户空间地址复制到内核空间（防止用户态竞态修改） */</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=nf>move_addr_to_kernel</span><span class=p>(</span><span class=n>uservaddr</span><span class=p>,</span> <span class=n>addrlen</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>address</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>ret</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=cm>/* 最终调用 sock-&gt;ops-&gt;connect()，TCP对应inet_stream_connect()
+</span></span></span><span class=line><span class=cl><span class=cm>             * → tcp_v4_connect() */</span>
+</span></span><span class=line><span class=cl>            <span class=n>ret</span> <span class=o>=</span> <span class=nf>__sys_connect_file</span><span class=p>(</span><span class=n>f</span><span class=p>.</span><span class=n>file</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>address</span><span class=p>,</span> <span class=n>addrlen</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>fdput</span><span class=p>(</span><span class=n>f</span><span class=p>);</span>  <span class=cm>/* 释放file引用 */</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=13-connect-的前置条件阻塞-socket-状态机与路由绑定>1.3 Connect 的前置条件：阻塞 socket 状态机与路由绑定</h3><h4 id=阻塞-socket-能否同时-connect-两个地址>阻塞 socket 能否同时 connect 两个地址？</h4><p><code>__inet_stream_connect()</code> (<code>net/ipv4/af_inet.c:698</code>) 通过 <code>sock->state</code> 状态机控制：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/af_inet.c:720
+</span></span></span><span class=line><span class=cl><span class=k>switch</span> <span class=p>(</span><span class=n>sock</span><span class=o>-&gt;</span><span class=n>state</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl><span class=k>case</span> <span class=nl>SS_CONNECTED</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>EISCONN</span><span class=p>;</span>        <span class=c1>// 已建立连接，拒绝重复 connect
+</span></span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=k>case</span> <span class=nl>SS_CONNECTING</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>EALREADY</span><span class=p>;</span>       <span class=c1>// 正在连接中（阻塞等待 SYN-ACK）
+</span></span></span><span class=line><span class=cl>    <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=k>case</span> <span class=nl>SS_UNCONNECTED</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 唯一允许发起 connect 的状态
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_CLOSE</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>          <span class=c1>// 内核状态非 CLOSE，拒绝
+</span></span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>connect</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>uaddr</span><span class=p>,</span> <span class=n>addr_len</span><span class=p>);</span>  <span class=c1>// → tcp_v4_connect()
+</span></span></span><span class=line><span class=cl>    <span class=n>sock</span><span class=o>-&gt;</span><span class=n>state</span> <span class=o>=</span> <span class=n>SS_CONNECTING</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=c1>// 阻塞等待
+</span></span></span><span class=line><span class=cl><span class=n>timeo</span> <span class=o>=</span> <span class=nf>sock_sndtimeo</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>flags</span> <span class=o>&amp;</span> <span class=n>O_NONBLOCK</span><span class=p>);</span>  <span class=c1>// 阻塞socket: timeo &gt; 0
+</span></span></span><span class=line><span class=cl><span class=nf>inet_wait_for_connect</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>timeo</span><span class=p>,</span> <span class=n>writebias</span><span class=p>);</span>     <span class=c1>// 睡眠直到 SYN-ACK 或超时
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>执行序列</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>第一次 connect(addr1):
+</span></span><span class=line><span class=cl>  SS_UNCONNECTED → tcp_v4_connect() → 发 SYN → SYN_SENT
+</span></span><span class=line><span class=cl>  → sock-&gt;state = SS_CONNECTING → inet_wait_for_connect() 阻塞
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>第二次 connect(addr2):  // 第一次仍在阻塞
+</span></span><span class=line><span class=cl>  sock-&gt;state == SS_CONNECTING → 直接返回 -EALREADY
+</span></span></code></pre></td></tr></table></div></div><p><strong>结论</strong>：阻塞 socket 不可能同时向两个地址发起连接。第二次 <code>connect()</code> 在状态检查阶段就被拒绝（<code>-EALREADY</code>）。多地址并行连接必须用非阻塞 socket + epoll/select。</p><h4 id=bind-不绑定路由>bind 不绑定路由</h4><p><code>__inet_bind()</code> (<code>net/ipv4/af_inet.c:530</code>) 只做四件事，<strong>不涉及任何路由函数</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/af_inet.c:530-599
+</span></span></span><span class=line><span class=cl><span class=mf>1.</span> <span class=nf>inet_addr_type_table</span><span class=p>()</span>          <span class=c1>// 验证地址类型（必须本机地址，除非 IP_FREEBIND）
+</span></span></span><span class=line><span class=cl><span class=mf>2.</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span> <span class=o>=</span> <span class=n>addr</span>         <span class=c1>// 设置源地址（发送用）
+</span></span></span><span class=line><span class=cl><span class=mf>3.</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_rcv_saddr</span> <span class=o>=</span> <span class=n>addr</span>     <span class=c1>// 设置收包匹配地址
+</span></span></span><span class=line><span class=cl><span class=mf>4.</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>get_port</span><span class=p>()</span>         <span class=c1>// 绑定端口，加入 bhash
+</span></span></span></code></pre></td></tr></table></div></div><p>没有调用 <code>ip_route_*</code> 系列函数。bind 只设置本地地址和端口，不查路由、不选出口设备。这也是为什么 <code>bind("0.0.0.0")</code> 能正常工作 — 源地址和路由都推迟到 connect 时确定。</p><h4 id=路由绑定的时机>路由绑定的时机</h4><div class=table-wrapper><table><thead><tr><th>时机</th><th>调用路径</th><th>说明</th></tr></thead><tbody><tr><td><strong>connect()</strong></td><td><code>tcp_v4_connect()</code> → <code>ip_route_connect()</code> → <code>ip_route_newports()</code> → <code>sk_setup_caps()</code></td><td>主动连接时确定并缓存路由（最常见）</td></tr><tr><td><strong>发送前检查</strong></td><td><code>tcp_transmit_skb()</code> → <code>sk_dst_check()</code></td><td>每次发送验证路由缓存有效性</td></tr><tr><td><strong>PMTU 变化</strong></td><td><code>tcp_v4_mtu_reduced()</code> → <code>sk_dst_reset()</code></td><td>MTU 减小时缓存失效，下次发送重新查找</td></tr><tr><td><strong>服务端收 SYN</strong></td><td><code>tcp_conn_request()</code> → <code>af_ops->route_req()</code></td><td>为 SYN-ACK 查找回客户端的路由（临时）</td></tr><tr><td><strong>服务端 accept</strong></td><td><code>tcp_v4_syn_recv_sock()</code> → <code>inet_csk_route_child_sock()</code></td><td>为子 socket 绑定持久路由</td></tr></tbody></table></div><p>路由是 <strong>connect 时绑定、send 时验证</strong> 的懒缓存模型。<code>tcp_v4_connect()</code> 中的关键代码：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:204
+</span></span></span><span class=line><span class=cl><span class=n>rt</span> <span class=o>=</span> <span class=nf>ip_route_connect</span><span class=p>(</span><span class=n>fl4</span><span class=p>,</span> <span class=n>nexthop</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                      <span class=nf>RT_CONN_FLAGS</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                      <span class=n>IPPROTO_TCP</span><span class=p>,</span> <span class=n>orig_sport</span><span class=p>,</span> <span class=n>orig_dport</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=c1>// 端口确定后重新验证路由（某些路由策略基于端口号）
+</span></span></span><span class=line><span class=cl><span class=n>rt</span> <span class=o>=</span> <span class=nf>ip_route_newports</span><span class=p>(</span><span class=n>fl4</span><span class=p>,</span> <span class=n>rt</span><span class=p>,</span> <span class=n>orig_sport</span><span class=p>,</span> <span class=n>orig_dport</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                       <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_sport</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_dport</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=c1>// 缓存到 socket
+</span></span></span><span class=line><span class=cl><span class=nf>sk_setup_caps</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rt</span><span class=o>-&gt;</span><span class=n>dst</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=二三次握手报文格式>二、三次握手报文格式</h2><div class=table-wrapper><table><thead><tr><th></th><th>第一个包 (SYN)</th><th>第二个包 (SYN-ACK)</th><th>第三个包 (ACK)</th></tr></thead><tbody><tr><td>方向</td><td>Client → Server</td><td>Server → Client</td><td>Client → Server</td></tr><tr><td>SYN</td><td>1</td><td>1</td><td>0</td></tr><tr><td>ACK</td><td>0</td><td>1</td><td>1</td></tr><tr><td>seq</td><td>ISN_client</td><td>ISN_server</td><td>ISN_client+1</td></tr><tr><td>ack</td><td>0</td><td>ISN_client+1</td><td>ISN_server+1</td></tr><tr><td>选项</td><td>MSS, WScale, SACK, TS</td><td>MSS, WScale, SACK, TS</td><td>Timestamps</td></tr></tbody></table></div><hr><p><a id=sec-syn></a></p><h2 id=三第一步客户端发送-syn>三、第一步：客户端发送 SYN</h2><h3 id=31-调用链>3.1 调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间: connect(sockfd, addr, addrlen)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>__sys_connect()                                [net/socket.c:2034]
+</span></span><span class=line><span class=cl>    ├── sockfd_lookup_light()   // fd → struct socket
+</span></span><span class=line><span class=cl>    ├── move_addr_to_kernel()   // 用户地址拷贝到内核
+</span></span><span class=line><span class=cl>    └── sock-&gt;ops-&gt;connect()    // TCP 对应 inet_stream_connect()
+</span></span><span class=line><span class=cl>        ↓
+</span></span><span class=line><span class=cl>inet_stream_connect()                            [net/ipv4/af_inet.c]
+</span></span><span class=line><span class=cl>    └── __inet_stream_connect()
+</span></span><span class=line><span class=cl>        └── tcp_v4_connect()                     [net/ipv4/tcp_ipv4.c:402]
+</span></span><span class=line><span class=cl>            ├── ip_route_connect()   // 路由查找 + 选源 IP
+</span></span><span class=line><span class=cl>            ├── inet_hash_connect() // 选临时端口 + 加入 ehash
+</span></span><span class=line><span class=cl>            ├── secure_tcp_seq()    // 生成不可预测 ISN (RFC6528)
+</span></span><span class=line><span class=cl>            └── tcp_connect()                    [net/ipv4/tcp_output.c:4895]
+</span></span><span class=line><span class=cl>                ├── tcp_connect_init()         // 设置 MSS/窗口/RTO
+</span></span><span class=line><span class=cl>                ├── tcp_init_nondata_skb()     // SYN 占 1 个 seq
+</span></span><span class=line><span class=cl>                ├── tcp_transmit_skb()         // 发送 SYN 包
+</span></span><span class=line><span class=cl>                └── inet_csk_reset_xmit_timer()// 启动 SYN 重传定时器
+</span></span></code></pre></td></tr></table></div></div><p><a id=sec-tcp_v4_connect></a></p><h3 id=32-tcp_v4_connect>3.2 <code>tcp_v4_connect()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>  1
+</span><span class=lnt>  2
+</span><span class=lnt>  3
+</span><span class=lnt>  4
+</span><span class=lnt>  5
+</span><span class=lnt>  6
+</span><span class=lnt>  7
+</span><span class=lnt>  8
+</span><span class=lnt>  9
+</span><span class=lnt> 10
+</span><span class=lnt> 11
+</span><span class=lnt> 12
+</span><span class=lnt> 13
+</span><span class=lnt> 14
+</span><span class=lnt> 15
+</span><span class=lnt> 16
+</span><span class=lnt> 17
+</span><span class=lnt> 18
+</span><span class=lnt> 19
+</span><span class=lnt> 20
+</span><span class=lnt> 21
+</span><span class=lnt> 22
+</span><span class=lnt> 23
+</span><span class=lnt> 24
+</span><span class=lnt> 25
+</span><span class=lnt> 26
+</span><span class=lnt> 27
+</span><span class=lnt> 28
+</span><span class=lnt> 29
+</span><span class=lnt> 30
+</span><span class=lnt> 31
+</span><span class=lnt> 32
+</span><span class=lnt> 33
+</span><span class=lnt> 34
+</span><span class=lnt> 35
+</span><span class=lnt> 36
+</span><span class=lnt> 37
+</span><span class=lnt> 38
+</span><span class=lnt> 39
+</span><span class=lnt> 40
+</span><span class=lnt> 41
+</span><span class=lnt> 42
+</span><span class=lnt> 43
+</span><span class=lnt> 44
+</span><span class=lnt> 45
+</span><span class=lnt> 46
+</span><span class=lnt> 47
+</span><span class=lnt> 48
+</span><span class=lnt> 49
+</span><span class=lnt> 50
+</span><span class=lnt> 51
+</span><span class=lnt> 52
+</span><span class=lnt> 53
+</span><span class=lnt> 54
+</span><span class=lnt> 55
+</span><span class=lnt> 56
+</span><span class=lnt> 57
+</span><span class=lnt> 58
+</span><span class=lnt> 59
+</span><span class=lnt> 60
+</span><span class=lnt> 61
+</span><span class=lnt> 62
+</span><span class=lnt> 63
+</span><span class=lnt> 64
+</span><span class=lnt> 65
+</span><span class=lnt> 66
+</span><span class=lnt> 67
+</span><span class=lnt> 68
+</span><span class=lnt> 69
+</span><span class=lnt> 70
+</span><span class=lnt> 71
+</span><span class=lnt> 72
+</span><span class=lnt> 73
+</span><span class=lnt> 74
+</span><span class=lnt> 75
+</span><span class=lnt> 76
+</span><span class=lnt> 77
+</span><span class=lnt> 78
+</span><span class=lnt> 79
+</span><span class=lnt> 80
+</span><span class=lnt> 81
+</span><span class=lnt> 82
+</span><span class=lnt> 83
+</span><span class=lnt> 84
+</span><span class=lnt> 85
+</span><span class=lnt> 86
+</span><span class=lnt> 87
+</span><span class=lnt> 88
+</span><span class=lnt> 89
+</span><span class=lnt> 90
+</span><span class=lnt> 91
+</span><span class=lnt> 92
+</span><span class=lnt> 93
+</span><span class=lnt> 94
+</span><span class=lnt> 95
+</span><span class=lnt> 96
+</span><span class=lnt> 97
+</span><span class=lnt> 98
+</span><span class=lnt> 99
+</span><span class=lnt>100
+</span><span class=lnt>101
+</span><span class=lnt>102
+</span><span class=lnt>103
+</span><span class=lnt>104
+</span><span class=lnt>105
+</span><span class=lnt>106
+</span><span class=lnt>107
+</span><span class=lnt>108
+</span><span class=lnt>109
+</span><span class=lnt>110
+</span><span class=lnt>111
+</span><span class=lnt>112
+</span><span class=lnt>113
+</span><span class=lnt>114
+</span><span class=lnt>115
+</span><span class=lnt>116
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:402
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>tcp_v4_connect</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sockaddr</span> <span class=o>*</span><span class=n>uaddr</span><span class=p>,</span> <span class=kt>int</span> <span class=n>addr_len</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sockaddr_in</span> <span class=o>*</span><span class=n>usin</span> <span class=o>=</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr_in</span> <span class=o>*</span><span class=p>)</span><span class=n>uaddr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_sock</span> <span class=o>*</span><span class=n>inet</span> <span class=o>=</span> <span class=nf>inet_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>__be16</span> <span class=n>orig_sport</span><span class=p>,</span> <span class=n>orig_dport</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>__be32</span> <span class=n>daddr</span><span class=p>,</span> <span class=n>nexthop</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>flowi4</span> <span class=o>*</span><span class=n>fl4</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rtable</span> <span class=o>*</span><span class=n>rt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>ip_options_rcu</span> <span class=o>*</span><span class=n>inet_opt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_timewait_death_row</span> <span class=o>*</span><span class=n>tcp_death_row</span> <span class=o>=</span> <span class=o>&amp;</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>tcp_death_row</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 验证地址长度和地址族 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>addr_len</span> <span class=o>&lt;</span> <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>sockaddr_in</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>EINVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>usin</span><span class=o>-&gt;</span><span class=n>sin_family</span> <span class=o>!=</span> <span class=n>AF_INET</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>EAFNOSUPPORT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>nexthop</span> <span class=o>=</span> <span class=n>daddr</span> <span class=o>=</span> <span class=n>usin</span><span class=o>-&gt;</span><span class=n>sin_addr</span><span class=p>.</span><span class=n>s_addr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>inet_opt</span> <span class=o>=</span> <span class=nf>rcu_dereference_protected</span><span class=p>(</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_opt</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                         <span class=nf>lockdep_sock_is_held</span><span class=p>(</span><span class=n>sk</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 处理源路由选项：如果设置了Loose/Strict Source Route，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 第一跳是opt.faddr而非最终目的地 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>inet_opt</span> <span class=o>&amp;&amp;</span> <span class=n>inet_opt</span><span class=o>-&gt;</span><span class=n>opt</span><span class=p>.</span><span class=n>srr</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>daddr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span> <span class=o>-</span><span class=n>EINVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>nexthop</span> <span class=o>=</span> <span class=n>inet_opt</span><span class=o>-&gt;</span><span class=n>opt</span><span class=p>.</span><span class=n>faddr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>orig_sport</span> <span class=o>=</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_sport</span><span class=p>;</span>   <span class=cm>/* 可能为0（未bind） */</span>
+</span></span><span class=line><span class=cl>    <span class=n>orig_dport</span> <span class=o>=</span> <span class=n>usin</span><span class=o>-&gt;</span><span class=n>sin_port</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>fl4</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>cork</span><span class=p>.</span><span class=n>fl</span><span class=p>.</span><span class=n>u</span><span class=p>.</span><span class=n>ip4</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 查找路由：确定出口设备和源IP地址 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>rt</span> <span class=o>=</span> <span class=nf>ip_route_connect</span><span class=p>(</span><span class=n>fl4</span><span class=p>,</span> <span class=n>nexthop</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                          <span class=nf>RT_CONN_FLAGS</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                          <span class=n>IPPROTO_TCP</span><span class=p>,</span> <span class=n>orig_sport</span><span class=p>,</span> <span class=n>orig_dport</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>IS_ERR</span><span class=p>(</span><span class=n>rt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>err</span> <span class=o>=</span> <span class=nf>PTR_ERR</span><span class=p>(</span><span class=n>rt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>err</span> <span class=o>==</span> <span class=o>-</span><span class=n>ENETUNREACH</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=nf>IP_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>IPSTATS_MIB_OUTNOROUTES</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* TCP是点对点协议，不能连接到多播或广播地址 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>rt</span><span class=o>-&gt;</span><span class=n>rt_flags</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>RTCF_MULTICAST</span> <span class=o>|</span> <span class=n>RTCF_BROADCAST</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>ip_rt_put</span><span class=p>(</span><span class=n>rt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>ENETUNREACH</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>inet_opt</span> <span class=o>||</span> <span class=o>!</span><span class=n>inet_opt</span><span class=o>-&gt;</span><span class=n>opt</span><span class=p>.</span><span class=n>srr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>daddr</span> <span class=o>=</span> <span class=n>fl4</span><span class=o>-&gt;</span><span class=n>daddr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 设置本地地址（如果还未bind，使用路由选择的源IP） */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span> <span class=o>=</span> <span class=n>fl4</span><span class=o>-&gt;</span><span class=n>saddr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sk_rcv_saddr_set</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 目标地址改变时，重置时间戳状态（socket复用场景） */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>ts_recent_stamp</span> <span class=o>&amp;&amp;</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_daddr</span> <span class=o>!=</span> <span class=n>daddr</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>ts_recent</span>       <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>ts_recent_stamp</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>likely</span><span class=p>(</span><span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>repair</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_dport</span> <span class=o>=</span> <span class=n>usin</span><span class=o>-&gt;</span><span class=n>sin_port</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sk_daddr_set</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>daddr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ext_hdr_len</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>inet_opt</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ext_hdr_len</span> <span class=o>=</span> <span class=n>inet_opt</span><span class=o>-&gt;</span><span class=n>opt</span><span class=p>.</span><span class=n>optlen</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* MSS上限默认536，后续SYN-ACK协商可能调大 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>mss_clamp</span> <span class=o>=</span> <span class=n>TCP_MSS_DEFAULT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 核心状态转换：CLOSE → SYN_SENT */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_set_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_SYN_SENT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 选择本地端口并加入ehash（用于收包时查找socket）
+</span></span></span><span class=line><span class=cl><span class=cm>     * 如果inet_sport为0，从临时端口范围自动选择，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 同时检查端口冲突（考虑TIME_WAIT重用） */</span>
+</span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=nf>inet_hash_connect</span><span class=p>(</span><span class=n>tcp_death_row</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>err</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>failure</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>sk_set_txhash</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 端口确定后重新验证路由（某些路由策略基于端口号） */</span>
+</span></span><span class=line><span class=cl>    <span class=n>rt</span> <span class=o>=</span> <span class=nf>ip_route_newports</span><span class=p>(</span><span class=n>fl4</span><span class=p>,</span> <span class=n>rt</span><span class=p>,</span> <span class=n>orig_sport</span><span class=p>,</span> <span class=n>orig_dport</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                           <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_sport</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_dport</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>IS_ERR</span><span class=p>(</span><span class=n>rt</span><span class=p>))</span> <span class=p>{</span> <span class=p>...</span> <span class=k>goto</span> <span class=n>failure</span><span class=p>;</span> <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_gso_type</span> <span class=o>=</span> <span class=n>SKB_GSO_TCPV4</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sk_setup_caps</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rt</span><span class=o>-&gt;</span><span class=n>dst</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 生成初始序列号（ISN）:
+</span></span></span><span class=line><span class=cl><span class=cm>     * secure_tcp_seq()基于SipHash(saddr, daddr, sport, dport, secret)，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 不可预测，防止TCP劫持（RFC6528）
+</span></span></span><span class=line><span class=cl><span class=cm>     * 同时生成时间戳偏移，防止通过时间戳推断系统启动时间 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>likely</span><span class=p>(</span><span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>repair</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                   <span class=nf>secure_tcp_seq</span><span class=p>(</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_daddr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                  <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_sport</span><span class=p>,</span> <span class=n>usin</span><span class=o>-&gt;</span><span class=n>sin_port</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>tsoffset</span> <span class=o>=</span> <span class=nf>secure_tcp_ts_off</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>                                         <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_daddr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_id</span> <span class=o>=</span> <span class=nf>get_random_u16</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 构建并发送SYN包 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=nf>tcp_connect</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><a id=sec-tcp_connect></a></p><h3 id=33-tcp_connect>3.3 <code>tcp_connect()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:4895
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>tcp_connect</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>buff</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* BPF钩子：通知eBPF程序有新连接（可修改拥塞算法、设置选项等） */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_call_bpf</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>BPF_SOCK_OPS_TCP_CONNECT_CB</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 验证路由缓存是否仍然有效，失效则重新查找 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_af_ops</span><span class=o>-&gt;</span><span class=nf>rebuild_header</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>EHOSTUNREACH</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 初始化TCP连接参数：头部长度/MSS/窗口/序列号/RTO */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_connect_init</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* repair模式(CRIU容器迁移)：TCP状态已由用户空间设置，跳过SYN发送 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>repair</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_finish_connect</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 分配SYN包：size=0(无载荷)，force_schedule=true(SYN必须发送) */</span>
+</span></span><span class=line><span class=cl>    <span class=n>buff</span> <span class=o>=</span> <span class=nf>sk_stream_alloc_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_allocation</span><span class=p>,</span> <span class=nb>true</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=o>!</span><span class=n>buff</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>ENOBUFS</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 设置SYN标志和序列号。write_seq++：SYN占用1个序列号空间
+</span></span></span><span class=line><span class=cl><span class=cm>     * （TCP协议规定SYN和FIN各占1个序列号） */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_init_nondata_skb</span><span class=p>(</span><span class=n>buff</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=o>++</span><span class=p>,</span> <span class=n>TCPHDR_SYN</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_mstamp_refresh</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* retrans_stamp：记录SYN首次发送时间，用于RTT计算和超时判断 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>retrans_stamp</span> <span class=o>=</span> <span class=nf>tcp_time_stamp</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 加入发送队列：更新内存计费和packets_out */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_connect_queue_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>buff</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ECN协商：如果sysctl_tcp_ecn开启，在SYN中设置ECE+CWR标志 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_ecn_send_syn</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>buff</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 加入重传红黑树(tcp_rtx_queue)，超时后从树中取出重传 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_rbtree_insert</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>tcp_rtx_queue</span><span class=p>,</span> <span class=n>buff</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 发送SYN包：
+</span></span></span><span class=line><span class=cl><span class=cm>     * TFO路径：tcp_send_syn_data() — SYN携带数据+cookie，减少1个RTT
+</span></span></span><span class=line><span class=cl><span class=cm>     * 普通路径：tcp_transmit_skb() — 纯SYN包
+</span></span></span><span class=line><span class=cl><span class=cm>     * clone_it=1：克隆skb发送，原始保留在重传队列中 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>fastopen_req</span> <span class=o>?</span> <span class=nf>tcp_send_syn_data</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>buff</span><span class=p>)</span> <span class=o>:</span>
+</span></span><span class=line><span class=cl>          <span class=nf>tcp_transmit_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>buff</span><span class=p>,</span> <span class=mi>1</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_allocation</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>err</span> <span class=o>==</span> <span class=o>-</span><span class=n>ECONNREFUSED</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_nxt</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>pushed_seq</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 启动SYN重传定时器：初始超时icsk_rto（默认1秒），
+</span></span></span><span class=line><span class=cl><span class=cm>     * 指数退避重传，最多tcp_syn_retries次（默认6次，总约63秒） */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_send_head</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ICSK_TIME_RETRANS</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                              <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_rto</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>SYN 包格式</strong>:</p><ul><li><code>SYN=1, ACK=0</code></li><li><code>seq=ISN</code></li><li><code>options</code>: MSS, Window Scale, SACK Permitted, Timestamp</li></ul><hr><p><a id=sec-synack></a></p><h2 id=四第二步服务端接收-syn-并发送-syn-ack>四、第二步：服务端接收 SYN 并发送 SYN-ACK</h2><h3 id=41-调用链>4.1 调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>tcp_v4_rcv()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_v4_do_rcv()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_rcv_state_process()                // TCP_LISTEN 状态
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>icsk-&gt;icsk_af_ops-&gt;conn_request()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_v4_conn_request()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_conn_request()                     [net/ipv4/tcp_input.c:8296-8490]
+</span></span><span class=line><span class=cl>    1. 检查 SYN Cookie（防洪水攻击）
+</span></span><span class=line><span class=cl>    2. 创建 request_sock（半连接）
+</span></span><span class=line><span class=cl>    3. 生成服务器 ISN
+</span></span><span class=line><span class=cl>    4. 加入 SYN 队列
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_v4_send_synack()
+</span></span><span class=line><span class=cl>    5. 构建 SYN-ACK 包
+</span></span><span class=line><span class=cl>    6. 发送
+</span></span></code></pre></td></tr></table></div></div><h3 id=42-tcp_v4_conn_request>4.2 <code>tcp_v4_conn_request()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:1992
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>tcp_v4_conn_request</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* TCP是点对点协议，不响应发送到广播或多播地址的SYN
+</span></span></span><span class=line><span class=cl><span class=cm>     * （也是防止放大攻击的措施） */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>skb_rtable</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>rt_flags</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>RTCF_BROADCAST</span> <span class=o>|</span> <span class=n>RTCF_MULTICAST</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>drop</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 调用通用的TCP连接请求处理函数
+</span></span></span><span class=line><span class=cl><span class=cm>     * tcp_request_sock_ops: request_sock操作函数表
+</span></span></span><span class=line><span class=cl><span class=cm>     * tcp_request_sock_ipv4_ops: IPv4专用操作（路由、发送SYN-ACK等） */</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>tcp_conn_request</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tcp_request_sock_ops</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                            <span class=o>&amp;</span><span class=n>tcp_request_sock_ipv4_ops</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>drop</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_listendrop</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><a id=sec-tcp_conn_request></a></p><h3 id=43-tcp_conn_request>4.3 <code>tcp_conn_request()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span><span class=lnt>74
+</span><span class=lnt>75
+</span><span class=lnt>76
+</span><span class=lnt>77
+</span><span class=lnt>78
+</span><span class=lnt>79
+</span><span class=lnt>80
+</span><span class=lnt>81
+</span><span class=lnt>82
+</span><span class=lnt>83
+</span><span class=lnt>84
+</span><span class=lnt>85
+</span><span class=lnt>86
+</span><span class=lnt>87
+</span><span class=lnt>88
+</span><span class=lnt>89
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:8296
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>tcp_conn_request</span><span class=p>(</span><span class=k>struct</span> <span class=n>request_sock_ops</span> <span class=o>*</span><span class=n>rsk_ops</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                     <span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_request_sock_ops</span> <span class=o>*</span><span class=n>af_ops</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                     <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>__u32</span> <span class=n>isn</span> <span class=o>=</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>tcp_tw_isn</span><span class=p>;</span>  <span class=cm>/* TIME_WAIT复用场景的预设ISN */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_options_received</span> <span class=n>tmp_opt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>request_sock</span> <span class=o>*</span><span class=n>req</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>want_cookie</span> <span class=o>=</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>dst_entry</span> <span class=o>*</span><span class=n>dst</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 1. 半连接队列容量检查 =====
+</span></span></span><span class=line><span class=cl><span class=cm>     * 队列满 或 管理员强制Cookie(syncookies==2) 时启用SYN Cookie。
+</span></span></span><span class=line><span class=cl><span class=cm>     * isn!=0(TIME_WAIT复用)跳过检查——旧连接已验证过对端合法性 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>((</span><span class=n>syncookies</span> <span class=o>==</span> <span class=mi>2</span> <span class=o>||</span> <span class=nf>inet_csk_reqsk_queue_is_full</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>isn</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>want_cookie</span> <span class=o>=</span> <span class=nf>tcp_syn_flood_action</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>rsk_ops</span><span class=o>-&gt;</span><span class=n>slab_name</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>want_cookie</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>drop</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 2. 全连接队列(accept queue)满检查 =====
+</span></span></span><span class=line><span class=cl><span class=cm>     * 应用来不及accept()消费，丢弃SYN比完成握手后再丢弃更高效 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>sk_acceptq_is_full</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_LISTENOVERFLOWS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>drop</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 3. 创建request_sock(半连接socket) =====
+</span></span></span><span class=line><span class=cl><span class=cm>     * request_sock约256B，远小于完整sock(~2KB)，是抵御SYN洪水的关键设计。
+</span></span></span><span class=line><span class=cl><span class=cm>     * !want_cookie: 非Cookie模式才关联到监听socket(增加半连接计数)，
+</span></span></span><span class=line><span class=cl><span class=cm>     *   Cookie模式下req只是临时使用(构造SYN-ACK)，发送后立即释放 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>req</span> <span class=o>=</span> <span class=nf>inet_reqsk_alloc</span><span class=p>(</span><span class=n>rsk_ops</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=o>!</span><span class=n>want_cookie</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>req</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>drop</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 4. 解析SYN包中的TCP选项 =====
+</span></span></span><span class=line><span class=cl><span class=cm>     * Cookie模式不解析Fast Open cookie(传NULL)，因为无法在ACK到达时验证 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_clear_options</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tmp_opt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>tmp_opt</span><span class=p>.</span><span class=n>mss_clamp</span> <span class=o>=</span> <span class=n>af_ops</span><span class=o>-&gt;</span><span class=n>mss_clamp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tmp_opt</span><span class=p>.</span><span class=n>user_mss</span>  <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>user_mss</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_parse_options</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tmp_opt</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                      <span class=n>want_cookie</span> <span class=o>?</span> <span class=nb>NULL</span> <span class=o>:</span> <span class=o>&amp;</span><span class=n>foc</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* SYN Cookie + 无时间戳 = 丢失所有选项信息:
+</span></span></span><span class=line><span class=cl><span class=cm>     * Cookie通过时间戳的TSecr字段编码窗口缩放和SACK等信息，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 对端不支持时间戳则只能清除所有选项 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>want_cookie</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>tmp_opt</span><span class=p>.</span><span class=n>saw_tstamp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_clear_options</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tmp_opt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_openreq_init</span><span class=p>(</span><span class=n>req</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tmp_opt</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 5. 查找SYN-ACK的发送路由 ===== */</span>
+</span></span><span class=line><span class=cl>    <span class=n>dst</span> <span class=o>=</span> <span class=n>af_ops</span><span class=o>-&gt;</span><span class=nf>route_req</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fl</span><span class=p>,</span> <span class=n>req</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>dst</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>drop_and_free</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 6. 生成服务端ISN =====
+</span></span></span><span class=line><span class=cl><span class=cm>     * SYN Cookie场景: ISN由cookie_init_sequence生成(编码连接状态到32位)
+</span></span></span><span class=line><span class=cl><span class=cm>     * 普通场景: secure_tcp_seq()基于SipHash生成不可预测的ISN(RFC6528) */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>want_cookie</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>isn</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>isn</span> <span class=o>=</span> <span class=n>af_ops</span><span class=o>-&gt;</span><span class=nf>init_seq</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>want_cookie</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>isn</span> <span class=o>=</span> <span class=nf>cookie_init_sequence</span><span class=p>(</span><span class=n>af_ops</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>req</span><span class=o>-&gt;</span><span class=n>mss</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>snt_isn</span> <span class=o>=</span> <span class=n>isn</span><span class=p>;</span>  <span class=cm>/* 记录ISN，收到ACK时验证: ack_seq == isn+1 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 7. 将req加入半连接哈希表(非Cookie模式) =====
+</span></span></span><span class=line><span class=cl><span class=cm>     * req伪装成mini socket(TCP_NEW_SYN_RECV)插入ehash，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 后续客户端ACK通过ehash查找到这个req。
+</span></span></span><span class=line><span class=cl><span class=cm>     * 同时启动SYN-ACK重传定时器(默认1秒) */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>want_cookie</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>inet_csk_reqsk_queue_hash_add</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>req</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>            <span class=nf>tcp_timeout_init</span><span class=p>((</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>req</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 8. 发送SYN-ACK ===== */</span>
+</span></span><span class=line><span class=cl>    <span class=n>af_ops</span><span class=o>-&gt;</span><span class=nf>send_synack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>dst</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fl</span><span class=p>,</span> <span class=n>req</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>foc</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=o>!</span><span class=n>want_cookie</span> <span class=o>?</span> <span class=nl>TCP_SYNACK_NORMAL</span> <span class=p>:</span> <span class=n>TCP_SYNACK_COOKIE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* Cookie模式: SYN-ACK已发送，状态编码在ISN中，不需要保存req，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 直接释放。客户端ACK到达时从ack_seq-1解码重建连接 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>want_cookie</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>reqsk_free</span><span class=p>(</span><span class=n>req</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>reqsk_put</span><span class=p>(</span><span class=n>req</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><a id=sec-tcp_v4_send_synack></a></p><h3 id=44-tcp_v4_send_synack>4.4 <code>tcp_v4_send_synack()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:1402
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>tcp_v4_send_synack</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>dst_entry</span> <span class=o>*</span><span class=n>dst</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                              <span class=k>struct</span> <span class=n>flowi</span> <span class=o>*</span><span class=n>fl</span><span class=p>,</span> <span class=k>struct</span> <span class=n>request_sock</span> <span class=o>*</span><span class=n>req</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                              <span class=k>struct</span> <span class=n>tcp_fastopen_cookie</span> <span class=o>*</span><span class=n>foc</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                              <span class=k>enum</span> <span class=n>tcp_synack_type</span> <span class=n>synack_type</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                              <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>syn_skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>inet_request_sock</span> <span class=o>*</span><span class=n>ireq</span> <span class=o>=</span> <span class=nf>inet_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>flowi4</span> <span class=n>fl4</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u8</span> <span class=n>tos</span><span class=p>;</span>   <span class=cm>/* ★ 必须在调用 ip_build_and_send_pkt 前声明并初始化 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 1. 获取回复路由（如果调用者未提供） */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>dst</span> <span class=o>&amp;&amp;</span> <span class=p>(</span><span class=n>dst</span> <span class=o>=</span> <span class=nf>inet_csk_route_req</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fl4</span><span class=p>,</span> <span class=n>req</span><span class=p>))</span> <span class=o>==</span> <span class=nb>NULL</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 2. 构建SYN-ACK数据包:
+</span></span></span><span class=line><span class=cl><span class=cm>     * - 分配skb
+</span></span></span><span class=line><span class=cl><span class=cm>     * - 填充TCP头(seq=服务端ISN, ack=客户端ISN+1, SYN=1, ACK=1)
+</span></span></span><span class=line><span class=cl><span class=cm>     * - 添加TCP选项(MSS, WScale, SACK, Timestamps)
+</span></span></span><span class=line><span class=cl><span class=cm>     * - TFO模式下可能携带cookie或数据 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>skb</span> <span class=o>=</span> <span class=nf>tcp_make_synack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>dst</span><span class=p>,</span> <span class=n>req</span><span class=p>,</span> <span class=n>foc</span><span class=p>,</span> <span class=n>synack_type</span><span class=p>,</span> <span class=n>syn_skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>skb</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 3. 计算TCP校验和（伪首部校验和） */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>__tcp_v4_send_check</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>ireq</span><span class=o>-&gt;</span><span class=n>ir_loc_addr</span><span class=p>,</span> <span class=n>ireq</span><span class=o>-&gt;</span><span class=n>ir_rmt_addr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 4. 设置TOS（Type of Service）
+</span></span></span><span class=line><span class=cl><span class=cm>         * sysctl_tcp_reflect_tos=1: 反射客户端SYN中的TOS(剥ECN位) + 本端ECN位
+</span></span></span><span class=line><span class=cl><span class=cm>         * sysctl_tcp_reflect_tos=0: 直接用本端socket的tos */</span>
+</span></span><span class=line><span class=cl>        <span class=n>tos</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_reflect_tos</span><span class=p>)</span> <span class=o>?</span>
+</span></span><span class=line><span class=cl>                <span class=p>(</span><span class=nf>tcp_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>syn_tos</span> <span class=o>&amp;</span> <span class=o>~</span><span class=n>INET_ECN_MASK</span><span class=p>)</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>                <span class=p>(</span><span class=nf>inet_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>tos</span> <span class=o>&amp;</span> <span class=n>INET_ECN_MASK</span><span class=p>)</span> <span class=o>:</span>
+</span></span><span class=line><span class=cl>                <span class=nf>inet_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>tos</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* BPF拥塞控制可能需要ECN(例如DCTCP) */</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>INET_ECN_is_capable</span><span class=p>(</span><span class=n>tos</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>            <span class=nf>tcp_bpf_ca_needs_ecn</span><span class=p>((</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>req</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=n>tos</span> <span class=o>|=</span> <span class=n>INET_ECN_ECT_0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 5. 构建IP头并发送（RCU读锁保护ireq_opt解引用） */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>rcu_read_lock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=n>err</span> <span class=o>=</span> <span class=nf>ip_build_and_send_pkt</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=n>ireq</span><span class=o>-&gt;</span><span class=n>ir_loc_addr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                     <span class=n>ireq</span><span class=o>-&gt;</span><span class=n>ir_rmt_addr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                     <span class=nf>rcu_dereference</span><span class=p>(</span><span class=n>ireq</span><span class=o>-&gt;</span><span class=n>ireq_opt</span><span class=p>),</span> <span class=n>tos</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>rcu_read_unlock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=n>err</span> <span class=o>=</span> <span class=nf>net_xmit_eval</span><span class=p>(</span><span class=n>err</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>SYN-ACK 包格式</strong>:</p><ul><li><code>SYN=1, ACK=1</code></li><li><code>seq=ISN_server</code></li><li><code>ack=ISN_client+1</code>（确认客户端的 SYN）</li><li><code>options</code>: 与 SYN 协商的选项</li></ul><hr><p><a id=sec-ack></a></p><h2 id=五第三步客户端接收-syn-ack-并发送-ack>五、第三步：客户端接收 SYN-ACK 并发送 ACK</h2><h3 id=51-调用链>5.1 调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>tcp_v4_rcv()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_v4_do_rcv()
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_rcv_state_process()                // TCP_SYN_SENT 状态
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_rcv_synsent_state_process()
+</span></span><span class=line><span class=cl>    1. 验证 ACK 合法性
+</span></span><span class=line><span class=cl>    2. 处理 SYN-ACK 选项
+</span></span><span class=line><span class=cl>    3. 更新 TCP 状态 → ESTABLISHED
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_finish_connect()
+</span></span><span class=line><span class=cl>    4. 通知应用层（sk-&gt;sk_state_change）
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_send_ack()
+</span></span><span class=line><span class=cl>    5. 发送最终 ACK
+</span></span></code></pre></td></tr></table></div></div><p><a id=sec-tcp_rcv_synsent></a></p><h3 id=52-tcp_rcv_synsent_state_process>5.2 <code>tcp_rcv_synsent_state_process()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>  1
+</span><span class=lnt>  2
+</span><span class=lnt>  3
+</span><span class=lnt>  4
+</span><span class=lnt>  5
+</span><span class=lnt>  6
+</span><span class=lnt>  7
+</span><span class=lnt>  8
+</span><span class=lnt>  9
+</span><span class=lnt> 10
+</span><span class=lnt> 11
+</span><span class=lnt> 12
+</span><span class=lnt> 13
+</span><span class=lnt> 14
+</span><span class=lnt> 15
+</span><span class=lnt> 16
+</span><span class=lnt> 17
+</span><span class=lnt> 18
+</span><span class=lnt> 19
+</span><span class=lnt> 20
+</span><span class=lnt> 21
+</span><span class=lnt> 22
+</span><span class=lnt> 23
+</span><span class=lnt> 24
+</span><span class=lnt> 25
+</span><span class=lnt> 26
+</span><span class=lnt> 27
+</span><span class=lnt> 28
+</span><span class=lnt> 29
+</span><span class=lnt> 30
+</span><span class=lnt> 31
+</span><span class=lnt> 32
+</span><span class=lnt> 33
+</span><span class=lnt> 34
+</span><span class=lnt> 35
+</span><span class=lnt> 36
+</span><span class=lnt> 37
+</span><span class=lnt> 38
+</span><span class=lnt> 39
+</span><span class=lnt> 40
+</span><span class=lnt> 41
+</span><span class=lnt> 42
+</span><span class=lnt> 43
+</span><span class=lnt> 44
+</span><span class=lnt> 45
+</span><span class=lnt> 46
+</span><span class=lnt> 47
+</span><span class=lnt> 48
+</span><span class=lnt> 49
+</span><span class=lnt> 50
+</span><span class=lnt> 51
+</span><span class=lnt> 52
+</span><span class=lnt> 53
+</span><span class=lnt> 54
+</span><span class=lnt> 55
+</span><span class=lnt> 56
+</span><span class=lnt> 57
+</span><span class=lnt> 58
+</span><span class=lnt> 59
+</span><span class=lnt> 60
+</span><span class=lnt> 61
+</span><span class=lnt> 62
+</span><span class=lnt> 63
+</span><span class=lnt> 64
+</span><span class=lnt> 65
+</span><span class=lnt> 66
+</span><span class=lnt> 67
+</span><span class=lnt> 68
+</span><span class=lnt> 69
+</span><span class=lnt> 70
+</span><span class=lnt> 71
+</span><span class=lnt> 72
+</span><span class=lnt> 73
+</span><span class=lnt> 74
+</span><span class=lnt> 75
+</span><span class=lnt> 76
+</span><span class=lnt> 77
+</span><span class=lnt> 78
+</span><span class=lnt> 79
+</span><span class=lnt> 80
+</span><span class=lnt> 81
+</span><span class=lnt> 82
+</span><span class=lnt> 83
+</span><span class=lnt> 84
+</span><span class=lnt> 85
+</span><span class=lnt> 86
+</span><span class=lnt> 87
+</span><span class=lnt> 88
+</span><span class=lnt> 89
+</span><span class=lnt> 90
+</span><span class=lnt> 91
+</span><span class=lnt> 92
+</span><span class=lnt> 93
+</span><span class=lnt> 94
+</span><span class=lnt> 95
+</span><span class=lnt> 96
+</span><span class=lnt> 97
+</span><span class=lnt> 98
+</span><span class=lnt> 99
+</span><span class=lnt>100
+</span><span class=lnt>101
+</span><span class=lnt>102
+</span><span class=lnt>103
+</span><span class=lnt>104
+</span><span class=lnt>105
+</span><span class=lnt>106
+</span><span class=lnt>107
+</span><span class=lnt>108
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:7299
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>tcp_rcv_synsent_state_process</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                         <span class=k>const</span> <span class=k>struct</span> <span class=n>tcphdr</span> <span class=o>*</span><span class=n>th</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_fastopen_cookie</span> <span class=n>foc</span> <span class=o>=</span> <span class=p>{</span> <span class=p>.</span><span class=n>len</span> <span class=o>=</span> <span class=o>-</span><span class=mi>1</span> <span class=p>};</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 保存原始mss_clamp：如果后续验证失败需要恢复，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 避免错误的选项值影响SYN重传 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>saved_clamp</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>mss_clamp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>fastopen_fail</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 解析SYN-ACK中的TCP选项 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_parse_options</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>foc</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 对端在SYN-ACK中原样回显了我方时间戳，减去偏移还原为本地真实时间 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>saw_tstamp</span> <span class=o>&amp;&amp;</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span> <span class=o>-=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>tsoffset</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>ack</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=cm>/* ===== 收到SYN-ACK（正常三次握手） ===== */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* RFC793 ACK验证：SYN_SENT状态下 ack_seq 只能是 ISS+1 */</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ack_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_una</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>            <span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ack_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_nxt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=cm>/* ACK无效，加速SYN重传 */</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span> <span class=o>==</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                <span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ICSK_TIME_RETRANS</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                          <span class=n>TCP_TIMEOUT_MIN</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>reset_and_undo</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* PAWS检查：回显时间戳必须在[retrans_stamp, now]范围内，
+</span></span></span><span class=line><span class=cl><span class=cm>         * 否则是对过期SYN的响应 */</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>saw_tstamp</span> <span class=o>&amp;&amp;</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>            <span class=o>!</span><span class=nf>between</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>retrans_stamp</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                     <span class=nf>tcp_time_stamp</span><span class=p>(</span><span class=n>tp</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_PAWSACTIVEREJECTED</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>reset_and_undo</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* RST+ACK：对端明确拒绝连接（目标端口未监听） */</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>rst</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=nf>tcp_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* ACK有效但没有SYN标志：不是合法的SYN-ACK，丢弃 */</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>syn</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>discard_and_undo</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* ===== SYN-ACK合法，开始建立连接 ===== */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_ecn_rcv_synack</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>th</span><span class=p>);</span>           <span class=cm>/* ECN协商结果 */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_init_wl</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>);</span> <span class=cm>/* 窗口更新基准 */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_try_undo_spurious_syn</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>         <span class=cm>/* 检查虚假超时 */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>FLAG_SLOWPATH</span><span class=p>);</span>       <span class=cm>/* 处理ACK：更新snd_una，停止重传定时器 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 更新接收序列号：SYN占1个序列号，期望下一个数据seq+1 */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>,</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span> <span class=o>+</span> <span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_wup</span> <span class=o>=</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span> <span class=o>+</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* SYN和SYN-ACK中的窗口值是未缩放的原始值 */</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_wnd</span> <span class=o>=</span> <span class=nf>ntohs</span><span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>window</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>wscale_ok</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=cm>/* 对端不支持窗口缩放：双方都不使用，窗口限制65535 */</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>snd_wscale</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_wscale</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>window_clamp</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>window_clamp</span><span class=p>,</span> <span class=mi>65535U</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>saw_tstamp</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>tstamp_ok</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=cm>/* 时间戳选项占12字节，需要从advmss中扣除 */</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_header_len</span> <span class=o>=</span>
+</span></span><span class=line><span class=cl>                <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcphdr</span><span class=p>)</span> <span class=o>+</span> <span class=n>TCPOLEN_TSTAMP_ALIGNED</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>advmss</span> <span class=o>-=</span> <span class=n>TCPOLEN_TSTAMP_ALIGNED</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=nf>tcp_store_ts_recent</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>  <span class=cm>/* 保存对端时间戳用于后续PAWS */</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_header_len</span> <span class=o>=</span> <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcphdr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 根据PMTU重新计算MSS */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_sync_mss</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_pmtu_cookie</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_initialize_rcv_mss</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 必须先设copied_seq再改状态，防止tcp_poll()
+</span></span></span><span class=line><span class=cl><span class=cm>         * 看到ESTABLISHED但copied_seq=0导致误判 */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>copied_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>smp_mb</span><span class=p>();</span>  <span class=cm>/* 写屏障：确保上述字段对其他CPU可见 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 完成连接：SYN_SENT → ESTABLISHED
+</span></span></span><span class=line><span class=cl><span class=cm>         * 内部初始化拥塞窗口、拥塞控制算法、启动keepalive定时器 */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_finish_connect</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 通知应用层：唤醒在connect()中阻塞等待的进程 */</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>sk</span><span class=o>-&gt;</span><span class=nf>sk_state_change</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=nf>sk_wake_async</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_WAKE_IO</span><span class=p>,</span> <span class=n>POLL_OUT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=cm>/* 发送三次握手的最终ACK */</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_send_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== 分支B: 收到纯SYN(无ACK) — 同时打开(simultaneous open) ===== */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ... SYN_SENT → SYN_RECV，此处省略
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>最终 ACK 包格式</strong>:</p><ul><li><code>SYN=0, ACK=1</code></li><li><code>seq=ISN_client+1</code></li><li><code>ack=ISN_server+1</code></li></ul><p><a id=sec-tcp_check_req></a></p><h3 id=53-服务端接收最终-ack--tcp_check_req>5.3 服务端接收最终 ACK — <code>tcp_check_req()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>tcp_v4_rcv()  → 在ehash中查找到request_sock(TCP_NEW_SYN_RECV状态)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_check_req()  → 验证ACK → 创建完整子sock → 加入accept队列
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sk-&gt;sk_data_ready()  → 唤醒accept()阻塞
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_minisocks.c:691
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=nf>tcp_check_req</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                           <span class=k>struct</span> <span class=n>request_sock</span> <span class=o>*</span><span class=n>req</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                           <span class=kt>bool</span> <span class=n>fastopen</span><span class=p>,</span> <span class=kt>bool</span> <span class=o>*</span><span class=n>req_stolen</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_options_received</span> <span class=n>tmp_opt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>child</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>tcphdr</span> <span class=o>*</span><span class=n>th</span> <span class=o>=</span> <span class=nf>tcp_hdr</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>__be32</span> <span class=n>flg</span> <span class=o>=</span> <span class=nf>tcp_flag_word</span><span class=p>(</span><span class=n>th</span><span class=p>)</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCP_FLAG_RST</span><span class=o>|</span><span class=n>TCP_FLAG_SYN</span><span class=o>|</span><span class=n>TCP_FLAG_ACK</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>paws_reject</span> <span class=o>=</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>own_req</span><span class=p>;</span>   <span class=cm>/* ★ 标识本CPU是否拥有此req（用于inet_csk_complete_hashdance） */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 解析TCP选项，进行PAWS检查 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>tmp_opt</span><span class=p>.</span><span class=n>saw_tstamp</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>   <span class=cm>/* ★ 必须初始化：后续 if (tmp_opt.saw_tstamp) 依赖 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>doff</span> <span class=o>&gt;</span> <span class=p>(</span><span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcphdr</span><span class=p>)</span><span class=o>&gt;&gt;</span><span class=mi>2</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_parse_options</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tmp_opt</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>tmp_opt</span><span class=p>.</span><span class=n>saw_tstamp</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>tmp_opt</span><span class=p>.</span><span class=n>ts_recent</span> <span class=o>=</span> <span class=n>req</span><span class=o>-&gt;</span><span class=n>ts_recent</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=n>tmp_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                <span class=n>tmp_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span> <span class=o>-=</span> <span class=nf>tcp_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ts_off</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=n>paws_reject</span> <span class=o>=</span> <span class=nf>tcp_paws_reject</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tmp_opt</span><span class=p>,</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>rst</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 纯SYN重传：客户端没收到SYN-ACK，重新发送了SYN。
+</span></span></span><span class=line><span class=cl><span class=cm>     * 重传SYN-ACK作为响应，重置定时器 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span> <span class=o>==</span> <span class=nf>tcp_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>rcv_isn</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>flg</span> <span class=o>==</span> <span class=n>TCP_FLAG_SYN</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>paws_reject</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>inet_rtx_syn_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>req</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=nf>mod_timer_pending</span><span class=p>(</span><span class=o>&amp;</span><span class=n>req</span><span class=o>-&gt;</span><span class=n>rsk_timer</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ACK验证：ack_seq必须等于snt_isn+1（确认我方SYN-ACK） */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>((</span><span class=n>flg</span> <span class=o>&amp;</span> <span class=n>TCP_FLAG_ACK</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>fastopen</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ack_seq</span> <span class=o>!=</span> <span class=nf>tcp_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>snt_isn</span> <span class=o>+</span> <span class=mi>1</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>sk</span><span class=p>;</span>  <span class=cm>/* ACK无效，调用者发送RST */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* PAWS拒绝或窗口外的包：发送ACK并丢弃 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>paws_reject</span> <span class=o>||</span> <span class=o>!</span><span class=nf>tcp_in_window</span><span class=p>(...))</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* RST或SYN：终止半连接 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>flg</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCP_FLAG_RST</span><span class=o>|</span><span class=n>TCP_FLAG_SYN</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>embryonic_reset</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 必须有ACK标志 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>flg</span> <span class=o>&amp;</span> <span class=n>TCP_FLAG_ACK</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* TCP_DEFER_ACCEPT：设置了defer_accept时，纯ACK(无数据)被暂时忽略，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 等待客户端发送数据后再创建完整socket（减少空闲连接） */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>req</span><span class=o>-&gt;</span><span class=n>num_timeout</span> <span class=o>&lt;</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_accept_queue</span><span class=p>.</span><span class=n>rskq_defer_accept</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span> <span class=o>==</span> <span class=nf>tcp_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>rcv_isn</span> <span class=o>+</span> <span class=mi>1</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>inet_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>acked</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ===== ACK有效，创建完整的子socket =====
+</span></span></span><span class=line><span class=cl><span class=cm>     * syn_recv_sock回调（IPv4是tcp_v4_syn_recv_sock）:
+</span></span></span><span class=line><span class=cl><span class=cm>     * 1. 创建新的struct sock（~2KB）
+</span></span></span><span class=line><span class=cl><span class=cm>     * 2. 初始化TCP状态（拷贝选项、窗口、MSS等）
+</span></span></span><span class=line><span class=cl><span class=cm>     * 3. 将新socket加入ehash（已建立连接哈希表）
+</span></span></span><span class=line><span class=cl><span class=cm>     * 状态变为 TCP_ESTABLISHED */</span>
+</span></span><span class=line><span class=cl>    <span class=n>child</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_af_ops</span><span class=o>-&gt;</span><span class=nf>syn_recv_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>req</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                                     <span class=n>req</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>own_req</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>child</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>listen_overflow</span><span class=p>;</span>  <span class=cm>/* accept队列满 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 完成握手：从半连接哈希表移到全连接accept队列，
+</span></span></span><span class=line><span class=cl><span class=cm>     * 唤醒阻塞在accept()的进程 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>inet_csk_complete_hashdance</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>child</span><span class=p>,</span> <span class=n>req</span><span class=p>,</span> <span class=n>own_req</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>此时服务端从 <code>request_sock</code>（~256B）转为完整 <code>struct sock</code>（~2KB），状态变为 <code>TCP_ESTABLISHED</code>。<code>accept()</code> 返回新连接的文件描述符。</p><hr><p><a id=sec-options></a></p><h2 id=六tcp-选项协商>六、TCP 选项协商</h2><p>三次握手期间，双方通过 SYN/SYN-ACK 中的 TCP 选项完成参数协商。</p><h3 id=61-mss-maximum-segment-size>6.1 MSS (Maximum Segment Size)</h3><ul><li>客户端在 SYN 中发送 MSS（通常 1460 = 1500 MTU - 20 IP - 20 TCP）</li><li>服务器在 SYN-ACK 中发送自己的 MSS</li><li>双方取较小值</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_v4_connect() 中（tcp_ipv4.c:221）：MSS 上限默认 536（RFC1122/RFC2581）
+</span></span></span><span class=line><span class=cl><span class=c1>// 收到 SYN-ACK 时由 tcp_parse_options() 重新 clamp 到对端通告值
+</span></span></span><span class=line><span class=cl><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>mss_clamp</span> <span class=o>=</span> <span class=n>TCP_MSS_DEFAULT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// tcp_connect_init() 中（tcp_output.c:4696）：advmss 从路由 metric 计算
+</span></span></span><span class=line><span class=cl><span class=c1>// 受用户 user_mss (setsockopt TCP_MAXSEG) 与 TCP_MSS_DEFAULT 下限约束
+</span></span></span><span class=line><span class=cl><span class=n>tp</span><span class=o>-&gt;</span><span class=n>advmss</span> <span class=o>=</span> <span class=nf>tcp_mss_clamp</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>dst_metric_advmss</span><span class=p>(</span><span class=n>dst</span><span class=p>));</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=62-window-scale>6.2 Window Scale</h3><ul><li>缩放因子范围: 0-14，允许窗口超过 65535 字节</li><li>只有双方都在 SYN 中发送才启用</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_select_initial_window()
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>sysctl_tcp_window_scaling</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_wscale</span> <span class=o>=</span> <span class=n>rcv_wscale</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=63-sack-selective-acknowledgment>6.3 SACK (Selective Acknowledgment)</h3><ul><li>允许接收方确认非连续数据块，提高丢包恢复效率</li><li>双方在 SYN 中发送 SACK Permitted 选项</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_parse_options()
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>opcode</span> <span class=o>==</span> <span class=n>TCPOPT_SACK_PERM</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>sack_ok</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=64-timestamps>6.4 Timestamps</h3><ul><li>用于 RTT 精确测量和 PAWS（Protection Against Wrapped Sequence）</li><li>双方在 SYN 中发送</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_parse_options()
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>opcode</span> <span class=o>==</span> <span class=n>TCPOPT_TIMESTAMP</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>tstamp_ok</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsval</span> <span class=o>=</span> <span class=nf>get_unaligned_be32</span><span class=p>(</span><span class=n>ptr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span> <span class=o>=</span> <span class=nf>get_unaligned_be32</span><span class=p>(</span><span class=n>ptr</span> <span class=o>+</span> <span class=mi>4</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><p><a id=sec-security></a></p><h2 id=七安全机制>七、安全机制</h2><h3 id=71-syn-cookie>7.1 SYN Cookie</h3><p><strong>目的</strong>：防止 SYN 洪水攻击耗尽服务器内存。</p><p><strong>原理</strong>：</p><ol><li>不分配 <code>request_sock</code>，避免内存耗尽</li><li>将连接信息编码到 ISN 中（加密哈希）</li><li>收到第三次 ACK 时，从 <code>ack_seq - 1</code> 反向恢复连接参数</li></ol><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_conn_request()
+</span></span></span><span class=line><span class=cl><span class=cm>/* syncookies 取值：0=禁用, 1=按需(默认), 2=强制
+</span></span></span><span class=line><span class=cl><span class=cm> * syncookies==2: 管理员强制所有SYN都用Cookie(测试/极端防护),
+</span></span></span><span class=line><span class=cl><span class=cm> *                不受队列状态影响
+</span></span></span><span class=line><span class=cl><span class=cm> * isn!=0: TIME_WAIT复用场景, 旧连接已验证对端合法性,
+</span></span></span><span class=line><span class=cl><span class=cm> *         跳过Cookie检查直接用预设ISN */</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>((</span><span class=n>syncookies</span> <span class=o>==</span> <span class=mi>2</span> <span class=o>||</span> <span class=nf>inet_csk_reqsk_queue_is_full</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>isn</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>want_cookie</span> <span class=o>=</span> <span class=nf>tcp_syn_flood_action</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>rsk_ops</span><span class=o>-&gt;</span><span class=n>slab_name</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>want_cookie</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>drop</span><span class=p>;</span>   <span class=c1>// syncookies=0 时直接丢 SYN（无兜底）
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cm>/* 后续: ISN 生成阶段才会调用 cookie_init_sequence()
+</span></span></span><span class=line><span class=cl><span class=cm> * 见 tcp_input.c:8441
+</span></span></span><span class=line><span class=cl><span class=cm> *     isn = cookie_init_sequence(af_ops, sk, skb, &amp;req-&gt;mss); */</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=72-半连接队列与全连接队列>7.2 半连接队列与全连接队列</h3><p>半连接/全连接队列的数据结构、计数器、溢出判断、溢出排查详见 <a class=link href=TCP-listen%e6%93%8d%e4%bd%9c.md>TCP-listen操作</a> 五~七节，此处仅列要点：</p><ul><li>半连接计数器 <code>qlen</code>（<code>atomic_t</code>）与全连接计数器 <code>sk_ack_backlog</code>（<code>u32</code>）<strong>完全独立</strong>，互不影响</li><li>两者共享同一上限 <code>sk_max_ack_backlog</code>（= <code>min(backlog, somaxconn)</code>）</li><li>半连接满判断用 <code>>=</code>，全连接满判断用 <code>></code>（全连接实际可容纳 <code>backlog + 1</code> 个）</li><li><code>ListenOverflows</code> 仅在全连接满时递增；<code>ListenDrops</code> 在所有监听路径 drop 时递增（粗粒度）</li></ul><h3 id=73-isn-防预测>7.3 ISN 防预测</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>           <span class=nf>secure_tcp_seq</span><span class=p>(</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_saddr</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_daddr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                          <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_sport</span><span class=p>,</span> <span class=n>usin</span><span class=o>-&gt;</span><span class=n>sin_port</span><span class=p>));</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>secure_tcp_seq()</code> 基于 SipHash + 时钟确保 ISN 不可预测，防止 TCP 劫持。</p><hr><h2 id=八tcp-fast-open>八、TCP Fast Open</h2><p>在 SYN 中携带数据，减少一个 RTT。</p><ol><li>首次连接：客户端获取 Fast Open Cookie</li><li>后续连接：SYN 中包含 Cookie + 数据</li><li>服务器验证 Cookie 后立即处理数据</li></ol><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// tcp_connect()
+</span></span></span><span class=line><span class=cl><span class=n>err</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>fastopen_req</span> <span class=o>?</span> <span class=nf>tcp_send_syn_data</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>buff</span><span class=p>)</span> <span class=o>:</span>
+</span></span><span class=line><span class=cl>      <span class=nf>tcp_transmit_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>buff</span><span class=p>,</span> <span class=mi>1</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_allocation</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=九错误处理>九、错误处理</h2><h3 id=91-syn-超时重传>9.1 SYN 超时重传</h3><ul><li>默认重传次数：<code>tcp_syn_retries = 6</code></li><li>超时时间指数增长：1s → 2s → 4s → 8s → 16s → 32s</li><li>总超时约 63 秒</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ICSK_TIME_RETRANS</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                          <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_rto</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=92-连接拒绝rst>9.2 连接拒绝（RST）</h3><p>目标端口未监听时，服务器发送 RST：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>rst</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=93-网络不可达>9.3 网络不可达</h3><p>路由查找失败时返回 <code>ENETUNREACH</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=n>rt</span> <span class=o>=</span> <span class=nf>ip_route_connect</span><span class=p>(...);</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>IS_ERR</span><span class=p>(</span><span class=n>rt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>err</span> <span class=o>=</span> <span class=nf>PTR_ERR</span><span class=p>(</span><span class=n>rt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>err</span> <span class=o>==</span> <span class=o>-</span><span class=n>ENETUNREACH</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>IP_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>IPSTATS_MIB_OUTNOROUTES</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=十相关系统参数>十、相关系统参数</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># SYN 重传次数</span>
+</span></span><span class=line><span class=cl>net.ipv4.tcp_syn_retries <span class=o>=</span> <span class=m>6</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># SYN-ACK 重传次数</span>
+</span></span><span class=line><span class=cl>net.ipv4.tcp_synack_retries <span class=o>=</span> <span class=m>5</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># SYN 队列上限</span>
+</span></span><span class=line><span class=cl>net.ipv4.tcp_max_syn_backlog <span class=o>=</span> <span class=m>1024</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># SYN Cookie 启用</span>
+</span></span><span class=line><span class=cl>net.ipv4.tcp_syncookies <span class=o>=</span> <span class=m>1</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># TCP Fast Open</span>
+</span></span><span class=line><span class=cl>net.ipv4.tcp_fastopen <span class=o>=</span> <span class=m>1</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># TCP 选项</span>
+</span></span><span class=line><span class=cl>net.ipv4.tcp_timestamps <span class=o>=</span> <span class=m>1</span>
+</span></span><span class=line><span class=cl>net.ipv4.tcp_window_scaling <span class=o>=</span> <span class=m>1</span>
+</span></span><span class=line><span class=cl>net.ipv4.tcp_sack <span class=o>=</span> <span class=m>1</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># Accept 队列上限</span>
+</span></span><span class=line><span class=cl>net.core.somaxconn <span class=o>=</span> <span class=m>4096</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=十一调试工具>十一、调试工具</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 抓取三次握手包</span>
+</span></span><span class=line><span class=cl>tcpdump -i eth0 -nn <span class=s1>&#39;port 8080 and (tcp[tcpflags] &amp; (tcp-syn|tcp-ack) != 0)&#39;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看半连接/全连接队列</span>
+</span></span><span class=line><span class=cl>ss -tan state syn-recv
+</span></span><span class=line><span class=cl>ss -ltn     <span class=c1># Recv-Q = accept 队列中连接数, Send-Q = backlog 上限</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 监控队列溢出</span>
+</span></span><span class=line><span class=cl>nstat -az <span class=p>|</span> grep -i listen
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看 TCP 统计</span>
+</span></span><span class=line><span class=cl>netstat -st <span class=p>|</span> grep -i syn
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=十二状态转换总结>十二、状态转换总结</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>客户端:
+</span></span><span class=line><span class=cl>CLOSED → [connect()/发送SYN] → SYN_SENT → [收到SYN-ACK/发送ACK] → ESTABLISHED
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>服务器:
+</span></span><span class=line><span class=cl>CLOSED → [listen()] → LISTEN → [收到SYN/发送SYN-ACK] → SYN_RECV → [收到ACK] → ESTABLISHED
+</span></span></code></pre></td></tr></table></div></div></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/%E4%B8%89%E6%AC%A1%E6%8F%A1%E6%89%8B/>三次握手</a>
+<a href=/tags/connect/>Connect</a>
+<a href=/tags/syn/>SYN</a>
+<a href=/tags/syn-ack/>SYN-ACK</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

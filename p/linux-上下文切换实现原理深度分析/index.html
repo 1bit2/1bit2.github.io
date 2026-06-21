@@ -1,0 +1,1561 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="Linux 上下文切换实现原理深度分析 基于 Linux 5.15.78 内核源码分析\n目录 一、核心概念区分 二、上下文切换整体流程 三、核心数据结构 四、调度入口分析 五、上下文切换核心实现 六、地址空间切换 七、寄存器切换（汇编层） 八、硬件上下文切换（C层） 九、上下文信息保存位置 十、系统调用与上下文切换的区别 十一、总结 一、核心概念区分 1.1 模式切换 vs 上下文切换 概念 模式切换 (Mode Switch) 上下文切换 (Context Switch) 定义 用户态 ↔ 内核态 进程A ↔ 进程B 是否换进程 ❌ 同一个进程 ✅ 不同进程 切换什么 特权级别 (Ring 3 → Ring 0) 整个执行环境 触发场景 系统调用、中断、异常 调用 schedule() 且选择不同进程 开销 较小 较大（涉及页表、TLB等） 1.2 图解对比 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 ┌────────────────────────────────────────────────────────────────────────┐ │ 模式切换 (系统调用) │ ├────────────────────────────────────────────────────────────────────────┤ │ │ │ 进程A用户态 ──────→ 进程A内核态 ──────→ 进程A用户态 │ │ 始终是进程A │ │ │ └────────────────────────────────────────────────────────────────────────┘ ┌────────────────────────────────────────────────────────────────────────┐ │ 上下文切换 (进程切换) │ ├────────────────────────────────────────────────────────────────────────┤ │ │ │ 进程A内核态 ─────────────────→ 进程B内核态 │ │ 换了一个进程！ │ │ │ └────────────────────────────────────────────────────────────────────────┘ 二、上下文切换整体流程 2.1 流程图 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 schedule() │ ▼ __schedule() │ ├── 1. 获取当前CPU运行队列 (rq) ├── 2. 选择下一个任务 (调度器: CFS/RT/DL) │ ▼ context_switch(prev, next) │ ├── prepare_task_switch() # 准备工作 │ ├── switch_mm_irqs_off() # 切换地址空间 (页表) │ │ │ └── load_new_mm_cr3() # 写CR3寄存器 │ ├── switch_to(prev, next) # 寄存器切换 │ │ │ └── __switch_to_asm() # 汇编实现 │ │ │ ├── 保存 callee-saved 寄存器 │ ├── 切换栈指针 (RSP) │ ├── 恢复 callee-saved 寄存器 │ │ │ └── __switch_to() # C函数 │ │ │ ├── FPU 状态切换 │ ├── 段寄存器切换 │ ├── TLS 加载 │ └── 更新 per-CPU current │ └── finish_task_switch() # 清理工作 2.2 调用链 1 2 3 4 5 6 7 8 schedule() └── __schedule() └── context_switch() ├── switch_mm_irqs_off() [地址空间切换] ├── switch_to() [宏] │ └── __switch_to_asm() [汇编] │ └── __switch_to() [C函数] └── finish_task_switch() 三、核心数据结构 3.1 task_struct（进程描述符） 每个进程都有一个 task_struct，其中包含了进程的所有信息：\n"><title>Linux 上下文切换实现原理深度分析</title><link rel=canonical href=https://1bit2.github.io/p/linux-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Linux 上下文切换实现原理深度分析"><meta property='og:description' content="Linux 上下文切换实现原理深度分析 基于 Linux 5.15.78 内核源码分析\n目录 一、核心概念区分 二、上下文切换整体流程 三、核心数据结构 四、调度入口分析 五、上下文切换核心实现 六、地址空间切换 七、寄存器切换（汇编层） 八、硬件上下文切换（C层） 九、上下文信息保存位置 十、系统调用与上下文切换的区别 十一、总结 一、核心概念区分 1.1 模式切换 vs 上下文切换 概念 模式切换 (Mode Switch) 上下文切换 (Context Switch) 定义 用户态 ↔ 内核态 进程A ↔ 进程B 是否换进程 ❌ 同一个进程 ✅ 不同进程 切换什么 特权级别 (Ring 3 → Ring 0) 整个执行环境 触发场景 系统调用、中断、异常 调用 schedule() 且选择不同进程 开销 较小 较大（涉及页表、TLB等） 1.2 图解对比 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 ┌────────────────────────────────────────────────────────────────────────┐ │ 模式切换 (系统调用) │ ├────────────────────────────────────────────────────────────────────────┤ │ │ │ 进程A用户态 ──────→ 进程A内核态 ──────→ 进程A用户态 │ │ 始终是进程A │ │ │ └────────────────────────────────────────────────────────────────────────┘ ┌────────────────────────────────────────────────────────────────────────┐ │ 上下文切换 (进程切换) │ ├────────────────────────────────────────────────────────────────────────┤ │ │ │ 进程A内核态 ─────────────────→ 进程B内核态 │ │ 换了一个进程！ │ │ │ └────────────────────────────────────────────────────────────────────────┘ 二、上下文切换整体流程 2.1 流程图 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 schedule() │ ▼ __schedule() │ ├── 1. 获取当前CPU运行队列 (rq) ├── 2. 选择下一个任务 (调度器: CFS/RT/DL) │ ▼ context_switch(prev, next) │ ├── prepare_task_switch() # 准备工作 │ ├── switch_mm_irqs_off() # 切换地址空间 (页表) │ │ │ └── load_new_mm_cr3() # 写CR3寄存器 │ ├── switch_to(prev, next) # 寄存器切换 │ │ │ └── __switch_to_asm() # 汇编实现 │ │ │ ├── 保存 callee-saved 寄存器 │ ├── 切换栈指针 (RSP) │ ├── 恢复 callee-saved 寄存器 │ │ │ └── __switch_to() # C函数 │ │ │ ├── FPU 状态切换 │ ├── 段寄存器切换 │ ├── TLS 加载 │ └── 更新 per-CPU current │ └── finish_task_switch() # 清理工作 2.2 调用链 1 2 3 4 5 6 7 8 schedule() └── __schedule() └── context_switch() ├── switch_mm_irqs_off() [地址空间切换] ├── switch_to() [宏] │ └── __switch_to_asm() [汇编] │ └── __switch_to() [C函数] └── finish_task_switch() 三、核心数据结构 3.1 task_struct（进程描述符） 每个进程都有一个 task_struct，其中包含了进程的所有信息：\n"><meta property='og:url' content='https://1bit2.github.io/p/linux-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='上下文切换'><meta property='article:tag' content='schedule'><meta property='article:tag' content='__schedule'><meta property='article:tag' content='switch_to'><meta property='article:tag' content='CFS'><meta property='article:published_time' content='2026-04-16T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-16T00:00:00+00:00'><meta name=twitter:title content="Linux 上下文切换实现原理深度分析"><meta name=twitter:description content="Linux 上下文切换实现原理深度分析 基于 Linux 5.15.78 内核源码分析\n目录 一、核心概念区分 二、上下文切换整体流程 三、核心数据结构 四、调度入口分析 五、上下文切换核心实现 六、地址空间切换 七、寄存器切换（汇编层） 八、硬件上下文切换（C层） 九、上下文信息保存位置 十、系统调用与上下文切换的区别 十一、总结 一、核心概念区分 1.1 模式切换 vs 上下文切换 概念 模式切换 (Mode Switch) 上下文切换 (Context Switch) 定义 用户态 ↔ 内核态 进程A ↔ 进程B 是否换进程 ❌ 同一个进程 ✅ 不同进程 切换什么 特权级别 (Ring 3 → Ring 0) 整个执行环境 触发场景 系统调用、中断、异常 调用 schedule() 且选择不同进程 开销 较小 较大（涉及页表、TLB等） 1.2 图解对比 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 ┌────────────────────────────────────────────────────────────────────────┐ │ 模式切换 (系统调用) │ ├────────────────────────────────────────────────────────────────────────┤ │ │ │ 进程A用户态 ──────→ 进程A内核态 ──────→ 进程A用户态 │ │ 始终是进程A │ │ │ └────────────────────────────────────────────────────────────────────────┘ ┌────────────────────────────────────────────────────────────────────────┐ │ 上下文切换 (进程切换) │ ├────────────────────────────────────────────────────────────────────────┤ │ │ │ 进程A内核态 ─────────────────→ 进程B内核态 │ │ 换了一个进程！ │ │ │ └────────────────────────────────────────────────────────────────────────┘ 二、上下文切换整体流程 2.1 流程图 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 schedule() │ ▼ __schedule() │ ├── 1. 获取当前CPU运行队列 (rq) ├── 2. 选择下一个任务 (调度器: CFS/RT/DL) │ ▼ context_switch(prev, next) │ ├── prepare_task_switch() # 准备工作 │ ├── switch_mm_irqs_off() # 切换地址空间 (页表) │ │ │ └── load_new_mm_cr3() # 写CR3寄存器 │ ├── switch_to(prev, next) # 寄存器切换 │ │ │ └── __switch_to_asm() # 汇编实现 │ │ │ ├── 保存 callee-saved 寄存器 │ ├── 切换栈指针 (RSP) │ ├── 恢复 callee-saved 寄存器 │ │ │ └── __switch_to() # C函数 │ │ │ ├── FPU 状态切换 │ ├── 段寄存器切换 │ ├── TLS 加载 │ └── 更新 per-CPU current │ └── finish_task_switch() # 清理工作 2.2 调用链 1 2 3 4 5 6 7 8 schedule() └── __schedule() └── context_switch() ├── switch_mm_irqs_off() [地址空间切换] ├── switch_to() [宏] │ └── __switch_to_asm() [汇编] │ └── __switch_to() [C函数] └── finish_task_switch() 三、核心数据结构 3.1 task_struct（进程描述符） 每个进程都有一个 task_struct，其中包含了进程的所有信息：\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#目录>目录</a></li><li><a href=#一核心概念区分>一、核心概念区分</a><ol><li><a href=#11-模式切换-vs-上下文切换>1.1 模式切换 vs 上下文切换</a></li><li><a href=#12-图解对比>1.2 图解对比</a></li></ol></li><li><a href=#二上下文切换整体流程>二、上下文切换整体流程</a><ol><li><a href=#21-流程图>2.1 流程图</a></li><li><a href=#22-调用链>2.2 调用链</a></li></ol></li><li><a href=#三核心数据结构>三、核心数据结构</a><ol><li><a href=#31-task_struct进程描述符>3.1 task_struct（进程描述符）</a></li><li><a href=#32-thread_struct硬件线程上下文>3.2 thread_struct（硬件线程上下文）</a></li><li><a href=#33-pt_regs用户态寄存器帧>3.3 pt_regs（用户态寄存器帧）</a></li><li><a href=#34-inactive_task_frame上下文切换帧>3.4 inactive_task_frame（上下文切换帧）</a></li><li><a href=#35-struct-fpufpusimd-状态>3.5 struct fpu（FPU/SIMD 状态）</a></li></ol></li><li><a href=#四调度入口分析>四、调度入口分析</a><ol><li><a href=#41-schedule-函数>4.1 schedule() 函数</a></li><li><a href=#42-__schedule-函数>4.2 __schedule() 函数</a></li></ol></li><li><a href=#五上下文切换核心实现>五、上下文切换核心实现</a><ol><li><a href=#51-context_switch-函数>5.1 context_switch() 函数</a></li><li><a href=#52-prepare_task_switch-函数>5.2 prepare_task_switch() 函数</a></li><li><a href=#53-finish_task_switch-函数>5.3 finish_task_switch() 函数</a></li></ol></li><li><a href=#六地址空间切换>六、地址空间切换</a><ol><li><a href=#61-switch_mm_irqs_off-函数>6.1 switch_mm_irqs_off() 函数</a></li><li><a href=#62-load_new_mm_cr3>6.2 load_new_mm_cr3()</a></li></ol></li><li><a href=#七寄存器切换汇编层>七、寄存器切换（汇编层）</a><ol><li><a href=#71-switch_to-宏>7.1 switch_to 宏</a></li><li><a href=#72-__switch_to_asmx86-64>7.2 __switch_to_asm（x86-64）</a></li><li><a href=#73-栈切换图解>7.3 栈切换图解</a></li></ol></li><li><a href=#八硬件上下文切换c层>八、硬件上下文切换（C层）</a><ol><li><a href=#81-__switch_tox86-64>8.1 __switch_to()（x86-64）</a></li><li><a href=#82-fpu-状态切换>8.2 FPU 状态切换</a></li></ol></li><li><a href=#九上下文信息保存位置>九、上下文信息保存位置</a><ol><li><a href=#91-保存位置总览>9.1 保存位置总览</a></li><li><a href=#92-内核栈大小>9.2 内核栈大小</a></li><li><a href=#93-保存内容详表>9.3 保存内容详表</a></li></ol></li><li><a href=#十系统调用与上下文切换的区别>十、系统调用与上下文切换的区别</a><ol><li><a href=#101-系统调用流程>10.1 系统调用流程</a></li><li><a href=#102-上下文切换流程>10.2 上下文切换流程</a></li><li><a href=#103-时间线对比>10.3 时间线对比</a></li><li><a href=#104-关键区别总结>10.4 关键区别总结</a></li></ol></li><li><a href=#十一总结>十一、总结</a><ol><li><a href=#111-上下文切换的本质>11.1 上下文切换的本质</a></li><li><a href=#112-上下文切换涉及的内容>11.2 上下文切换涉及的内容</a></li><li><a href=#113-保存位置>11.3 保存位置</a></li><li><a href=#114-一句话总结>11.4 一句话总结</a></li></ol></li><li><a href=#参考文件>参考文件</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E8%BF%9B%E7%A8%8B/ style=background-color:#fbbc04;color:#fff>进程</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/linux-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/>Linux 上下文切换实现原理深度分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 16, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>16 minute read</time></div></footer></div></header><section class=article-content><h1 id=linux-上下文切换实现原理深度分析>Linux 上下文切换实现原理深度分析</h1><blockquote><p>基于 Linux 5.15.78 内核源码分析</p></blockquote><hr><h2 id=目录>目录</h2><ul><li><a class=link href=#%e4%b8%80%e6%a0%b8%e5%bf%83%e6%a6%82%e5%bf%b5%e5%8c%ba%e5%88%86>一、核心概念区分</a></li><li><a class=link href=#%e4%ba%8c%e4%b8%8a%e4%b8%8b%e6%96%87%e5%88%87%e6%8d%a2%e6%95%b4%e4%bd%93%e6%b5%81%e7%a8%8b>二、上下文切换整体流程</a></li><li><a class=link href=#%e4%b8%89%e6%a0%b8%e5%bf%83%e6%95%b0%e6%8d%ae%e7%bb%93%e6%9e%84>三、核心数据结构</a></li><li><a class=link href=#%e5%9b%9b%e8%b0%83%e5%ba%a6%e5%85%a5%e5%8f%a3%e5%88%86%e6%9e%90>四、调度入口分析</a></li><li><a class=link href=#%e4%ba%94%e4%b8%8a%e4%b8%8b%e6%96%87%e5%88%87%e6%8d%a2%e6%a0%b8%e5%bf%83%e5%ae%9e%e7%8e%b0>五、上下文切换核心实现</a></li><li><a class=link href=#%e5%85%ad%e5%9c%b0%e5%9d%80%e7%a9%ba%e9%97%b4%e5%88%87%e6%8d%a2>六、地址空间切换</a></li><li><a class=link href=#%e4%b8%83%e5%af%84%e5%ad%98%e5%99%a8%e5%88%87%e6%8d%a2%e6%b1%87%e7%bc%96%e5%b1%82>七、寄存器切换（汇编层）</a></li><li><a class=link href=#%e5%85%ab%e7%a1%ac%e4%bb%b6%e4%b8%8a%e4%b8%8b%e6%96%87%e5%88%87%e6%8d%a2c%e5%b1%82>八、硬件上下文切换（C层）</a></li><li><a class=link href=#%e4%b9%9d%e4%b8%8a%e4%b8%8b%e6%96%87%e4%bf%a1%e6%81%af%e4%bf%9d%e5%ad%98%e4%bd%8d%e7%bd%ae>九、上下文信息保存位置</a></li><li><a class=link href=#%e5%8d%81%e7%b3%bb%e7%bb%9f%e8%b0%83%e7%94%a8%e4%b8%8e%e4%b8%8a%e4%b8%8b%e6%96%87%e5%88%87%e6%8d%a2%e7%9a%84%e5%8c%ba%e5%88%ab>十、系统调用与上下文切换的区别</a></li><li><a class=link href=#%e5%8d%81%e4%b8%80%e6%80%bb%e7%bb%93>十一、总结</a></li></ul><hr><h2 id=一核心概念区分>一、核心概念区分</h2><h3 id=11-模式切换-vs-上下文切换>1.1 模式切换 vs 上下文切换</h3><div class=table-wrapper><table><thead><tr><th>概念</th><th>模式切换 (Mode Switch)</th><th>上下文切换 (Context Switch)</th></tr></thead><tbody><tr><td><strong>定义</strong></td><td>用户态 ↔ 内核态</td><td>进程A ↔ 进程B</td></tr><tr><td><strong>是否换进程</strong></td><td>❌ 同一个进程</td><td>✅ 不同进程</td></tr><tr><td><strong>切换什么</strong></td><td>特权级别 (Ring 3 → Ring 0)</td><td>整个执行环境</td></tr><tr><td><strong>触发场景</strong></td><td>系统调用、中断、异常</td><td>调用 schedule() 且选择不同进程</td></tr><tr><td><strong>开销</strong></td><td>较小</td><td>较大（涉及页表、TLB等）</td></tr></tbody></table></div><h3 id=12-图解对比>1.2 图解对比</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌────────────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                           模式切换 (系统调用)                           │
+</span></span><span class=line><span class=cl>├────────────────────────────────────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>│  进程A用户态 ──────→ 进程A内核态 ──────→ 进程A用户态                    │
+</span></span><span class=line><span class=cl>│                        始终是进程A                                      │
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>└────────────────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>┌────────────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                           上下文切换 (进程切换)                         │
+</span></span><span class=line><span class=cl>├────────────────────────────────────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>│  进程A内核态 ─────────────────→ 进程B内核态                             │
+</span></span><span class=line><span class=cl>│                  换了一个进程！                                         │
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>└────────────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=二上下文切换整体流程>二、上下文切换整体流程</h2><h3 id=21-流程图>2.1 流程图</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=n>schedule</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>▼</span>
+</span></span><span class=line><span class=cl><span class=n>__schedule</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>├──</span> <span class=mf>1.</span> <span class=err>获取当前</span><span class=n>CPU运行队列</span> <span class=p>(</span><span class=n>rq</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=err>├──</span> <span class=mf>2.</span> <span class=err>选择下一个任务</span> <span class=p>(</span><span class=err>调度器</span><span class=p>:</span> <span class=n>CFS</span><span class=o>/</span><span class=n>RT</span><span class=o>/</span><span class=n>DL</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>▼</span>
+</span></span><span class=line><span class=cl><span class=n>context_switch</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>├──</span> <span class=n>prepare_task_switch</span><span class=p>()</span>        <span class=c1># 准备工作</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>├──</span> <span class=n>switch_mm_irqs_off</span><span class=p>()</span>         <span class=c1># 切换地址空间 (页表)</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>       <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>       <span class=err>└──</span> <span class=n>load_new_mm_cr3</span><span class=p>()</span>    <span class=c1># 写CR3寄存器</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>├──</span> <span class=n>switch_to</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>)</span>        <span class=c1># 寄存器切换</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>       <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>       <span class=err>└──</span> <span class=n>__switch_to_asm</span><span class=p>()</span>    <span class=c1># 汇编实现</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>               <span class=err>├──</span> <span class=err>保存</span> <span class=n>callee</span><span class=o>-</span><span class=n>saved</span> <span class=err>寄存器</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>               <span class=err>├──</span> <span class=err>切换栈指针</span> <span class=p>(</span><span class=n>RSP</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>               <span class=err>├──</span> <span class=err>恢复</span> <span class=n>callee</span><span class=o>-</span><span class=n>saved</span> <span class=err>寄存器</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>               <span class=err>└──</span> <span class=n>__switch_to</span><span class=p>()</span>   <span class=c1># C函数</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>                       <span class=err>├──</span> <span class=n>FPU</span> <span class=err>状态切换</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>                       <span class=err>├──</span> <span class=err>段寄存器切换</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>                       <span class=err>├──</span> <span class=n>TLS</span> <span class=err>加载</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>                       <span class=err>└──</span> <span class=err>更新</span> <span class=n>per</span><span class=o>-</span><span class=n>CPU</span> <span class=n>current</span>
+</span></span><span class=line><span class=cl>    <span class=err>│</span>
+</span></span><span class=line><span class=cl>    <span class=err>└──</span> <span class=n>finish_task_switch</span><span class=p>()</span>         <span class=c1># 清理工作</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=22-调用链>2.2 调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>schedule()
+</span></span><span class=line><span class=cl>  └── __schedule()
+</span></span><span class=line><span class=cl>        └── context_switch()
+</span></span><span class=line><span class=cl>              ├── switch_mm_irqs_off()     [地址空间切换]
+</span></span><span class=line><span class=cl>              ├── switch_to()               [宏]
+</span></span><span class=line><span class=cl>              │     └── __switch_to_asm()   [汇编]
+</span></span><span class=line><span class=cl>              │           └── __switch_to() [C函数]
+</span></span><span class=line><span class=cl>              └── finish_task_switch()
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=三核心数据结构>三、核心数据结构</h2><h3 id=31-task_struct进程描述符>3.1 task_struct（进程描述符）</h3><p>每个进程都有一个 <code>task_struct</code>，其中包含了进程的所有信息：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: include/linux/sched.h
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>task_struct</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ... 其他字段 ...
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>mm</span><span class=p>;</span>           <span class=c1>// 进程地址空间
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>active_mm</span><span class=p>;</span>    <span class=c1>// 活动地址空间（内核线程借用）
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=o>*</span><span class=n>stack</span><span class=p>;</span>                    <span class=c1>// 指向内核栈
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>thread_struct</span> <span class=kr>thread</span><span class=p>;</span>    <span class=c1>// 硬件上下文（架构相关）
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// ... 其他字段 ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=32-thread_struct硬件线程上下文>3.2 thread_struct（硬件线程上下文）</h3><p>保存进程的硬件上下文，在上下文切换时保存/恢复：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/include/asm/processor.h
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>thread_struct</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* TLS 描述符 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>desc_struct</span>  <span class=n>tls_array</span><span class=p>[</span><span class=n>GDT_ENTRY_TLS_ENTRIES</span><span class=p>];</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* 内核栈指针 - 上下文切换的核心！ */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>sp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_X86_64
+</span></span></span><span class=line><span class=cl>    <span class=cm>/* 段寄存器 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>short</span>      <span class=n>es</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>short</span>      <span class=n>ds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>short</span>      <span class=n>fsindex</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>short</span>      <span class=n>gsindex</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* FS/GS 基址 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>fsbase</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>gsbase</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 调试寄存器 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>virtual_dr6</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>ptrace_dr7</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* 异常信息 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>cr2</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>trap_nr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>error_code</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* I/O 权限 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>io_bitmap</span>    <span class=o>*</span><span class=n>io_bitmap</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>iopl_emul</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* 内存保护键 */</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span>                 <span class=n>pkru</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* FPU/SSE/AVX 状态 - 必须在最后，大小可变 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fpu</span>          <span class=n>fpu</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=33-pt_regs用户态寄存器帧>3.3 pt_regs（用户态寄存器帧）</h3><p>进入内核时保存用户态寄存器，位于内核栈顶：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/include/asm/ptrace.h (x86-64)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>pt_regs</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* Callee-preserved 寄存器 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r15</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r14</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r13</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r12</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>bp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>bx</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* Callee-clobbered 寄存器 - 进入内核时保存 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r11</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r10</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r9</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r8</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>ax</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>cx</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>dx</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>si</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>di</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* 系统调用号 / 错误码 / IRQ号 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>orig_ax</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* iretq 返回帧 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>ip</span><span class=p>;</span>       <span class=c1>// 用户程序执行位置
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>cs</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>flags</span><span class=p>;</span>    <span class=c1>// RFLAGS
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>sp</span><span class=p>;</span>       <span class=c1>// 用户栈指针
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>ss</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=34-inactive_task_frame上下文切换帧>3.4 inactive_task_frame（上下文切换帧）</h3><p>上下文切换时保存在栈上的寄存器帧：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/include/asm/switch_to.h
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>inactive_task_frame</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_X86_64
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r15</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r14</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r13</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>r12</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=cp>#else
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>flags</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>si</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>di</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>bx</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* 栈帧头，用于栈回溯 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>bp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>ret_addr</span><span class=p>;</span>  <span class=c1>// 切换后的返回地址
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=35-struct-fpufpusimd-状态>3.5 struct fpu（FPU/SIMD 状态）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/include/asm/fpu/types.h
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>fpu</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>     * 记录上次在哪个CPU加载过FPU寄存器
+</span></span></span><span class=line><span class=cl><span class=cm>     * 用于懒惰恢复优化
+</span></span></span><span class=line><span class=cl><span class=cm>     */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span>            <span class=n>last_cpu</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/* AVX512 使用时间戳 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>           <span class=n>avx512_timestamp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>     * FPU 寄存器的内存副本
+</span></span></span><span class=line><span class=cl><span class=cm>     * 上下文切换时保存/恢复
+</span></span></span><span class=line><span class=cl><span class=cm>     */</span>
+</span></span><span class=line><span class=cl>    <span class=k>union</span> <span class=n>fpregs_state</span>      <span class=n>state</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四调度入口分析>四、调度入口分析</h2><h3 id=41-schedule-函数>4.1 schedule() 函数</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: kernel/sched/core.c
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=n>asmlinkage</span> <span class=n>__visible</span> <span class=kt>void</span> <span class=n>__sched</span> <span class=nf>schedule</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span> <span class=o>=</span> <span class=n>current</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 提交异步工作
+</span></span></span><span class=line><span class=cl>    <span class=nf>sched_submit_work</span><span class=p>(</span><span class=n>tsk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=k>do</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 禁用抢占
+</span></span></span><span class=line><span class=cl>        <span class=nf>preempt_disable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        
+</span></span><span class=line><span class=cl>        <span class=c1>// 核心调度函数
+</span></span></span><span class=line><span class=cl>        <span class=nf>__schedule</span><span class=p>(</span><span class=n>SM_NONE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        
+</span></span><span class=line><span class=cl>        <span class=c1>// 重新启用抢占
+</span></span></span><span class=line><span class=cl>        <span class=nf>sched_preempt_enable_no_resched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>while</span> <span class=p>(</span><span class=nf>need_resched</span><span class=p>());</span>  <span class=c1>// 循环直到不再需要重新调度
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=nf>sched_update_worker</span><span class=p>(</span><span class=n>tsk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=nf>EXPORT_SYMBOL</span><span class=p>(</span><span class=n>schedule</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=42-__schedule-函数>4.2 __schedule() 函数</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span><span class=lnt>74
+</span><span class=lnt>75
+</span><span class=lnt>76
+</span><span class=lnt>77
+</span><span class=lnt>78
+</span><span class=lnt>79
+</span><span class=lnt>80
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: kernel/sched/core.c
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=n>__sched</span> <span class=n>notrace</span> <span class=nf>__schedule</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>sched_mode</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>prev</span><span class=p>,</span> <span class=o>*</span><span class=n>next</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>switch_count</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>prev_state</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rq_flags</span> <span class=n>rf</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span><span class=n>rq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>cpu</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 获取当前 CPU 和运行队列
+</span></span></span><span class=line><span class=cl>    <span class=n>cpu</span> <span class=o>=</span> <span class=nf>smp_processor_id</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>rq</span> <span class=o>=</span> <span class=nf>cpu_rq</span><span class=p>(</span><span class=n>cpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>prev</span> <span class=o>=</span> <span class=n>rq</span><span class=o>-&gt;</span><span class=n>curr</span><span class=p>;</span>  <span class=c1>// 当前正在运行的任务
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>schedule_debug</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=o>!!</span><span class=n>sched_mode</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 禁用本地中断
+</span></span></span><span class=line><span class=cl>    <span class=nf>local_irq_disable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=nf>rcu_note_context_switch</span><span class=p>(</span><span class=o>!!</span><span class=n>sched_mode</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 获取运行队列锁
+</span></span></span><span class=line><span class=cl>    <span class=nf>rq_lock</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>smp_mb__after_spinlock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 更新运行队列时钟
+</span></span></span><span class=line><span class=cl>    <span class=n>rq</span><span class=o>-&gt;</span><span class=n>clock_update_flags</span> <span class=o>&lt;&lt;=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>update_rq_clock</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>switch_count</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>nivcsw</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 读取进程状态
+</span></span></span><span class=line><span class=cl>    <span class=n>prev_state</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>__state</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 如果进程不是可运行状态，从队列中移除
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>sched_mode</span> <span class=o>&amp;</span> <span class=n>SM_MASK_PREEMPT</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=n>prev_state</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>signal_pending_state</span><span class=p>(</span><span class=n>prev_state</span><span class=p>,</span> <span class=n>prev</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>__state</span><span class=p>,</span> <span class=n>TASK_RUNNING</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>prev</span><span class=o>-&gt;</span><span class=n>sched_contributes_to_load</span> <span class=o>=</span>
+</span></span><span class=line><span class=cl>                <span class=p>(</span><span class=n>prev_state</span> <span class=o>&amp;</span> <span class=n>TASK_UNINTERRUPTIBLE</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>                <span class=o>!</span><span class=p>(</span><span class=n>prev_state</span> <span class=o>&amp;</span> <span class=n>TASK_NOLOAD</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>                <span class=o>!</span><span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>PF_FROZEN</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>            <span class=nf>deactivate_task</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>DEQUEUE_SLEEP</span> <span class=o>|</span> <span class=n>DEQUEUE_NOCLOCK</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=n>switch_count</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>nvcsw</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 选择下一个要运行的任务
+</span></span></span><span class=line><span class=cl>    <span class=n>next</span> <span class=o>=</span> <span class=nf>pick_next_task</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>clear_tsk_need_resched</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>clear_preempt_need_resched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 如果选择了不同的任务，执行上下文切换
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>likely</span><span class=p>(</span><span class=n>prev</span> <span class=o>!=</span> <span class=n>next</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>rq</span><span class=o>-&gt;</span><span class=n>nr_switches</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        
+</span></span><span class=line><span class=cl>        <span class=c1>// 更新 rq-&gt;curr
+</span></span></span><span class=line><span class=cl>        <span class=nf>RCU_INIT_POINTER</span><span class=p>(</span><span class=n>rq</span><span class=o>-&gt;</span><span class=n>curr</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        
+</span></span><span class=line><span class=cl>        <span class=o>++*</span><span class=n>switch_count</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=nf>migrate_disable_switch</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>psi_sched_switch</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>,</span> <span class=o>!</span><span class=nf>task_on_rq_queued</span><span class=p>(</span><span class=n>prev</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=nf>trace_sched_switch</span><span class=p>(</span><span class=n>sched_mode</span> <span class=o>&amp;</span> <span class=n>SM_MASK_PREEMPT</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// ★★★ 执行上下文切换 ★★★
+</span></span></span><span class=line><span class=cl>        <span class=n>rq</span> <span class=o>=</span> <span class=nf>context_switch</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 没有切换，释放锁
+</span></span></span><span class=line><span class=cl>        <span class=n>rq</span><span class=o>-&gt;</span><span class=n>clock_update_flags</span> <span class=o>&amp;=</span> <span class=o>~</span><span class=p>(</span><span class=n>RQCF_ACT_SKIP</span><span class=o>|</span><span class=n>RQCF_REQ_SKIP</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>rq_unpin_lock</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>__balance_callbacks</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>raw_spin_rq_unlock_irq</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=五上下文切换核心实现>五、上下文切换核心实现</h2><h3 id=51-context_switch-函数>5.1 context_switch() 函数</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: kernel/sched/core.c
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=n>__always_inline</span> <span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span>
+</span></span><span class=line><span class=cl><span class=nf>context_switch</span><span class=p>(</span><span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span><span class=n>rq</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>prev</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>               <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>next</span><span class=p>,</span> <span class=k>struct</span> <span class=n>rq_flags</span> <span class=o>*</span><span class=n>rf</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 准备切换
+</span></span></span><span class=line><span class=cl>    <span class=nf>prepare_task_switch</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 通知架构开始切换（用于虚拟化）
+</span></span></span><span class=line><span class=cl>    <span class=nf>arch_start_context_switch</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>     * 地址空间切换逻辑：
+</span></span></span><span class=line><span class=cl><span class=cm>     * 
+</span></span></span><span class=line><span class=cl><span class=cm>     * kernel -&gt; kernel   lazy + transfer active
+</span></span></span><span class=line><span class=cl><span class=cm>     *   user -&gt; kernel   lazy + mmgrab() active
+</span></span></span><span class=line><span class=cl><span class=cm>     *
+</span></span></span><span class=line><span class=cl><span class=cm>     * kernel -&gt;   user   switch + mmdrop() active
+</span></span></span><span class=line><span class=cl><span class=cm>     *   user -&gt;   user   switch
+</span></span></span><span class=line><span class=cl><span class=cm>     */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>next</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 切换到内核线程
+</span></span></span><span class=line><span class=cl>        <span class=nf>enter_lazy_tlb</span><span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>active_mm</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>next</span><span class=o>-&gt;</span><span class=n>active_mm</span> <span class=o>=</span> <span class=n>prev</span><span class=o>-&gt;</span><span class=n>active_mm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=nf>mmgrab</span><span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>active_mm</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>else</span>
+</span></span><span class=line><span class=cl>            <span class=n>prev</span><span class=o>-&gt;</span><span class=n>active_mm</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 切换到用户进程
+</span></span></span><span class=line><span class=cl>        <span class=nf>membarrier_switch_mm</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=o>-&gt;</span><span class=n>active_mm</span><span class=p>,</span> <span class=n>next</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        
+</span></span><span class=line><span class=cl>        <span class=c1>// ★ 切换页表（地址空间）★
+</span></span></span><span class=line><span class=cl>        <span class=nf>switch_mm_irqs_off</span><span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>active_mm</span><span class=p>,</span> <span class=n>next</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>rq</span><span class=o>-&gt;</span><span class=n>prev_mm</span> <span class=o>=</span> <span class=n>prev</span><span class=o>-&gt;</span><span class=n>active_mm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=n>prev</span><span class=o>-&gt;</span><span class=n>active_mm</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>rq</span><span class=o>-&gt;</span><span class=n>clock_update_flags</span> <span class=o>&amp;=</span> <span class=o>~</span><span class=p>(</span><span class=n>RQCF_ACT_SKIP</span><span class=o>|</span><span class=n>RQCF_REQ_SKIP</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>prepare_lock_switch</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>next</span><span class=p>,</span> <span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ★★★ 切换寄存器和栈 ★★★
+</span></span></span><span class=line><span class=cl>    <span class=nf>switch_to</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>,</span> <span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>barrier</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 完成切换（此时已经是新进程在执行了！）
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>finish_task_switch</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=52-prepare_task_switch-函数>5.2 prepare_task_switch() 函数</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: kernel/sched/core.c
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span>
+</span></span><span class=line><span class=cl><span class=nf>prepare_task_switch</span><span class=p>(</span><span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span><span class=n>rq</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>prev</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                    <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>next</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>kcov_prepare_switch</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sched_info_switch</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>perf_event_task_sched_out</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>rseq_preempt</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>fire_sched_out_preempt_notifiers</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>kmap_local_sched_out</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=nf>prepare_task</span><span class=p>(</span><span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>prepare_arch_switch</span><span class=p>(</span><span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=53-finish_task_switch-函数>5.3 finish_task_switch() 函数</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: kernel/sched/core.c
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span><span class=nf>finish_task_switch</span><span class=p>(</span><span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>prev</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=nf>__releases</span><span class=p>(</span><span class=n>rq</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span><span class=n>rq</span> <span class=o>=</span> <span class=nf>this_rq</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>mm</span> <span class=o>=</span> <span class=n>rq</span><span class=o>-&gt;</span><span class=n>prev_mm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>long</span> <span class=n>prev_state</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 注意：此时 prev 可能在其他 CPU 上运行或已经被释放
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 除了读取 prev-&gt;state，不应该再访问 prev 的其他字段
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>vtime_task_switch</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>perf_event_task_sched_in</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>current</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>finish_task</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tick_nohz_task_switch</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=nf>finish_lock_switch</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>finish_arch_post_lock_switch</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=nf>kcov_finish_switch</span><span class=p>(</span><span class=n>current</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>kmap_local_sched_in</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>fire_sched_in_preempt_notifiers</span><span class=p>(</span><span class=n>current</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 释放之前借用的 mm（如果有）
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>mm</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>membarrier_mm_sync_core_before_usermode</span><span class=p>(</span><span class=n>mm</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>mmdrop</span><span class=p>(</span><span class=n>mm</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 如果前一个进程已经死亡，释放其资源
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=n>prev_state</span> <span class=o>==</span> <span class=n>TASK_DEAD</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>sched_class</span><span class=o>-&gt;</span><span class=n>task_dead</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=n>prev</span><span class=o>-&gt;</span><span class=n>sched_class</span><span class=o>-&gt;</span><span class=nf>task_dead</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=nf>put_task_struct_rcu_user</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>rq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=六地址空间切换>六、地址空间切换</h2><h3 id=61-switch_mm_irqs_off-函数>6.1 switch_mm_irqs_off() 函数</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span><span class=lnt>74
+</span><span class=lnt>75
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/mm/tlb.c
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>switch_mm_irqs_off</span><span class=p>(</span><span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>prev</span><span class=p>,</span> <span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>next</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>real_prev</span> <span class=o>=</span> <span class=nf>this_cpu_read</span><span class=p>(</span><span class=n>cpu_tlbstate</span><span class=p>.</span><span class=n>loaded_mm</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>u16</span> <span class=n>prev_asid</span> <span class=o>=</span> <span class=nf>this_cpu_read</span><span class=p>(</span><span class=n>cpu_tlbstate</span><span class=p>.</span><span class=n>loaded_mm_asid</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>was_lazy</span> <span class=o>=</span> <span class=nf>this_cpu_read</span><span class=p>(</span><span class=n>cpu_tlbstate_shared</span><span class=p>.</span><span class=n>is_lazy</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=n>cpu</span> <span class=o>=</span> <span class=nf>smp_processor_id</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>u64</span> <span class=n>next_tlb_gen</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>need_flush</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u16</span> <span class=n>new_asid</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 确保中断已禁用
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>IS_ENABLED</span><span class=p>(</span><span class=n>CONFIG_PROVE_LOCKING</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=nf>WARN_ON_ONCE</span><span class=p>(</span><span class=o>!</span><span class=nf>irqs_disabled</span><span class=p>());</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 验证 CR3 的正确性（调试模式）
+</span></span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_DEBUG_VM
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>WARN_ON_ONCE</span><span class=p>(</span><span class=nf>__read_cr3</span><span class=p>()</span> <span class=o>!=</span> <span class=nf>build_cr3</span><span class=p>(</span><span class=n>real_prev</span><span class=o>-&gt;</span><span class=n>pgd</span><span class=p>,</span> <span class=n>prev_asid</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>__flush_tlb_all</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>was_lazy</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>this_cpu_write</span><span class=p>(</span><span class=n>cpu_tlbstate_shared</span><span class=p>.</span><span class=n>is_lazy</span><span class=p>,</span> <span class=nb>false</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 如果切换到同一个 mm，可能只需要刷新
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>real_prev</span> <span class=o>==</span> <span class=n>next</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ... 懒惰切换优化 ...
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 应用安全缓解措施
+</span></span></span><span class=line><span class=cl>    <span class=nf>cond_mitigation</span><span class=p>(</span><span class=n>tsk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 更新 CPU 掩码
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>real_prev</span> <span class=o>!=</span> <span class=o>&amp;</span><span class=n>init_mm</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>cpumask_clear_cpu</span><span class=p>(</span><span class=n>cpu</span><span class=p>,</span> <span class=nf>mm_cpumask</span><span class=p>(</span><span class=n>real_prev</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>next</span> <span class=o>!=</span> <span class=o>&amp;</span><span class=n>init_mm</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>cpumask_set_cpu</span><span class=p>(</span><span class=n>cpu</span><span class=p>,</span> <span class=nf>mm_cpumask</span><span class=p>(</span><span class=n>next</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 获取 TLB 代数
+</span></span></span><span class=line><span class=cl>    <span class=n>next_tlb_gen</span> <span class=o>=</span> <span class=nf>atomic64_read</span><span class=p>(</span><span class=o>&amp;</span><span class=n>next</span><span class=o>-&gt;</span><span class=n>context</span><span class=p>.</span><span class=n>tlb_gen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 选择新的 ASID
+</span></span></span><span class=line><span class=cl>    <span class=nf>choose_new_asid</span><span class=p>(</span><span class=n>next</span><span class=p>,</span> <span class=n>next_tlb_gen</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>new_asid</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>need_flush</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 标记正在切换
+</span></span></span><span class=line><span class=cl>    <span class=nf>this_cpu_write</span><span class=p>(</span><span class=n>cpu_tlbstate</span><span class=p>.</span><span class=n>loaded_mm</span><span class=p>,</span> <span class=n>LOADED_MM_SWITCHING</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>barrier</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ★★★ 加载新的页表到 CR3 ★★★
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>need_flush</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>this_cpu_write</span><span class=p>(</span><span class=n>cpu_tlbstate</span><span class=p>.</span><span class=n>ctxs</span><span class=p>[</span><span class=n>new_asid</span><span class=p>].</span><span class=n>ctx_id</span><span class=p>,</span> <span class=n>next</span><span class=o>-&gt;</span><span class=n>context</span><span class=p>.</span><span class=n>ctx_id</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>this_cpu_write</span><span class=p>(</span><span class=n>cpu_tlbstate</span><span class=p>.</span><span class=n>ctxs</span><span class=p>[</span><span class=n>new_asid</span><span class=p>].</span><span class=n>tlb_gen</span><span class=p>,</span> <span class=n>next_tlb_gen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>load_new_mm_cr3</span><span class=p>(</span><span class=n>next</span><span class=o>-&gt;</span><span class=n>pgd</span><span class=p>,</span> <span class=n>new_asid</span><span class=p>,</span> <span class=nb>true</span><span class=p>);</span>  <span class=c1>// 刷新 TLB
+</span></span></span><span class=line><span class=cl>        <span class=nf>trace_tlb_flush</span><span class=p>(</span><span class=n>TLB_FLUSH_ON_TASK_SWITCH</span><span class=p>,</span> <span class=n>TLB_FLUSH_ALL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>load_new_mm_cr3</span><span class=p>(</span><span class=n>next</span><span class=o>-&gt;</span><span class=n>pgd</span><span class=p>,</span> <span class=n>new_asid</span><span class=p>,</span> <span class=nb>false</span><span class=p>);</span> <span class=c1>// 不刷新（使用 PCID）
+</span></span></span><span class=line><span class=cl>        <span class=nf>trace_tlb_flush</span><span class=p>(</span><span class=n>TLB_FLUSH_ON_TASK_SWITCH</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>barrier</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 更新状态
+</span></span></span><span class=line><span class=cl>    <span class=nf>this_cpu_write</span><span class=p>(</span><span class=n>cpu_tlbstate</span><span class=p>.</span><span class=n>loaded_mm</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>this_cpu_write</span><span class=p>(</span><span class=n>cpu_tlbstate</span><span class=p>.</span><span class=n>loaded_mm_asid</span><span class=p>,</span> <span class=n>new_asid</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>next</span> <span class=o>!=</span> <span class=n>real_prev</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>cr4_update_pce_mm</span><span class=p>(</span><span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>switch_ldt</span><span class=p>(</span><span class=n>real_prev</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>  <span class=c1>// 切换 LDT
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=62-load_new_mm_cr3>6.2 load_new_mm_cr3()</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/mm/tlb.c
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>load_new_mm_cr3</span><span class=p>(</span><span class=kt>pgd_t</span> <span class=o>*</span><span class=n>pgdir</span><span class=p>,</span> <span class=n>u16</span> <span class=n>new_asid</span><span class=p>,</span> <span class=kt>bool</span> <span class=n>need_flush</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>new_mm_cr3</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>need_flush</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>invalidate_user_asid</span><span class=p>(</span><span class=n>new_asid</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>new_mm_cr3</span> <span class=o>=</span> <span class=nf>build_cr3</span><span class=p>(</span><span class=n>pgdir</span><span class=p>,</span> <span class=n>new_asid</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>new_mm_cr3</span> <span class=o>=</span> <span class=nf>build_cr3_noflush</span><span class=p>(</span><span class=n>pgdir</span><span class=p>,</span> <span class=n>new_asid</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ★ 写入 CR3 寄存器，切换页表 ★
+</span></span></span><span class=line><span class=cl>    <span class=nf>write_cr3</span><span class=p>(</span><span class=n>new_mm_cr3</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=七寄存器切换汇编层>七、寄存器切换（汇编层）</h2><h3 id=71-switch_to-宏>7.1 switch_to 宏</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/include/asm/switch_to.h
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#define switch_to(prev, next, last)                 \
+</span></span></span><span class=line><span class=cl><span class=cp>do {                                                \
+</span></span></span><span class=line><span class=cl><span class=cp>    ((last) = __switch_to_asm((prev), (next)));     \
+</span></span></span><span class=line><span class=cl><span class=cp>} while (0)
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=72-__switch_to_asmx86-64>7.2 __switch_to_asm（x86-64）</h3><p>这是上下文切换最核心的代码：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-asm data-lang=asm><span class=line><span class=cl><span class=c1>// 文件: arch/x86/entry/entry_64.S
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm> * %rdi: prev task
+</span></span></span><span class=line><span class=cl><span class=cm> * %rsi: next task
+</span></span></span><span class=line><span class=cl><span class=cm> */</span>
+</span></span><span class=line><span class=cl><span class=na>.pushsection</span> <span class=no>.text</span><span class=p>,</span> <span class=s>&#34;ax&#34;</span>
+</span></span><span class=line><span class=cl><span class=nf>SYM_FUNC_START</span><span class=p>(</span><span class=no>__switch_to_asm</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>     * 保存 callee-saved 寄存器
+</span></span></span><span class=line><span class=cl><span class=cm>     * 顺序必须与 inactive_task_frame 结构匹配
+</span></span></span><span class=line><span class=cl><span class=cm>     */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>pushq</span>   <span class=nv>%rbp</span>
+</span></span><span class=line><span class=cl>    <span class=nf>pushq</span>   <span class=nv>%rbx</span>
+</span></span><span class=line><span class=cl>    <span class=nf>pushq</span>   <span class=nv>%r12</span>
+</span></span><span class=line><span class=cl>    <span class=nf>pushq</span>   <span class=nv>%r13</span>
+</span></span><span class=line><span class=cl>    <span class=nf>pushq</span>   <span class=nv>%r14</span>
+</span></span><span class=line><span class=cl>    <span class=nf>pushq</span>   <span class=nv>%r15</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ★★★ 切换栈指针 - 这是上下文切换的核心！★★★ */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>movq</span>    <span class=nv>%rsp</span><span class=p>,</span> <span class=no>TASK_threadsp</span><span class=p>(</span><span class=nv>%rdi</span><span class=p>)</span>    <span class=cm>/* 保存 prev 的栈指针 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>movq</span>    <span class=no>TASK_threadsp</span><span class=p>(</span><span class=nv>%rsi</span><span class=p>),</span> <span class=nv>%rsp</span>    <span class=cm>/* 加载 next 的栈指针 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>#ifdef CONFIG_STACKPROTECTOR
+</span></span></span><span class=line><span class=cl>    <span class=cm>/* 更新栈保护金丝雀 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>movq</span>    <span class=no>TASK_stack_canary</span><span class=p>(</span><span class=nv>%rsi</span><span class=p>),</span> <span class=nv>%rbx</span>
+</span></span><span class=line><span class=cl>    <span class=nf>movq</span>    <span class=nv>%rbx</span><span class=p>,</span> <span class=no>PER_CPU_VAR</span><span class=p>(</span><span class=no>fixed_percpu_data</span><span class=p>)</span> <span class=err>+</span> <span class=no>stack_canary_offset</span>
+</span></span><span class=line><span class=cl><span class=c1>#endif
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm>     * RSB (Return Stack Buffer) 填充
+</span></span></span><span class=line><span class=cl><span class=cm>     * 防止推测执行攻击
+</span></span></span><span class=line><span class=cl><span class=cm>     */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>FILL_RETURN_BUFFER</span> <span class=nv>%r12</span><span class=p>,</span> <span class=no>RSB_CLEAR_LOOPS</span><span class=p>,</span> <span class=no>X86_FEATURE_RSB_CTXSW</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 恢复 callee-saved 寄存器（从新栈弹出）*/</span>
+</span></span><span class=line><span class=cl>    <span class=nf>popq</span>    <span class=nv>%r15</span>
+</span></span><span class=line><span class=cl>    <span class=nf>popq</span>    <span class=nv>%r14</span>
+</span></span><span class=line><span class=cl>    <span class=nf>popq</span>    <span class=nv>%r13</span>
+</span></span><span class=line><span class=cl>    <span class=nf>popq</span>    <span class=nv>%r12</span>
+</span></span><span class=line><span class=cl>    <span class=nf>popq</span>    <span class=nv>%rbx</span>
+</span></span><span class=line><span class=cl>    <span class=nf>popq</span>    <span class=nv>%rbp</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 跳转到 C 函数完成剩余工作 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>jmp</span>     <span class=no>__switch_to</span>
+</span></span><span class=line><span class=cl><span class=nf>SYM_FUNC_END</span><span class=p>(</span><span class=no>__switch_to_asm</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=na>.popsection</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=73-栈切换图解>7.3 栈切换图解</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>切换前：                              切换后：
+</span></span><span class=line><span class=cl>                                     
+</span></span><span class=line><span class=cl>进程A的栈                             进程B的栈
+</span></span><span class=line><span class=cl>┌─────────────┐                      ┌─────────────┐
+</span></span><span class=line><span class=cl>│    ...      │                      │    ...      │
+</span></span><span class=line><span class=cl>├─────────────┤                      ├─────────────┤
+</span></span><span class=line><span class=cl>│    r15      │                      │    r15      │ ← pop
+</span></span><span class=line><span class=cl>│    r14      │                      │    r14      │ ← pop
+</span></span><span class=line><span class=cl>│    r13      │                      │    r13      │ ← pop
+</span></span><span class=line><span class=cl>│    r12      │                      │    r12      │ ← pop
+</span></span><span class=line><span class=cl>│    rbx      │                      │    rbx      │ ← pop
+</span></span><span class=line><span class=cl>│    rbp      │                      │    rbp      │ ← pop
+</span></span><span class=line><span class=cl>├─────────────┤ ← RSP (保存到       ├─────────────┤ ← RSP (从
+</span></span><span class=line><span class=cl>│    ...      │    A-&gt;thread.sp)     │    ...      │    B-&gt;thread.sp 加载)
+</span></span><span class=line><span class=cl>└─────────────┘                      └─────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>1. 把寄存器压入A的栈
+</span></span><span class=line><span class=cl>2. 保存A的RSP到A-&gt;thread.sp
+</span></span><span class=line><span class=cl>3. 从B-&gt;thread.sp加载RSP（栈切换！）
+</span></span><span class=line><span class=cl>4. 从B的栈弹出寄存器
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=八硬件上下文切换c层>八、硬件上下文切换（C层）</h2><h3 id=81-__switch_tox86-64>8.1 __switch_to()（x86-64）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/kernel/process_64.c
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=n>__visible</span> <span class=n>__notrace_funcgraph</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span>
+</span></span><span class=line><span class=cl><span class=nf>__switch_to</span><span class=p>(</span><span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>prev_p</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>next_p</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>thread_struct</span> <span class=o>*</span><span class=n>prev</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>prev_p</span><span class=o>-&gt;</span><span class=kr>thread</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>thread_struct</span> <span class=o>*</span><span class=n>next</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>next_p</span><span class=o>-&gt;</span><span class=kr>thread</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fpu</span> <span class=o>*</span><span class=n>prev_fpu</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>fpu</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fpu</span> <span class=o>*</span><span class=n>next_fpu</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>next</span><span class=o>-&gt;</span><span class=n>fpu</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>cpu</span> <span class=o>=</span> <span class=nf>smp_processor_id</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>WARN_ON_ONCE</span><span class=p>(</span><span class=nf>IS_ENABLED</span><span class=p>(</span><span class=n>CONFIG_DEBUG_ENTRY</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>                 <span class=nf>this_cpu_read</span><span class=p>(</span><span class=n>hardirq_stack_inuse</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 1. 保存 FPU 状态 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>test_thread_flag</span><span class=p>(</span><span class=n>TIF_NEED_FPU_LOAD</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=nf>switch_fpu_prepare</span><span class=p>(</span><span class=n>prev_fpu</span><span class=p>,</span> <span class=n>cpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 2. 保存 FS/GS 段寄存器 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>save_fsgs</span><span class=p>(</span><span class=n>prev_p</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 3. 加载新任务的 TLS 描述符 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>load_TLS</span><span class=p>(</span><span class=n>next</span><span class=p>,</span> <span class=n>cpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 4. 结束懒惰模式（虚拟化相关）*/</span>
+</span></span><span class=line><span class=cl>    <span class=nf>arch_end_context_switch</span><span class=p>(</span><span class=n>next_p</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 5. 切换 DS 和 ES 段寄存器 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>savesegment</span><span class=p>(</span><span class=n>es</span><span class=p>,</span> <span class=n>prev</span><span class=o>-&gt;</span><span class=n>es</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=n>next</span><span class=o>-&gt;</span><span class=n>es</span> <span class=o>|</span> <span class=n>prev</span><span class=o>-&gt;</span><span class=n>es</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=nf>loadsegment</span><span class=p>(</span><span class=n>es</span><span class=p>,</span> <span class=n>next</span><span class=o>-&gt;</span><span class=n>es</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>savesegment</span><span class=p>(</span><span class=n>ds</span><span class=p>,</span> <span class=n>prev</span><span class=o>-&gt;</span><span class=n>ds</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=n>next</span><span class=o>-&gt;</span><span class=n>ds</span> <span class=o>|</span> <span class=n>prev</span><span class=o>-&gt;</span><span class=n>ds</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=nf>loadsegment</span><span class=p>(</span><span class=n>ds</span><span class=p>,</span> <span class=n>next</span><span class=o>-&gt;</span><span class=n>ds</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 6. 加载 FS/GS base */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>x86_fsgsbase_load</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 7. 加载 PKRU（内存保护键）*/</span>
+</span></span><span class=line><span class=cl>    <span class=nf>x86_pkru_load</span><span class=p>(</span><span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 8. 更新 per-CPU 变量 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>this_cpu_write</span><span class=p>(</span><span class=n>current_task</span><span class=p>,</span> <span class=n>next_p</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>this_cpu_write</span><span class=p>(</span><span class=n>cpu_current_top_of_stack</span><span class=p>,</span> <span class=nf>task_top_of_stack</span><span class=p>(</span><span class=n>next_p</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 9. 完成 FPU 切换 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>switch_fpu_finish</span><span class=p>(</span><span class=n>next_fpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 10. 更新内核栈指针 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>update_task_stack</span><span class=p>(</span><span class=n>next_p</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 11. 处理额外切换（I/O 权限位图等）*/</span>
+</span></span><span class=line><span class=cl>    <span class=nf>switch_to_extra</span><span class=p>(</span><span class=n>prev_p</span><span class=p>,</span> <span class=n>next_p</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 12. AMD SYSRET 问题修复 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>static_cpu_has_bug</span><span class=p>(</span><span class=n>X86_BUG_SYSRET_SS_ATTRS</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>short</span> <span class=n>ss_sel</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=nf>savesegment</span><span class=p>(</span><span class=n>ss</span><span class=p>,</span> <span class=n>ss_sel</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>ss_sel</span> <span class=o>!=</span> <span class=n>__KERNEL_DS</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=nf>loadsegment</span><span class=p>(</span><span class=n>ss</span><span class=p>,</span> <span class=n>__KERNEL_DS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* 返回 prev，用于 finish_task_switch() */</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>prev_p</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=82-fpu-状态切换>8.2 FPU 状态切换</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/include/asm/fpu/internal.h
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm> * FPU 切换采用&#34;懒惰&#34;策略：
+</span></span></span><span class=line><span class=cl><span class=cm> * - switch_fpu_prepare() 保存旧状态
+</span></span></span><span class=line><span class=cl><span class=cm> * - switch_fpu_finish() 设置 TIF_NEED_FPU_LOAD 标志
+</span></span></span><span class=line><span class=cl><span class=cm> * - 实际加载在返回用户态或内核使用FPU时进行
+</span></span></span><span class=line><span class=cl><span class=cm> */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>switch_fpu_prepare</span><span class=p>(</span><span class=k>struct</span> <span class=n>fpu</span> <span class=o>*</span><span class=n>old_fpu</span><span class=p>,</span> <span class=kt>int</span> <span class=n>cpu</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>static_cpu_has</span><span class=p>(</span><span class=n>X86_FEATURE_FPU</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=p>(</span><span class=n>current</span><span class=o>-&gt;</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>PF_KTHREAD</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 保存 FPU 寄存器到内存
+</span></span></span><span class=line><span class=cl>        <span class=nf>save_fpregs_to_fpstate</span><span class=p>(</span><span class=n>old_fpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        
+</span></span><span class=line><span class=cl>        <span class=c1>// 记录上次运行的 CPU（用于懒惰恢复优化）
+</span></span></span><span class=line><span class=cl>        <span class=n>old_fpu</span><span class=o>-&gt;</span><span class=n>last_cpu</span> <span class=o>=</span> <span class=n>cpu</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=nf>trace_x86_fpu_regs_deactivated</span><span class=p>(</span><span class=n>old_fpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>switch_fpu_finish</span><span class=p>(</span><span class=k>struct</span> <span class=n>fpu</span> <span class=o>*</span><span class=n>new_fpu</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 设置标志，表示需要在返回用户态时加载 FPU
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>cpu_feature_enabled</span><span class=p>(</span><span class=n>X86_FEATURE_FPU</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=nf>set_thread_flag</span><span class=p>(</span><span class=n>TIF_NEED_FPU_LOAD</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=九上下文信息保存位置>九、上下文信息保存位置</h2><h3 id=91-保存位置总览>9.1 保存位置总览</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                      task_struct                            │
+</span></span><span class=line><span class=cl>│  (进程描述符，每个进程一个，位于内核内存)                     │
+</span></span><span class=line><span class=cl>│                                                             │
+</span></span><span class=line><span class=cl>│  ├── thread_struct thread    ← 硬件上下文                   │
+</span></span><span class=line><span class=cl>│  │     ├── sp (内核栈指针)    ★ 上下文切换核心              │
+</span></span><span class=line><span class=cl>│  │     ├── fs/gs base                                       │
+</span></span><span class=line><span class=cl>│  │     ├── TLS描述符                                        │
+</span></span><span class=line><span class=cl>│  │     ├── fpu (FPU/SSE/AVX状态)                           │
+</span></span><span class=line><span class=cl>│  │     └── ...                                              │
+</span></span><span class=line><span class=cl>│  │                                                          │
+</span></span><span class=line><span class=cl>│  └── void *stack            ← 指向内核栈                    │
+</span></span><span class=line><span class=cl>│                                                             │
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                          │
+</span></span><span class=line><span class=cl>                          ▼
+</span></span><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                    内核栈 (Kernel Stack)                     │
+</span></span><span class=line><span class=cl>│                    大小: 16KB (x86-64)                       │
+</span></span><span class=line><span class=cl>│                                                             │
+</span></span><span class=line><span class=cl>│  栈顶 (高地址) ─────────────────────────────────────────────│
+</span></span><span class=line><span class=cl>│  │   struct pt_regs         ← 用户态寄存器 (系统调用/中断时)│
+</span></span><span class=line><span class=cl>│  │   ├── rax, rbx, rcx...                                   │
+</span></span><span class=line><span class=cl>│  │   ├── rip, rsp, rflags                                   │
+</span></span><span class=line><span class=cl>│  │   └── cs, ss                                             │
+</span></span><span class=line><span class=cl>│  │                                                          │
+</span></span><span class=line><span class=cl>│  │   ... 函数调用帧 ...                                      │
+</span></span><span class=line><span class=cl>│  │                                                          │
+</span></span><span class=line><span class=cl>│  │   struct inactive_task_frame  ← 上下文切换时的寄存器     │
+</span></span><span class=line><span class=cl>│  │   ├── r15, r14, r13, r12                                 │
+</span></span><span class=line><span class=cl>│  │   ├── rbx, rbp                                           │
+</span></span><span class=line><span class=cl>│  │   └── ret_addr          ★ 切换后从这里继续执行           │
+</span></span><span class=line><span class=cl>│  ▼                                                          │
+</span></span><span class=line><span class=cl>│  栈底 (低地址) ─────────────────────────────────────────────│
+</span></span><span class=line><span class=cl>│                                                             │
+</span></span><span class=line><span class=cl>│  thread.sp ──────────────────────→ 指向 inactive_task_frame │
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=92-内核栈大小>9.2 内核栈大小</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件: arch/x86/include/asm/page_64_types.h
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#define THREAD_SIZE_ORDER   (2 + KASAN_STACK_ORDER)
+</span></span></span><span class=line><span class=cl><span class=cp>#define THREAD_SIZE         (PAGE_SIZE &lt;&lt; THREAD_SIZE_ORDER)
+</span></span></span><span class=line><span class=cl><span class=c1>// x86-64: THREAD_SIZE = 4KB × 4 = 16KB
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=93-保存内容详表>9.3 保存内容详表</h3><div class=table-wrapper><table><thead><tr><th>类别</th><th>保存内容</th><th>保存位置</th><th>保存时机</th></tr></thead><tbody><tr><td><strong>CPU通用寄存器</strong></td><td>RAX, RBX, RCX, RDX, RSI, RDI, R8-R15</td><td><code>pt_regs</code> (栈上)</td><td>进入内核时</td></tr><tr><td><strong>栈指针</strong></td><td>RSP</td><td><code>thread.sp</code></td><td>上下文切换时</td></tr><tr><td><strong>帧指针</strong></td><td>RBP</td><td>栈上 (inactive_task_frame)</td><td>上下文切换时</td></tr><tr><td><strong>指令指针</strong></td><td>RIP</td><td><code>pt_regs</code> / 栈返回地址</td><td>进入内核时</td></tr><tr><td><strong>标志寄存器</strong></td><td>RFLAGS</td><td><code>pt_regs</code> (栈上)</td><td>进入内核时</td></tr><tr><td><strong>段寄存器</strong></td><td>CS, SS, DS, ES, FS, GS</td><td><code>pt_regs</code> + <code>thread</code></td><td>切换时保存</td></tr><tr><td><strong>FS/GS Base</strong></td><td>fsbase, gsbase</td><td><code>thread.fsbase/gsbase</code></td><td><code>__switch_to()</code></td></tr><tr><td><strong>FPU/SSE/AVX</strong></td><td>XMM0-15, YMM, ZMM, MXCSR</td><td><code>thread.fpu.state</code></td><td><code>switch_fpu_prepare()</code></td></tr><tr><td><strong>TLS描述符</strong></td><td>线程本地存储</td><td><code>thread.tls_array[]</code></td><td><code>load_TLS()</code></td></tr><tr><td><strong>页表基址</strong></td><td>CR3</td><td><code>mm_struct.pgd</code></td><td><code>switch_mm_irqs_off()</code></td></tr><tr><td><strong>调试寄存器</strong></td><td>DR0-DR7</td><td><code>thread.ptrace_dr7</code> 等</td><td>需要时</td></tr><tr><td><strong>I/O权限</strong></td><td>IOPL, I/O位图</td><td><code>thread.io_bitmap</code></td><td><code>switch_to_extra()</code></td></tr><tr><td><strong>PKRU</strong></td><td>内存保护键</td><td><code>thread.pkru</code></td><td><code>x86_pkru_load()</code></td></tr></tbody></table></div><hr><h2 id=十系统调用与上下文切换的区别>十、系统调用与上下文切换的区别</h2><h3 id=101-系统调用流程>10.1 系统调用流程</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌────────────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                           系统调用流程                                  │
+</span></span><span class=line><span class=cl>├────────────────────────────────────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>│  用户态                              内核态                            │
+</span></span><span class=line><span class=cl>│  ┌──────────┐                       ┌──────────┐                      │
+</span></span><span class=line><span class=cl>│  │ 程序代码  │                       │ 内核代码  │                      │
+</span></span><span class=line><span class=cl>│  │          │                       │          │                      │
+</span></span><span class=line><span class=cl>│  │ printf() │                       │ sys_write│                      │
+</span></span><span class=line><span class=cl>│  │    │     │                       │    │     │                      │
+</span></span><span class=line><span class=cl>│  │    ▼     │                       │    ▼     │                      │
+</span></span><span class=line><span class=cl>│  │ syscall  │ ─────────────────────→│ 入口代码  │                      │
+</span></span><span class=line><span class=cl>│  │ 指令     │    ① 保存用户态寄存器 │          │                      │
+</span></span><span class=line><span class=cl>│  │          │       到 pt_regs      │          │                      │
+</span></span><span class=line><span class=cl>│  │          │                       │ 执行内核 │                      │
+</span></span><span class=line><span class=cl>│  │          │                       │ 代码     │                      │
+</span></span><span class=line><span class=cl>│  │          │ ←────────────────────│          │                      │
+</span></span><span class=line><span class=cl>│  │ 继续执行  │    ② 恢复用户态寄存器 │ sysret   │                      │
+</span></span><span class=line><span class=cl>│  │          │       从 pt_regs      │          │                      │
+</span></span><span class=line><span class=cl>│  └──────────┘                       └──────────┘                      │
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>│  ★ 始终是同一个进程！                                                  │
+</span></span><span class=line><span class=cl>│  ★ 不需要保存内核态信息（执行完就丢弃）                                 │
+</span></span><span class=line><span class=cl>│  ★ 这是&#34;模式切换&#34;，不是&#34;上下文切换&#34;                                    │
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>└────────────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=102-上下文切换流程>10.2 上下文切换流程</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌────────────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                           上下文切换流程                                │
+</span></span><span class=line><span class=cl>├────────────────────────────────────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>│  进程A内核态                          进程B内核态                       │
+</span></span><span class=line><span class=cl>│  ┌──────────┐                        ┌──────────┐                     │
+</span></span><span class=line><span class=cl>│  │ 执行中... │                        │ 之前睡眠 │                     │
+</span></span><span class=line><span class=cl>│  │          │                        │ 在此处   │                     │
+</span></span><span class=line><span class=cl>│  │ schedule │                        │          │                     │
+</span></span><span class=line><span class=cl>│  │    │     │                        │          │                     │
+</span></span><span class=line><span class=cl>│  │    ▼     │                        │          │                     │
+</span></span><span class=line><span class=cl>│  │context_  │                        │          │                     │
+</span></span><span class=line><span class=cl>│  │ switch   │ ─────────────────────→ │ 恢复执行 │                     │
+</span></span><span class=line><span class=cl>│  │          │  ① 保存A的寄存器       │          │                     │
+</span></span><span class=line><span class=cl>│  │          │  ② 保存A的栈指针       │          │                     │
+</span></span><span class=line><span class=cl>│  │          │  ③ 切换页表            │          │                     │
+</span></span><span class=line><span class=cl>│  │          │  ④ 加载B的栈指针       │          │                     │
+</span></span><span class=line><span class=cl>│  │          │  ⑤ 恢复B的寄存器       │          │                     │
+</span></span><span class=line><span class=cl>│  │  (睡眠)  │                        │ 继续执行 │                     │
+</span></span><span class=line><span class=cl>│  └──────────┘                        └──────────┘                     │
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>│  ★ 换了一个进程！                                                      │
+</span></span><span class=line><span class=cl>│  ★ 需要保存完整的上下文                                                │
+</span></span><span class=line><span class=cl>│  ★ 这才是真正的&#34;上下文切换&#34;                                            │
+</span></span><span class=line><span class=cl>│                                                                        │
+</span></span><span class=line><span class=cl>└────────────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=103-时间线对比>10.3 时间线对比</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时间 ──────────────────────────────────────────────────────────────────→
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>【系统调用】（无上下文切换）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>进程A: [用户态] ──syscall──→ [内核态] ──sysret──→ [用户态]
+</span></span><span class=line><span class=cl>                   │                        │
+</span></span><span class=line><span class=cl>              保存pt_regs              恢复pt_regs
+</span></span><span class=line><span class=cl>              (同一进程)               (同一进程)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>【上下文切换】
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>进程A: [用户态] ─→ [内核态] ─→ [睡眠........................] ─→ [内核态] ─→ [用户态]
+</span></span><span class=line><span class=cl>                        │                                          ↑
+</span></span><span class=line><span class=cl>                   保存上下文                                  恢复上下文
+</span></span><span class=line><span class=cl>                   到A的栈+thread                             从A的栈+thread
+</span></span><span class=line><span class=cl>                        │                                          │
+</span></span><span class=line><span class=cl>                        └──────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                                          ↑
+</span></span><span class=line><span class=cl>                                    (可能很长时间)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>进程B:       [睡眠...] ─→ [内核态] ─→ [用户态] ─→ [内核态] ─→ [睡眠...]
+</span></span><span class=line><span class=cl>                              ↑
+</span></span><span class=line><span class=cl>                         从这里切入
+</span></span></code></pre></td></tr></table></div></div><h3 id=104-关键区别总结>10.4 关键区别总结</h3><div class=table-wrapper><table><thead><tr><th>比较项</th><th>系统调用</th><th>上下文切换</th></tr></thead><tbody><tr><td><strong>进程变化</strong></td><td>同一进程</td><td>不同进程</td></tr><tr><td><strong>特权级变化</strong></td><td>Ring 3 → Ring 0 → Ring 3</td><td>保持 Ring 0</td></tr><tr><td><strong>页表切换</strong></td><td>不需要</td><td>需要（如果进程不同）</td></tr><tr><td><strong>保存用户态寄存器</strong></td><td>是（pt_regs）</td><td>之前已保存</td></tr><tr><td><strong>保存内核态寄存器</strong></td><td>不需要</td><td>需要</td></tr><tr><td><strong>保存栈指针</strong></td><td>不需要</td><td>需要（thread.sp）</td></tr><tr><td><strong>FPU 切换</strong></td><td>不需要</td><td>需要</td></tr><tr><td><strong>TLB 影响</strong></td><td>无</td><td>可能刷新</td></tr><tr><td><strong>开销</strong></td><td>较小（~100 cycles）</td><td>较大（~1000+ cycles）</td></tr></tbody></table></div><hr><h2 id=十一总结>十一、总结</h2><h3 id=111-上下文切换的本质>11.1 上下文切换的本质</h3><p><strong>上下文切换的核心是栈切换</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// __switch_to_asm 中最关键的两行：
+</span></span></span><span class=line><span class=cl><span class=n>movq</span>  <span class=o>%</span><span class=n>rsp</span><span class=p>,</span> <span class=nf>TASK_threadsp</span><span class=p>(</span><span class=o>%</span><span class=n>rdi</span><span class=p>)</span>   <span class=c1>// 保存当前栈指针到 prev-&gt;thread.sp
+</span></span></span><span class=line><span class=cl><span class=n>movq</span>  <span class=nf>TASK_threadsp</span><span class=p>(</span><span class=o>%</span><span class=n>rsi</span><span class=p>),</span> <span class=o>%</span><span class=n>rsp</span>   <span class=c1>// 从 next-&gt;thread.sp 加载新栈指针
+</span></span></span></code></pre></td></tr></table></div></div><p>一旦栈指针切换：</p><ul><li>后续的 <code>pop</code> 从新栈取数据</li><li><code>ret</code> 跳转到新栈上保存的返回地址</li><li>&ldquo;魔法般"地切换到了另一个进程</li></ul><h3 id=112-上下文切换涉及的内容>11.2 上下文切换涉及的内容</h3><ol><li><p><strong>CPU 寄存器</strong></p><ul><li>通用寄存器 (RAX-R15)</li><li>栈指针 (RSP, RBP)</li><li>段寄存器 (CS, SS, DS, ES, FS, GS)</li><li>FS/GS Base</li><li>标志寄存器 (RFLAGS)</li></ul></li><li><p><strong>FPU/SIMD 状态</strong></p><ul><li>x87 FPU 寄存器</li><li>SSE 寄存器 (XMM0-15)</li><li>AVX 寄存器 (YMM, ZMM)</li><li>MXCSR</li></ul></li><li><p><strong>地址空间</strong></p><ul><li>页表 (CR3)</li><li>TLB（可能需要刷新）</li><li>LDT</li></ul></li><li><p><strong>其他硬件状态</strong></p><ul><li>TLS 描述符</li><li>I/O 权限位图</li><li>PKRU（内存保护键）</li><li>调试寄存器</li></ul></li></ol><h3 id=113-保存位置>11.3 保存位置</h3><div class=table-wrapper><table><thead><tr><th>信息类型</th><th>保存位置</th></tr></thead><tbody><tr><td>用户态寄存器</td><td>内核栈顶 (<code>pt_regs</code>)</td></tr><tr><td>内核栈指针</td><td><code>task_struct.thread.sp</code></td></tr><tr><td>内核态寄存器</td><td>各自的内核栈 (<code>inactive_task_frame</code>)</td></tr><tr><td>FPU/SIMD</td><td><code>task_struct.thread.fpu</code></td></tr><tr><td>段寄存器</td><td><code>task_struct.thread</code></td></tr><tr><td>页表</td><td><code>mm_struct.pgd</code></td></tr></tbody></table></div><h3 id=114-一句话总结>11.4 一句话总结</h3><blockquote><p><strong>上下文切换 = 保存当前进程的 CPU 状态到内存 + 从内存恢复另一个进程的 CPU 状态</strong></p><p><strong>核心技巧：通过切换栈指针 (RSP)，让 <code>ret</code> 指令自然跳转到新进程的执行位置</strong></p></blockquote><hr><h2 id=参考文件>参考文件</h2><div class=table-wrapper><table><thead><tr><th>文件路径</th><th>内容</th></tr></thead><tbody><tr><td><code>kernel/sched/core.c</code></td><td>调度器核心，schedule(), context_switch()</td></tr><tr><td><code>arch/x86/entry/entry_64.S</code></td><td>__switch_to_asm 汇编实现</td></tr><tr><td><code>arch/x86/kernel/process_64.c</code></td><td>__switch_to() C 函数</td></tr><tr><td><code>arch/x86/mm/tlb.c</code></td><td>switch_mm_irqs_off() 页表切换</td></tr><tr><td><code>arch/x86/include/asm/switch_to.h</code></td><td>switch_to 宏，inactive_task_frame</td></tr><tr><td><code>arch/x86/include/asm/processor.h</code></td><td>thread_struct 定义</td></tr><tr><td><code>arch/x86/include/asm/ptrace.h</code></td><td>pt_regs 定义</td></tr><tr><td><code>arch/x86/include/asm/fpu/types.h</code></td><td>fpu 结构定义</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2/>上下文切换</a>
+<a href=/tags/schedule/>Schedule</a>
+<a href=/tags/__schedule/>__Schedule</a>
+<a href=/tags/switch_to/>Switch_to</a>
+<a href=/tags/cfs/>CFS</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/linux-%E8%B0%83%E5%BA%A6%E5%99%A8%E6%89%A7%E8%A1%8C%E6%97%B6%E6%9C%BA%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 调度器执行时机深度分析</h2></div></a></article><article><a href=/p/%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8%E6%9C%BA%E5%88%B6/><div class=article-details><h2 class=article-title>系统调用机制</h2></div></a></article><article><a href=/p/cpu-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E4%B8%8E%E5%86%85%E6%A0%B8%E6%A0%88%E8%BF%9B%E7%A8%8B%E6%98%AF%E6%80%8E%E4%B9%88%E8%A2%AB-cpu-%E6%89%A7%E8%A1%8C%E7%9A%84/><div class=article-details><h2 class=article-title>CPU 上下文切换与内核栈——进程是怎么被 CPU 执行的</h2></div></a></article><article><a href=/p/%E8%BF%9B%E7%A8%8B%E5%86%85%E6%A0%B8%E7%BB%93%E6%9E%84%E5%85%B3%E7%B3%BB-task_struct-%E5%8F%8A%E5%85%B6%E5%85%B3%E8%81%94%E5%AD%90%E7%B3%BB%E7%BB%9F/><div class=article-details><h2 class=article-title>进程内核结构关系 — task_struct 及其关联子系统</h2></div></a></article><article><a href=/p/%E8%BF%9B%E7%A8%8B%E4%B8%8E%E7%BA%BF%E7%A8%8B%E7%9A%84%E6%9C%AC%E8%B4%A8%E5%8C%BA%E5%88%AB%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E7%9C%8B%E5%85%B1%E4%BA%AB%E4%B8%8E%E9%9A%94%E7%A6%BB/><div class=article-details><h2 class=article-title>进程与线程的本质区别——从内核源码看共享与隔离</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

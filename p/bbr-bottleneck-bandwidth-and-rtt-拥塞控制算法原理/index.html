@@ -1,0 +1,596 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理 基于 Linux 5.15.78 内核源码 net/ipv4/tcp_bbr.c 分析\n沉淀说明：本文档与 tcp_bbr.c 顶部长注释、实现常量（bbr_*）保持一致；算法论文级推导以 ACM Queue 原文为准，实现细节以本树源码为准。\n一、设计哲学 1.1 传统算法的问题 传统 TCP 拥塞控制（Reno、CUBIC 等）基于 &ldquo;丢包即拥塞&rdquo; 假设：\n场景 问题 深缓冲网络 (bufferbloat) 先填满巨大缓冲区再丢包 → 排队延迟极高（数百毫秒） 浅缓冲网络 缓冲区小 → 频繁丢包 → 反复降速 → 带宽利用率低 有随机丢包的链路（如无线网络） 误将随机丢包当作拥塞信号 → 不必要的降速 1.2 BBR 的核心思路 BBR 不依赖丢包，而是直接 建模网络路径的两个物理参数：\nBtlBw (Bottleneck Bandwidth)：瓶颈链路的最大吞吐能力 RTprop (Round-trip propagation time)：链路的最小传播延迟（不含排队） BBR 的目标是让发送速率精确地"骑在" BtlBw 上，同时保持 inflight 数据量等于 BDP（管道恰好满、队列恰好空），实现 最大吞吐 + 最低延迟 的理想工作点。\n'><title>BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理</title><link rel=canonical href=https://1bit2.github.io/p/bbr-bottleneck-bandwidth-and-rtt-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E7%AE%97%E6%B3%95%E5%8E%9F%E7%90%86/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理"><meta property='og:description' content='BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理 基于 Linux 5.15.78 内核源码 net/ipv4/tcp_bbr.c 分析\n沉淀说明：本文档与 tcp_bbr.c 顶部长注释、实现常量（bbr_*）保持一致；算法论文级推导以 ACM Queue 原文为准，实现细节以本树源码为准。\n一、设计哲学 1.1 传统算法的问题 传统 TCP 拥塞控制（Reno、CUBIC 等）基于 &ldquo;丢包即拥塞&rdquo; 假设：\n场景 问题 深缓冲网络 (bufferbloat) 先填满巨大缓冲区再丢包 → 排队延迟极高（数百毫秒） 浅缓冲网络 缓冲区小 → 频繁丢包 → 反复降速 → 带宽利用率低 有随机丢包的链路（如无线网络） 误将随机丢包当作拥塞信号 → 不必要的降速 1.2 BBR 的核心思路 BBR 不依赖丢包，而是直接 建模网络路径的两个物理参数：\nBtlBw (Bottleneck Bandwidth)：瓶颈链路的最大吞吐能力 RTprop (Round-trip propagation time)：链路的最小传播延迟（不含排队） BBR 的目标是让发送速率精确地"骑在" BtlBw 上，同时保持 inflight 数据量等于 BDP（管道恰好满、队列恰好空），实现 最大吞吐 + 最低延迟 的理想工作点。\n'><meta property='og:url' content='https://1bit2.github.io/p/bbr-bottleneck-bandwidth-and-rtt-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E7%AE%97%E6%B3%95%E5%8E%9F%E7%90%86/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='BBR'><meta property='article:tag' content='拥塞控制'><meta property='article:tag' content='pacing_rate'><meta property='article:tag' content='cwnd'><meta property='article:tag' content='状态机'><meta property='article:published_time' content='2026-04-16T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-16T00:00:00+00:00'><meta name=twitter:title content="BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理"><meta name=twitter:description content='BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理 基于 Linux 5.15.78 内核源码 net/ipv4/tcp_bbr.c 分析\n沉淀说明：本文档与 tcp_bbr.c 顶部长注释、实现常量（bbr_*）保持一致；算法论文级推导以 ACM Queue 原文为准，实现细节以本树源码为准。\n一、设计哲学 1.1 传统算法的问题 传统 TCP 拥塞控制（Reno、CUBIC 等）基于 &ldquo;丢包即拥塞&rdquo; 假设：\n场景 问题 深缓冲网络 (bufferbloat) 先填满巨大缓冲区再丢包 → 排队延迟极高（数百毫秒） 浅缓冲网络 缓冲区小 → 频繁丢包 → 反复降速 → 带宽利用率低 有随机丢包的链路（如无线网络） 误将随机丢包当作拥塞信号 → 不必要的降速 1.2 BBR 的核心思路 BBR 不依赖丢包，而是直接 建模网络路径的两个物理参数：\nBtlBw (Bottleneck Bandwidth)：瓶颈链路的最大吞吐能力 RTprop (Round-trip propagation time)：链路的最小传播延迟（不含排队） BBR 的目标是让发送速率精确地"骑在" BtlBw 上，同时保持 inflight 数据量等于 BDP（管道恰好满、队列恰好空），实现 最大吞吐 + 最低延迟 的理想工作点。\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一设计哲学>一、设计哲学</a><ol><li><a href=#11-传统算法的问题>1.1 传统算法的问题</a></li><li><a href=#12-bbr-的核心思路>1.2 BBR 的核心思路</a></li></ol></li><li><a href=#二核心算法公式>二、核心算法公式</a><ol><li><a href=#21-网络模型参数估计>2.1 网络模型参数估计</a><ol><li><a href=#btlbw瓶颈带宽>BtlBw（瓶颈带宽）</a></li><li><a href=#rtprop传播延迟>RTprop（传播延迟）</a></li></ol></li><li><a href=#22-bdp带宽-延迟积>2.2 BDP（带宽-延迟积）</a></li><li><a href=#23-发送速率控制pacing-rate>2.3 发送速率控制（Pacing Rate）</a></li><li><a href=#24-拥塞窗口控制cwnd>2.4 拥塞窗口控制（cwnd）</a></li></ol></li><li><a href=#三状态机运行原理>三、状态机运行原理</a><ol><li><a href=#31-startup--快速探测管道容量>3.1 STARTUP — 快速探测管道容量</a></li><li><a href=#32-drain--排空-startup-建立的队列>3.2 DRAIN — 排空 STARTUP 建立的队列</a></li><li><a href=#33-probe_bw--稳态运行与带宽探测>3.3 PROBE_BW — 稳态运行与带宽探测</a></li><li><a href=#34-probe_rtt--协作测量传播延迟>3.4 PROBE_RTT — 协作测量传播延迟</a></li></ol></li><li><a href=#四参数变化一览表>四、参数变化一览表</a></li><li><a href=#五bbr_main-每-ack-完整执行流程>五、<code>bbr_main</code> 每 ACK 完整执行流程</a><ol><li><a href=#50-总览调用树>5.0 总览：调用树</a></li><li><a href=#51-第一步bbr_update_model--感知网络>5.1 第一步：<code>bbr_update_model()</code> — 感知网络</a><ol><li><a href=#-bbr_update_bw--带宽采样与-btlbw-更新>① <code>bbr_update_bw()</code> — 带宽采样与 BtlBw 更新</a></li><li><a href=#-bbr_update_ack_aggregation--ack-聚合度追踪>② <code>bbr_update_ack_aggregation()</code> — ACK 聚合度追踪</a></li><li><a href=#-bbr_update_cycle_phase--probe_bw-增益循环推进>③ <code>bbr_update_cycle_phase()</code> — PROBE_BW 增益循环推进</a></li><li><a href=#-bbr_check_full_bw_reached--startup-管道填满检测>④ <code>bbr_check_full_bw_reached()</code> — STARTUP 管道填满检测</a></li><li><a href=#-bbr_check_drain--startup--drain--probe_bw-转换>⑤ <code>bbr_check_drain()</code> — STARTUP → DRAIN → PROBE_BW 转换</a></li><li><a href=#-bbr_update_min_rtt--rtprop-维护--probe_rtt-状态机>⑥ <code>bbr_update_min_rtt()</code> — RTprop 维护 + PROBE_RTT 状态机</a></li><li><a href=#-bbr_update_gains--设置增益因子>⑦ <code>bbr_update_gains()</code> — 设置增益因子</a></li></ol></li><li><a href=#52-中间步骤bbr_bw--获取有效带宽>5.2 中间步骤：<code>bbr_bw()</code> — 获取有效带宽</a></li><li><a href=#53-第二步bbr_set_pacing_rate--设置发送速率>5.3 第二步：<code>bbr_set_pacing_rate()</code> — 设置发送速率</a></li><li><a href=#54-第三步bbr_set_cwnd--设置拥塞窗口>5.4 第三步：<code>bbr_set_cwnd()</code> — 设置拥塞窗口</a></li></ol></li><li><a href=#六辅助机制>六、辅助机制</a><ol><li><a href=#61-token-bucket-限速器检测lt-采样>6.1 Token-Bucket 限速器检测（LT 采样）</a></li><li><a href=#62-ack-聚合补偿>6.2 ACK 聚合补偿</a></li><li><a href=#63-丢包恢复packet-conservation>6.3 丢包恢复（Packet Conservation）</a></li></ol></li><li><a href=#七完整的一次-ack-处理时序例子>七、完整的一次 ACK 处理时序（例子）</a></li><li><a href=#八关键设计选择总结>八、关键设计选择总结</a></li><li><a href=#九与-linux-tcp-栈的衔接本树-51578>九、与 Linux TCP 栈的衔接（本树 5.15.78）</a><ol><li><a href=#91-拥塞控制入口每个-ack-一次>9.1 拥塞控制入口：每个 ACK 一次</a></li><li><a href=#92-发送侧pacing_rate-与-cwnd-如何生效>9.2 发送侧：pacing_rate 与 cwnd 如何"生效"</a></li><li><a href=#93-部署提示与源码注释一致>9.3 部署提示（与源码注释一致）</a></li></ol></li><li><a href=#十内核关键常量速查tcp_bbrc>十、内核关键常量速查（<code>tcp_bbr.c</code>）</a></li><li><a href=#十一源码导航tcp_bbrc>十一、源码导航（<code>tcp_bbr.c</code>）</a></li><li><a href=#十二维护与核对清单>十二、维护与核对清单</a></li><li><a href=#十三参考文献>十三、参考文献</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/bbr-bottleneck-bandwidth-and-rtt-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E7%AE%97%E6%B3%95%E5%8E%9F%E7%90%86/>BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 16, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>15 minute read</time></div></footer></div></header><section class=article-content><h1 id=bbr-bottleneck-bandwidth-and-rtt-拥塞控制算法原理>BBR (Bottleneck Bandwidth and RTT) 拥塞控制算法原理</h1><blockquote><p>基于 Linux 5.15.78 内核源码 <code>net/ipv4/tcp_bbr.c</code> 分析</p></blockquote><p><strong>沉淀说明</strong>：本文档与 <code>tcp_bbr.c</code> 顶部长注释、实现常量（<code>bbr_*</code>）保持一致；算法论文级推导以 ACM Queue 原文为准，实现细节以本树源码为准。</p><hr><h2 id=一设计哲学>一、设计哲学</h2><h3 id=11-传统算法的问题>1.1 传统算法的问题</h3><p>传统 TCP 拥塞控制（Reno、CUBIC 等）基于 <strong>&ldquo;丢包即拥塞&rdquo;</strong> 假设：</p><div class=table-wrapper><table><thead><tr><th>场景</th><th>问题</th></tr></thead><tbody><tr><td>深缓冲网络 (bufferbloat)</td><td>先填满巨大缓冲区再丢包 → 排队延迟极高（数百毫秒）</td></tr><tr><td>浅缓冲网络</td><td>缓冲区小 → 频繁丢包 → 反复降速 → 带宽利用率低</td></tr><tr><td>有随机丢包的链路（如无线网络）</td><td>误将随机丢包当作拥塞信号 → 不必要的降速</td></tr></tbody></table></div><h3 id=12-bbr-的核心思路>1.2 BBR 的核心思路</h3><p>BBR 不依赖丢包，而是直接 <strong>建模网络路径的两个物理参数</strong>：</p><ul><li><strong>BtlBw</strong> (Bottleneck Bandwidth)：瓶颈链路的最大吞吐能力</li><li><strong>RTprop</strong> (Round-trip propagation time)：链路的最小传播延迟（不含排队）</li></ul><p>BBR 的目标是让发送速率精确地"骑在" BtlBw 上，同时保持 inflight 数据量等于 BDP（管道恰好满、队列恰好空），实现 <strong>最大吞吐 + 最低延迟</strong> 的理想工作点。</p><hr><h2 id=二核心算法公式>二、核心算法公式</h2><h3 id=21-网络模型参数估计>2.1 网络模型参数估计</h3><h4 id=btlbw瓶颈带宽>BtlBw（瓶颈带宽）</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>BtlBw = windowed_max(delivery_rate, 过去 10 个 RTT)
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong>delivery_rate</strong> = ACK 确认的数据量 / 投递间隔时间</li><li>使用滑动窗口 <strong>最大值</strong> 滤波器（<code>win_minmax</code>）</li><li><strong>为什么取最大值</strong>：真实带宽是投递速率的上界，各种噪声（排队延迟、ACK 聚合、调度抖动）只会使测量偏低，不会偏高。取最大值过滤向下噪声。</li><li><strong>窗口长度 = 10 RTT</strong>：覆盖完整的 PROBE_BW gain cycle (8 RTT) + 2 RTT 余量</li></ul><h4 id=rtprop传播延迟>RTprop（传播延迟）</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>RTprop = windowed_min(rtt_sample, 过去 10 秒)
+</span></span></code></pre></td></tr></table></div></div><ul><li>RTT = 传播延迟 + <strong>排队延迟</strong> + 处理延迟</li><li>使用滑动窗口 <strong>最小值</strong> 滤波器</li><li><strong>为什么取最小值</strong>：真实传播延迟是 RTT 的下界，排队只会抬高不会降低。取最小值过滤向上噪声。</li><li><strong>窗口长度 = 10 秒</strong>：适应路由变化等网络条件变化。到期后强制进入 PROBE_RTT 重新测量。</li></ul><h3 id=22-bdp带宽-延迟积>2.2 BDP（带宽-延迟积）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>BDP = BtlBw × RTprop
+</span></span></code></pre></td></tr></table></div></div><p><strong>物理含义</strong>：网络管道中可以容纳的在途数据量（单位：数据包）。这是实现"管道满、队列空"理想状态的精确 inflight 数据量。</p><h3 id=23-发送速率控制pacing-rate>2.3 发送速率控制（Pacing Rate）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>pacing_rate = pacing_gain × BtlBw × (1 - 1%)
+</span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>组成部分</th><th>含义</th><th>源码位置</th></tr></thead><tbody><tr><td><code>pacing_gain</code></td><td>增益因子，不同状态取不同值</td><td><code>bbr_update_gains()</code></td></tr><tr><td><code>BtlBw</code></td><td>瓶颈带宽估计</td><td><code>bbr_bw()</code></td></tr><tr><td><code>(1 - 1%)</code></td><td>边际系数，略低于带宽</td><td><code>bbr_pacing_margin_percent</code></td></tr></tbody></table></div><p><strong>1% 边际的设计原理</strong>：</p><p>如果 pacing_rate 精确等于 BtlBw，任何微小的测量误差（哪怕 0.1% 的高估）都会导致持续的队列积累。乘以 0.99 使平均注入速率略低于实际带宽：</p><ul><li>带宽高估时：0.99 × 高估值 ≈ 真实值，不会积累队列</li><li>带宽准确时：0.99 × 真实值，管道 99% 利用率，队列为空</li><li>带宽低估时：本身就不会积累队列</li></ul><p>这 1% 的吞吐量代价几乎不可感知，但显著降低了稳态队列占用和延迟。</p><h3 id=24-拥塞窗口控制cwnd>2.4 拥塞窗口控制（cwnd）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>target_cwnd = cwnd_gain × BDP + extra_acked + quantization_budget
+</span></span><span class=line><span class=cl>cwnd = max(target_cwnd, 4)
+</span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>组成部分</th><th>含义</th><th>作用</th></tr></thead><tbody><tr><td><code>cwnd_gain × BDP</code></td><td>基础 inflight 上限</td><td>cwnd_gain=2 提供 2 倍 BDP 余量</td></tr><tr><td><code>extra_acked</code></td><td>ACK 聚合额外余量</td><td>补偿 ACK 聚合间隙</td></tr><tr><td><code>quantization_budget</code></td><td>TSO/GRO 处理余量</td><td>3×tso_segs + 取偶 + Phase0 补偿</td></tr><tr><td><code>min = 4</code></td><td>最小 cwnd</td><td>保证 delayed-ACK 下管道畅通</td></tr></tbody></table></div><p><strong>cwnd 不含 1% 边际的原因</strong>：pacing_rate 和 cwnd 职责不同：</p><ul><li>pacing_rate 控制数据 <strong>注入速率</strong>（水龙头流速）</li><li>cwnd 控制在途数据 <strong>上限</strong>（水池容量上限）</li></ul><p>cwnd 需要宽松的天花板来容忍 ACK 延迟和聚合波动，而不是精确限制。</p><hr><h2 id=三状态机运行原理>三、状态机运行原理</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>            |
+</span></span><span class=line><span class=cl>            V
+</span></span><span class=line><span class=cl>   +---&gt; STARTUP  ----+
+</span></span><span class=line><span class=cl>   |        |         |
+</span></span><span class=line><span class=cl>   |        V         |
+</span></span><span class=line><span class=cl>   |      DRAIN   ----+
+</span></span><span class=line><span class=cl>   |        |         |
+</span></span><span class=line><span class=cl>   |        V         |
+</span></span><span class=line><span class=cl>   +---&gt; PROBE_BW ----+
+</span></span><span class=line><span class=cl>   |      ^    |      |
+</span></span><span class=line><span class=cl>   |      |    |      |
+</span></span><span class=line><span class=cl>   |      +----+      |
+</span></span><span class=line><span class=cl>   |                  |
+</span></span><span class=line><span class=cl>   +---- PROBE_RTT &lt;--+
+</span></span></code></pre></td></tr></table></div></div><h3 id=31-startup--快速探测管道容量>3.1 STARTUP — 快速探测管道容量</h3><div class=table-wrapper><table><thead><tr><th>参数</th><th>值</th><th>说明</th></tr></thead><tbody><tr><td>pacing_gain</td><td>2/ln(2) ≈ 2.885</td><td>每 RTT 发送速率翻倍</td></tr><tr><td>cwnd_gain</td><td>2/ln(2) ≈ 2.885</td><td>匹配 pacing 增长</td></tr></tbody></table></div><p><strong>high_gain = 2/ln(2) 的数学推导</strong>：</p><p>在 paced 发送模式下，设第 n 轮的发送量为 <code>S(n)</code>，增益为 <code>G</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>S(n) = G × BtlBw_est(n-1) × RTT
+</span></span></code></pre></td></tr></table></div></div><p>因为 BtlBw 估计基于上一轮的投递速率，<code>BtlBw_est(n) ≈ S(n-1) / RTT</code>，所以：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>S(n) = G × S(n-1)
+</span></span></code></pre></td></tr></table></div></div><p>要使每轮总发送量翻倍（匹配传统慢启动），需要：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>S(1) + S(2) + ... + S(n) = 2 × (S(1) + S(2) + ... + S(n-1))
+</span></span></code></pre></td></tr></table></div></div><p>即 <code>S(n) = S(1) + S(2) + ... + S(n-1)</code>，对等比数列 <code>G^(n-1)</code> 求解得 <strong>G = 2/ln(2) ≈ 2.885</strong>。</p><p><strong>退出条件</strong>：连续 3 轮 BtlBw 增长 &lt; 25% → 判定管道已满</p><p>为什么要 3 轮：</p><ol><li>第 1 轮：接收端 rwin 自动调优可能正在扩大</li><li>第 2 轮：用更大 rwin 填充管道</li><li>第 3 轮：获得更高的投递速率样本</li></ol><h3 id=32-drain--排空-startup-建立的队列>3.2 DRAIN — 排空 STARTUP 建立的队列</h3><div class=table-wrapper><table><thead><tr><th>参数</th><th>值</th><th>说明</th></tr></thead><tbody><tr><td>pacing_gain</td><td>1/2.885 ≈ 0.347</td><td>STARTUP 增益的倒数</td></tr><tr><td>cwnd_gain</td><td>2.885</td><td>保持高 cwnd，不触发慢启动</td></tr></tbody></table></div><p><strong>排空原理</strong>：</p><p>STARTUP 结束时 inflight ≈ 2.885 × BDP，队列积累 = (2.885 - 1) × BDP ≈ 1.885 × BDP。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>发送速率 = 0.347 × BtlBw
+</span></span><span class=line><span class=cl>ACK 返回速率 = BtlBw
+</span></span><span class=line><span class=cl>净排出速率 = BtlBw × (1 - 0.347) = 0.653 × BtlBw
+</span></span><span class=line><span class=cl>排空时间 ≈ 1.885 × BDP / (0.653 × BtlBw) ≈ 2.9 × RTprop
+</span></span></code></pre></td></tr></table></div></div><p>选择 drain_gain = 1/high_gain 使 STARTUP 多注入和 DRAIN 排出的数据量精确对称。</p><p><strong>DRAIN 期间 cwnd_gain 仍为 2.885 的原因</strong>：如果同时降低 cwnd，cwnd 会小于当前 inflight，TCP 会停止发送直到 inflight 降至 cwnd 以下——相当于突然断流而非渐进排空。保持高 cwnd，让 pacing_rate 自然控制排空节奏。</p><p><strong>退出条件</strong>：inflight ≤ BDP</p><h3 id=33-probe_bw--稳态运行与带宽探测>3.3 PROBE_BW — 稳态运行与带宽探测</h3><div class=table-wrapper><table><thead><tr><th>参数</th><th>值</th><th>说明</th></tr></thead><tbody><tr><td>pacing_gain 循环</td><td>[5/4, 3/4, 1, 1, 1, 1, 1, 1]</td><td>8 phase 循环</td></tr><tr><td>cwnd_gain</td><td>2.0</td><td>容忍 ACK 波动</td></tr><tr><td>每 phase 持续时间</td><td>≈ 1 × RTprop</td><td>按 min_rtt 计时</td></tr></tbody></table></div><p><strong>Gain Cycling 详解</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>Phase 0 (gain=1.25): 探测 — 以高于 BtlBw 25% 的速率发送
+</span></span><span class=line><span class=cl>  ├── 如果有新带宽 → BtlBw 滤波器捕获更高样本
+</span></span><span class=line><span class=cl>  ├── 多注入 0.25 × BDP 数据到队列
+</span></span><span class=line><span class=cl>  └── 退出条件：时间 ≥ RTprop 且 (丢包 或 inflight ≥ 1.25×BDP)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>Phase 1 (gain=0.75): 排空 — 以低于 BtlBw 25% 的速率发送
+</span></span><span class=line><span class=cl>  ├── 排出 Phase 0 多注入的 0.25 × BDP 数据
+</span></span><span class=line><span class=cl>  ├── 数学平衡：多注入 = (1.25-1)×BDP = 少注入 = (1-0.75)×BDP = 0.25×BDP
+</span></span><span class=line><span class=cl>  └── 退出条件：时间 ≥ RTprop 或 inflight ≤ BDP
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>Phase 2-7 (gain=1.0): 巡航 — 以 BtlBw 速率匀速发送
+</span></span><span class=line><span class=cl>  ├── 管道满、队列空，高吞吐低延迟
+</span></span><span class=line><span class=cl>  └── 退出条件：时间 ≥ RTprop
+</span></span></code></pre></td></tr></table></div></div><p><strong>公平性</strong>：多条 BBR 流共享瓶颈时，各流的 gain cycling 异步进行（起始 phase 随机化），短时间交替试探，长时间收敛到公平份额。</p><h3 id=34-probe_rtt--协作测量传播延迟>3.4 PROBE_RTT — 协作测量传播延迟</h3><div class=table-wrapper><table><thead><tr><th>参数</th><th>值</th><th>说明</th></tr></thead><tbody><tr><td>pacing_gain</td><td>1.0</td><td>正常速率</td></tr><tr><td>cwnd</td><td>4 包 (强制)</td><td>最小值</td></tr><tr><td>持续时间</td><td>max(200ms, 1 RTT)</td><td>在 inflight ≤ 4 后计时</td></tr><tr><td>触发条件</td><td>min_rtt 10 秒未更新</td><td>窗口到期</td></tr></tbody></table></div><p><strong>运行流程</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>10 秒 min_rtt 窗口到期
+</span></span><span class=line><span class=cl>  → 保存当前 cwnd
+</span></span><span class=line><span class=cl>  → 压缩 cwnd 到 4 包
+</span></span><span class=line><span class=cl>  → 等待 inflight 降到 ≤ 4
+</span></span><span class=line><span class=cl>  → 启动 200ms 计时器
+</span></span><span class=line><span class=cl>  → 200ms + 1 RTT 后退出
+</span></span><span class=line><span class=cl>  → 恢复 cwnd，进入 PROBE_BW 或 STARTUP
+</span></span></code></pre></td></tr></table></div></div><p><strong>性能开销</strong>：200ms / 10s = 2% 吞吐量损失</p><p><strong>协作效果</strong>：所有 BBR 流都会周期性进入 PROBE_RTT，共同排空瓶颈队列，使每个流都能测到准确的 RTprop。</p><hr><h2 id=四参数变化一览表>四、参数变化一览表</h2><div class=table-wrapper><table><thead><tr><th>参数</th><th>STARTUP</th><th>DRAIN</th><th>PROBE_BW</th><th>PROBE_RTT</th></tr></thead><tbody><tr><td>pacing_gain</td><td>2.885</td><td>0.347</td><td>循环 [5/4, 3/4, 1×6]</td><td>1.0</td></tr><tr><td>cwnd_gain</td><td>2.885</td><td>2.885</td><td>2.0</td><td>1.0</td></tr><tr><td>inflight 目标</td><td>递增至饱和</td><td>降至 BDP</td><td>≈ BDP ± 25%</td><td>4 pkts</td></tr><tr><td>BtlBw 更新</td><td>是</td><td>是</td><td>是</td><td>否 (app_limited)</td></tr><tr><td>RTprop 更新</td><td>机会性</td><td>机会性</td><td>机会性</td><td>强制更新</td></tr><tr><td>典型持续时间</td><td>~6 RTT</td><td>~3 RTT</td><td>大部分时间</td><td>200ms+1RTT</td></tr></tbody></table></div><hr><h2 id=五bbr_main-每-ack-完整执行流程>五、<code>bbr_main</code> 每 ACK 完整执行流程</h2><p><code>bbr_main()</code> 是 BBR 的核心入口，TCP 栈在每个 ACK 到达时调用。它分为两大阶段：<strong>更新模型</strong>（感知网络）和<strong>设置控制输出</strong>（控制发送）。下面按代码调用顺序逐层展开。</p><h3 id=50-总览调用树>5.0 总览：调用树</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>bbr_main(sk, rs)                    ← TCP栈每ACK调用一次
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>├── bbr_update_model(sk, rs)        ← 第1步：感知网络，更新内部模型
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_update_bw()             ← ① 带宽采样：轮次检测 + LT限速器 + BtlBw滤波
+</span></span><span class=line><span class=cl>│   │   ├── 轮次(round)检测          delivered计数切分RTT轮次
+</span></span><span class=line><span class=cl>│   │   ├── bbr_lt_bw_sampling()     检测token-bucket限速器
+</span></span><span class=line><span class=cl>│   │   └── minmax_running_max()     滑动窗口最大值更新BtlBw
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_update_ack_aggregation() ← ② ACK聚合度追踪
+</span></span><span class=line><span class=cl>│   │   └── 双缓冲滑动窗口记录extra_acked最大值
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_update_cycle_phase()    ← ③ PROBE_BW增益循环推进
+</span></span><span class=line><span class=cl>│   │   ├── bbr_is_next_cycle_phase()  phase切换条件判定
+</span></span><span class=line><span class=cl>│   │   └── bbr_advance_cycle_phase()  推进到下一个phase
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_check_full_bw_reached() ← ④ STARTUP管道填满检测
+</span></span><span class=line><span class=cl>│   │   └── 连续3轮BtlBw增长&lt;25% → full_bw_reached=1
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_check_drain()           ← ⑤ STARTUP→DRAIN→PROBE_BW转换
+</span></span><span class=line><span class=cl>│   │   ├── full_bw_reached → 切到DRAIN
+</span></span><span class=line><span class=cl>│   │   └── inflight≤BDP → 切到PROBE_BW
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_update_min_rtt()        ← ⑥ RTprop维护 + PROBE_RTT状态机
+</span></span><span class=line><span class=cl>│   │   ├── 更新min_rtt_us(取最小/到期强制替换)
+</span></span><span class=line><span class=cl>│   │   ├── 10s到期 → 进入PROBE_RTT
+</span></span><span class=line><span class=cl>│   │   └── PROBE_RTT内部：等排空→计时→退出
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   └── bbr_update_gains()          ← ⑦ 根据当前mode设置pacing_gain/cwnd_gain
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>├── bbr_bw(sk)                      ← 获取有效带宽(BtlBw或lt_bw)
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>├── bbr_set_pacing_rate(sk,bw,gain) ← 第2步输出: pacing_rate = gain × bw × 0.99
+</span></span><span class=line><span class=cl>│   └── bbr_bw_to_pacing_rate()      定点转bytes/sec，含1%边际
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>└── bbr_set_cwnd(sk,rs,acked,bw,gain) ← 第3步输出: cwnd
+</span></span><span class=line><span class=cl>    ├── bbr_set_cwnd_to_recover_or_restore()  丢包恢复路径
+</span></span><span class=line><span class=cl>    ├── bbr_bdp()                     BDP = ceil(bw × min_rtt × gain)
+</span></span><span class=line><span class=cl>    ├── bbr_ack_aggregation_cwnd()    + ACK聚合余量
+</span></span><span class=line><span class=cl>    ├── bbr_quantization_budget()     + TSO/GRO量化余量
+</span></span><span class=line><span class=cl>    └── PROBE_RTT时强制cwnd=4
+</span></span></code></pre></td></tr></table></div></div><h3 id=51-第一步bbr_update_model--感知网络>5.1 第一步：<code>bbr_update_model()</code> — 感知网络</h3><p><code>bbr_update_model()</code> 按固定顺序调用 7 个子函数来更新 BBR 对网络的认知。<strong>顺序不可打乱</strong>——后面的函数依赖前面的结果（例如 <code>bbr_check_drain()</code> 需要 <code>bbr_check_full_bw_reached()</code> 设置的 <code>full_bw_reached</code> 标志）。</p><h4 id=-bbr_update_bw--带宽采样与-btlbw-更新>① <code>bbr_update_bw()</code> — 带宽采样与 BtlBw 更新</h4><p>这是模型更新的第一步，也是 BBR 最核心的函数。每个 ACK 都调用。它做三件事：</p><p><strong>A. 轮次(round)检测</strong> — 用 delivered 计数切分 RTT 轮次</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>条件：!before(rs-&gt;prior_delivered, bbr-&gt;next_rtt_delivered)
+</span></span><span class=line><span class=cl>含义：本ACK的参考包是在&#34;当前轮次门槛之后&#34;发出的 → 一个RTT已过
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>触发时：
+</span></span><span class=line><span class=cl>  next_rtt_delivered = tp-&gt;delivered  （画新门槛线）
+</span></span><span class=line><span class=cl>  rtt_cnt++                           （全局轮次计数器+1）
+</span></span><span class=line><span class=cl>  round_start = 1                     （通知其他子函数&#34;新轮次到了&#34;）
+</span></span><span class=line><span class=cl>  packet_conservation = 0             （结束丢包恢复的包守恒）
+</span></span></code></pre></td></tr></table></div></div><p><strong>为什么用 delivered 计数而不用挂钟？</strong> RTT 会随队列深度变化，挂钟切分的"一轮"可能不对齐实际的包往返。delivered 计数与包的实际到达严格绑定，天然适应 RTT 的波动。</p><p><strong>B. LT 限速器采样</strong> — <code>bbr_lt_bw_sampling()</code></p><p>检测链路上是否有 token-bucket 限速器（详见§六）。如果检测到，<code>bbr_bw()</code> 会返回 <code>lt_bw</code> 替代 <code>bbr_max_bw()</code>。</p><p><strong>C. BtlBw 滤波器更新</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=n>bw</span> <span class=o>=</span> <span class=n>rs</span><span class=o>-&gt;</span><span class=n>delivered</span> <span class=o>*</span> <span class=n>BW_UNIT</span> <span class=o>/</span> <span class=n>rs</span><span class=o>-&gt;</span><span class=n>interval_us</span>   <span class=c1>// 本次投递速率
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>rs</span><span class=o>-&gt;</span><span class=n>is_app_limited</span> <span class=o>||</span> <span class=n>bw</span> <span class=o>&gt;=</span> <span class=nf>bbr_max_bw</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>  <span class=c1>// 过滤app_limited样本
+</span></span></span><span class=line><span class=cl>    <span class=nf>minmax_running_max</span><span class=p>(</span><span class=o>&amp;</span><span class=n>bbr</span><span class=o>-&gt;</span><span class=n>bw</span><span class=p>,</span> <span class=mi>10</span><span class=p>,</span> <span class=n>rtt_cnt</span><span class=p>,</span> <span class=n>bw</span><span class=p>)</span> <span class=c1>// 10轮窗口取最大
+</span></span></span></code></pre></td></tr></table></div></div><ul><li><strong>为什么取 max</strong>：瓶颈带宽是投递速率的物理上限。排队、ACK 聚合、调度延迟只会让单次样本偏低，不会系统性偏高。取 max 过滤向下噪声。</li><li><strong>为什么跳过 app_limited</strong>：应用没喂满数据时投递速率偏低，写入 max 滤波器没意义——但如果 bw 仍然 ≥ 当前 BtlBw，说明路径可能变好了，例外纳入。</li><li><strong>滑动窗口 10 轮</strong>：覆盖 8 phase 的 gain cycle + 2 轮余量，确保即使在 gain=0.75 的低速 phase 也不会把高峰样本过早淘汰。</li></ul><h4 id=-bbr_update_ack_aggregation--ack-聚合度追踪>② <code>bbr_update_ack_aggregation()</code> — ACK 聚合度追踪</h4><p>网络设备（LRO/GRO）和 delayed-ACK 会把多个 ACK 合并成一个大 ACK。在合并间隙中，发送端收不到 ACK → inflight 不减 → cwnd 被"卡住"。如果 cwnd 没有足够余量，这会导致发送端被迫停发。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>epoch_us = 当前时间 - 纪元起点
+</span></span><span class=line><span class=cl>expected_acked = BtlBw × epoch_us          // 按带宽应该确认多少
+</span></span><span class=line><span class=cl>extra_acked = actual_acked - expected_acked // 超出预期的部分 = ACK聚合量
+</span></span></code></pre></td></tr></table></div></div><p>使用<strong>双缓冲</strong>实现近似滑动窗口（每 5 RTT 轮换），追踪 <code>extra_acked</code> 最大值。这个值后续加到 <code>target_cwnd</code> 上，为 ACK 聚合间隙预留 cwnd 余量。</p><h4 id=-bbr_update_cycle_phase--probe_bw-增益循环推进>③ <code>bbr_update_cycle_phase()</code> — PROBE_BW 增益循环推进</h4><p>仅在 <code>mode == BBR_PROBE_BW</code> 时生效。调用 <code>bbr_is_next_cycle_phase()</code> 判断是否切换到下一个 gain phase。</p><p><strong>各 phase 的切换条件不同</strong>：</p><div class=table-wrapper><table><thead><tr><th>Phase</th><th>Gain</th><th>切换条件</th></tr></thead><tbody><tr><td>Phase 0</td><td>5/4</td><td>时间 ≥ RTprop <strong>且</strong> (丢包 或 inflight ≥ 1.25×BDP)</td></tr><tr><td>Phase 1</td><td>3/4</td><td>时间 ≥ RTprop <strong>或</strong> inflight ≤ BDP</td></tr><tr><td>Phase 2-7</td><td>1.0</td><td>时间 ≥ RTprop</td></tr></tbody></table></div><p>设计逻辑：</p><ul><li>Phase 0（探测）：必须等到数据真正"堆"到队列里（inflight 够大）或出现丢包，才能确认探测完成。时间+inflight 双条件保证探测有效。</li><li>Phase 1（排空）：排空越快越好，要么时间到了，要么 inflight 已降到 BDP，任一满足即停。</li><li>Phase 2-7（巡航）：纯时间驱动，每 RTT 推进一步。</li></ul><p><strong>重要细节</strong>：Phase 0 切换时使用的 inflight 经过 EDT 修正 (<code>bbr_packets_in_net_at_edt</code>)——fq 队列规则下，本地排队等待 pacing 的包尚未进入网络，不应算作"在途"。</p><h4 id=-bbr_check_full_bw_reached--startup-管道填满检测>④ <code>bbr_check_full_bw_reached()</code> — STARTUP 管道填满检测</h4><p>仅在 STARTUP 期间、每个新轮次起点、非 app_limited 时执行：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>bw_thresh = full_bw × 1.25         // 上次记录的带宽 × 125%
+</span></span><span class=line><span class=cl>if (bbr_max_bw &gt;= bw_thresh)
+</span></span><span class=line><span class=cl>    full_bw = bbr_max_bw            // 还在增长，更新高水位
+</span></span><span class=line><span class=cl>    full_bw_cnt = 0                 // 重置停滞计数
+</span></span><span class=line><span class=cl>else
+</span></span><span class=line><span class=cl>    full_bw_cnt++                   // 增长不足25%，停滞+1
+</span></span><span class=line><span class=cl>    if (full_bw_cnt &gt;= 3)
+</span></span><span class=line><span class=cl>        full_bw_reached = true      // 连续3轮停滞 → 管道满了
+</span></span></code></pre></td></tr></table></div></div><p><strong>为什么是 25% 和 3 轮？</strong></p><ul><li>25%：低于此增幅说明带宽接近饱和（噪声级别的增长）</li><li>3 轮：排除接收端 rwin 自动调优的干扰——rwin 通常需要 1-2 轮才稳定，第 3 轮的样本才可靠</li></ul><h4 id=-bbr_check_drain--startup--drain--probe_bw-转换>⑤ <code>bbr_check_drain()</code> — STARTUP → DRAIN → PROBE_BW 转换</h4><p>两步状态转换：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>if (mode == STARTUP &amp;&amp; full_bw_reached)
+</span></span><span class=line><span class=cl>    mode = DRAIN                    // 管道满了，开始排空
+</span></span><span class=line><span class=cl>    snd_ssthresh = BDP              // 设置统计值（BBR自身不用）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>if (mode == DRAIN &amp;&amp; inflight ≤ BDP)
+</span></span><span class=line><span class=cl>    bbr_reset_probe_bw_mode()       // 排空完成，进入稳态
+</span></span></code></pre></td></tr></table></div></div><p><strong>为什么 DRAIN → PROBE_BW 用 inflight ≤ BDP？</strong> BDP 就是"管道恰好满、队列恰好空"的 inflight 数据量。inflight 降到 BDP 以下说明 STARTUP 建立的队列已排完。</p><h4 id=-bbr_update_min_rtt--rtprop-维护--probe_rtt-状态机>⑥ <code>bbr_update_min_rtt()</code> — RTprop 维护 + PROBE_RTT 状态机</h4><p><strong>A. 更新 min_rtt_us</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>if (rtt_us &lt; min_rtt_us)                        // 更小 → 写入
+</span></span><span class=line><span class=cl>    min_rtt_us = rtt_us
+</span></span><span class=line><span class=cl>elif (10s到期 &amp;&amp; !is_ack_delayed)                // 到期 → 强制刷新
+</span></span><span class=line><span class=cl>    min_rtt_us = rtt_us                          // 允许变大，跟上网络变化
+</span></span><span class=line><span class=cl>min_rtt_stamp = now                              // 重置10s计时器
+</span></span></code></pre></td></tr></table></div></div><p>为什么排除 <code>is_ack_delayed</code>：delayed ACK 会人为增加 RTT（接收端攒 40ms 再回 ACK），用它刷新 min_rtt 会污染 RTprop 估计。</p><p><strong>B. 进入 PROBE_RTT</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>if (10s到期 &amp;&amp; !idle_restart &amp;&amp; mode != PROBE_RTT)
+</span></span><span class=line><span class=cl>    mode = PROBE_RTT
+</span></span><span class=line><span class=cl>    保存cwnd
+</span></span></code></pre></td></tr></table></div></div><p>为什么 <code>idle_restart</code> 时不进入：刚从空闲恢复时管道本来就空，不需要再压 cwnd 排队。</p><p><strong>C. PROBE_RTT 内部两步退出</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>步骤A：inflight 降到 ≤ 4 包
+</span></span><span class=line><span class=cl>  → 启动200ms计时器
+</span></span><span class=line><span class=cl>  → 清零round_done
+</span></span><span class=line><span class=cl>  → 对齐next_rtt_delivered
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>步骤B：200ms到期 + round_start（至少经过一个RTT）
+</span></span><span class=line><span class=cl>  → 恢复cwnd
+</span></span><span class=line><span class=cl>  → 重置min_rtt_stamp
+</span></span><span class=line><span class=cl>  → 切回PROBE_BW或STARTUP
+</span></span></code></pre></td></tr></table></div></div><p>为什么需要等一个 round_start：200ms 是挂钟时间，但必须确保"cwnd=4 的包确实在管道里走了一个完整来回"才能量到排空后的真实 RTT。</p><p><strong>D. 标记 app_limited</strong></p><p>PROBE_RTT 期间故意只发 4 包，<code>tp->app_limited</code> 被置位，防止 <code>bbr_update_bw()</code> 把低速样本写入 BtlBw 的 max 滤波器。</p><h4 id=-bbr_update_gains--设置增益因子>⑦ <code>bbr_update_gains()</code> — 设置增益因子</h4><p>根据当前 mode 设置 <code>pacing_gain</code> 和 <code>cwnd_gain</code>：</p><div class=table-wrapper><table><thead><tr><th>Mode</th><th>pacing_gain</th><th>cwnd_gain</th><th>说明</th></tr></thead><tbody><tr><td>STARTUP</td><td>2.885</td><td>2.885</td><td>指数探测</td></tr><tr><td>DRAIN</td><td>0.347</td><td>2.885</td><td>低速排空，高cwnd防停发</td></tr><tr><td>PROBE_BW</td><td>gain_cycle[idx] 或 1.0(限速时)</td><td>2.0</td><td>稳态循环</td></tr><tr><td>PROBE_RTT</td><td>1.0</td><td>1.0</td><td>正常速率，cwnd在bbr_set_cwnd中压到4</td></tr></tbody></table></div><p><strong>PROBE_BW 被限速时</strong>：如果 <code>lt_use_bw=1</code>（检测到 token-bucket 限速器），<code>pacing_gain</code> 强制为 1.0，不做 gain cycling——被限速时 gain>1 只会超速丢包。</p><h3 id=52-中间步骤bbr_bw--获取有效带宽>5.2 中间步骤：<code>bbr_bw()</code> — 获取有效带宽</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>return</span> <span class=n>bbr</span><span class=o>-&gt;</span><span class=n>lt_use_bw</span> <span class=o>?</span> <span class=n>bbr</span><span class=o>-&gt;</span><span class=nl>lt_bw</span> <span class=p>:</span> <span class=nf>bbr_max_bw</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p>如果检测到限速器，使用 LT 采样得到的长期平均带宽；否则使用 BtlBw 的 max 滤波器输出。</p><h3 id=53-第二步bbr_set_pacing_rate--设置发送速率>5.3 第二步：<code>bbr_set_pacing_rate()</code> — 设置发送速率</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>rate = bbr_bw_to_pacing_rate(bw, gain)
+</span></span><span class=line><span class=cl>     = bw × gain × mss × (100-1%) / 100     // 含1%边际
+</span></span><span class=line><span class=cl>     → 转为 bytes/sec
+</span></span><span class=line><span class=cl>     → min(rate, sk_max_pacing_rate)          // 受用户上限约束
+</span></span></code></pre></td></tr></table></div></div><p><strong>STARTUP 期间的特殊策略</strong>：<code>full_bw_reached=0</code> 时只允许速率上升，不下降。因为 STARTUP 在持续探测更高带宽，瞬时波动不应导致降速。</p><p><strong>首次 RTT 初始化</strong>：连接初期还没有投递速率样本时，从 SRTT 估算初始 pacing_rate = <code>high_gain × init_cwnd / srtt</code>。</p><h3 id=54-第三步bbr_set_cwnd--设置拥塞窗口>5.4 第三步：<code>bbr_set_cwnd()</code> — 设置拥塞窗口</h3><p>这是 BBR 的最后一步输出，分为两条路径：</p><p><strong>路径 A：丢包恢复路径</strong> — <code>bbr_set_cwnd_to_recover_or_restore()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>每个ACK：cwnd -= losses（先扣丢失的包）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>刚进入Recovery（第1轮）：
+</span></span><span class=line><span class=cl>  packet_conservation = 1
+</span></span><span class=line><span class=cl>  cwnd = inflight + acked             // 裁剪到实际在途量
+</span></span><span class=line><span class=cl>  → 包守恒：每收P个ACK才允许发P个新包
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>退出Recovery：
+</span></span><span class=line><span class=cl>  cwnd = max(cwnd, prior_cwnd)        // 恢复进入前的cwnd
+</span></span><span class=line><span class=cl>  packet_conservation = 0
+</span></span></code></pre></td></tr></table></div></div><p><strong>路径 B：正常路径</strong> — 三步计算 target_cwnd</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>target_cwnd  = bbr_bdp(bw, cwnd_gain)          // ①基础：gain × BDP
+</span></span><span class=line><span class=cl>target_cwnd += bbr_ack_aggregation_cwnd()       // ②加：ACK聚合余量
+</span></span><span class=line><span class=cl>target_cwnd  = bbr_quantization_budget(target)  // ③加：TSO/GRO量化余量
+</span></span></code></pre></td></tr></table></div></div><p><strong>① <code>bbr_bdp()</code> — BDP 计算</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>w = bw × min_rtt_us                    // pkts × 2^24（usec相消）
+</span></span><span class=line><span class=cl>bdp = ceil(w × gain / BBR_UNIT / BW_UNIT)
+</span></span></code></pre></td></tr></table></div></div><p>向上取整的原因：宁可多 0.x 个包（微量排队），也不少 0.x 个包（浪费带宽）。管道必须填满。</p><p><strong>② <code>bbr_ack_aggregation_cwnd()</code> — ACK 聚合余量</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>extra = max(extra_acked[0], extra_acked[1])  // 双缓冲取较大值
+</span></span><span class=line><span class=cl>return extra_acked_gain × extra              // gain=1，即直接加上
+</span></span></code></pre></td></tr></table></div></div><p><strong>③ <code>bbr_quantization_budget()</code> — 量化余量</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>cwnd += 3 × tso_segs_goal    // Qdisc、TSO引擎、接收端各需1段缓冲
+</span></span><span class=line><span class=cl>cwnd = 向上取偶数             // 减少delayed-ACK对奇数cwnd的不利影响
+</span></span><span class=line><span class=cl>if (PROBE_BW Phase 0)
+</span></span><span class=line><span class=cl>    cwnd += 2                 // 确保小BDP时 gain cycling 也能推动inflight &gt; BDP
+</span></span></code></pre></td></tr></table></div></div><p><strong>cwnd 更新策略</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>if (full_bw_reached)
+</span></span><span class=line><span class=cl>    cwnd = min(cwnd + acked, target_cwnd)   // 受target封顶
+</span></span><span class=line><span class=cl>else (STARTUP)
+</span></span><span class=line><span class=cl>    cwnd += acked                           // 不封顶，指数增长
+</span></span><span class=line><span class=cl>cwnd = max(cwnd, 4)                         // 最小4包
+</span></span><span class=line><span class=cl>cwnd = min(cwnd, snd_cwnd_clamp)            // 全局上限
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>if (PROBE_RTT)
+</span></span><span class=line><span class=cl>    cwnd = min(cwnd, 4)                     // 强制压到4包
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=六辅助机制>六、辅助机制</h2><h3 id=61-token-bucket-限速器检测lt-采样>6.1 Token-Bucket 限速器检测（LT 采样）</h3><p>互联网中广泛部署 token-bucket 流量限速器。限速器允许短期突发（token 充满），但长期限制速率。BBR 的 BtlBw 估计会被突发阶段的高速率"污染"。</p><p><strong>三阶段状态机</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+</span></span><span class=line><span class=cl>│   空闲等待    │  丢包→  │   采样测速    │  确认→  │  使用限速值   │
+</span></span><span class=line><span class=cl>│ (等token耗尽) │ ─────→ │ (量4~16 RTT)  │ ─────→ │ (跑48 RTT)   │
+</span></span><span class=line><span class=cl>└──────────────┘         └──────────────┘         └──────┬───────┘
+</span></span><span class=line><span class=cl>       ↑                        │ 失败                     │ 到期
+</span></span><span class=line><span class=cl>       └────────────────────────┘                         │
+</span></span><span class=line><span class=cl>       ↑──────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><p><strong>检测算法</strong>（<code>bbr_lt_bw_sampling</code> + <code>bbr_lt_bw_interval_done</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>1. 空闲等待(lt_is_sampling=0)：等首次丢包（token耗尽信号）
+</span></span><span class=line><span class=cl>2. 开始采样(lt_is_sampling=1)：记录起点快照
+</span></span><span class=line><span class=cl>3. 累计 4-16 RTT 后，等再次丢包结束区间
+</span></span><span class=line><span class=cl>4. 检查 丢包率 = lost / delivered
+</span></span><span class=line><span class=cl>5. 如果丢包率 ≥ 20% → 高丢包区间 → 计算平均投递速率
+</span></span><span class=line><span class=cl>6. bbr_lt_bw_interval_done()：
+</span></span><span class=line><span class=cl>   ├── 首次(lt_bw=0)：记住bw，等下一区间
+</span></span><span class=line><span class=cl>   └── 有上一区间(lt_bw≠0)：比较两区间
+</span></span><span class=line><span class=cl>       ├── 相近(差异≤12.5%或≤4Kbps) → lt_bw取平均，lt_use_bw=1
+</span></span><span class=line><span class=cl>       └── 不相近 → 覆盖lt_bw，重来
+</span></span><span class=line><span class=cl>7. 使用中(lt_use_bw=1)：pacing用lt_bw替代BtlBw，48 RTT后重置
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键设计选择</strong>：</p><ul><li>用"丢包到丢包"而非固定时间做区间——对齐 token-bucket 的自然消耗周期</li><li>双区间确认——避免偶发拥塞误判</li><li>相对阈值(12.5%) + 绝对阈值(4Kbps)——高速率和低速率都能正确判定</li></ul><h3 id=62-ack-聚合补偿>6.2 ACK 聚合补偿</h3><p>网络设备 (LRO/GRO) 和 delayed-ACK 可能导致 ACK 聚合到达。在 ACK 间隙期间，如果 cwnd 不够大，发送端被迫停发。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>expected_acked = BtlBw × epoch_duration
+</span></span><span class=line><span class=cl>extra_acked = actual_acked - expected_acked
+</span></span><span class=line><span class=cl>target_cwnd += max(extra_acked, 过去 5-10 RTT)
+</span></span></code></pre></td></tr></table></div></div><p>使用双缓冲实现近似滑动窗口，每 5 RTT 轮换一次。</p><h3 id=63-丢包恢复packet-conservation>6.3 丢包恢复（Packet Conservation）</h3><p>BBR 不因丢包大幅砍 cwnd，而是使用温和的包守恒原则：</p><div class=table-wrapper><table><thead><tr><th>恢复阶段</th><th>策略</th><th>效果</th></tr></thead><tbody><tr><td>第 1 轮</td><td>cwnd = max(cwnd, inflight + acked)</td><td>严格一进一出</td></tr><tr><td>后续轮次</td><td>cwnd += acked (受 target_cwnd 封顶)</td><td>允许慢启动增长</td></tr><tr><td>退出恢复</td><td>cwnd = max(cwnd, prior_cwnd)</td><td>恢复之前保存的 cwnd</td></tr></tbody></table></div><hr><h2 id=七完整的一次-ack-处理时序例子>七、完整的一次 ACK 处理时序（例子）</h2><p>以一个处于 <strong>PROBE_BW Phase 2 (gain=1.0)</strong> 稳态运行的连接为例，一个 ACK 到达时的完整执行流程：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>ACK到达，TCP栈调用 bbr_main(sk, rs)
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>├── bbr_update_model(sk, rs)
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_update_bw()
+</span></span><span class=line><span class=cl>│   │   ├── round_start=0（默认非轮次起点）
+</span></span><span class=line><span class=cl>│   │   ├── rs-&gt;delivered=5, interval_us=10000 → 有效样本
+</span></span><span class=line><span class=cl>│   │   ├── prior_delivered=8000, next_rtt_delivered=7800
+</span></span><span class=line><span class=cl>│   │   │   !before(8000,7800)=true → 新轮次！
+</span></span><span class=line><span class=cl>│   │   │   next_rtt_delivered=8005, rtt_cnt++, round_start=1
+</span></span><span class=line><span class=cl>│   │   ├── bbr_lt_bw_sampling() → lt_use_bw=0, 无丢包 → 直接return
+</span></span><span class=line><span class=cl>│   │   ├── bw = 5 × 2^24 / 10000 = 8388 (pkts/usec定点)
+</span></span><span class=line><span class=cl>│   │   └── !app_limited → minmax_running_max(bw=8388, window=10, t=rtt_cnt)
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_update_ack_aggregation()
+</span></span><span class=line><span class=cl>│   │   ├── round_start=1 → extra_acked_win_rtts++
+</span></span><span class=line><span class=cl>│   │   ├── expected_acked=7000, actual=7500 → extra=500
+</span></span><span class=line><span class=cl>│   │   └── extra_acked[idx] = max(extra_acked[idx], 500)
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_update_cycle_phase()
+</span></span><span class=line><span class=cl>│   │   ├── mode=PROBE_BW → 检查是否切phase
+</span></span><span class=line><span class=cl>│   │   ├── gain=1.0(巡航) → 纯时间驱动
+</span></span><span class=line><span class=cl>│   │   └── 时间 &gt; min_rtt → 推进到Phase 3
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_check_full_bw_reached()
+</span></span><span class=line><span class=cl>│   │   └── full_bw_reached=1 → 跳过（已经过了STARTUP）
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_check_drain()
+</span></span><span class=line><span class=cl>│   │   └── mode=PROBE_BW → 跳过（不是STARTUP也不是DRAIN）
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   ├── bbr_update_min_rtt()
+</span></span><span class=line><span class=cl>│   │   ├── rtt_us=20100, min_rtt_us=20000 → 不更小，不更新
+</span></span><span class=line><span class=cl>│   │   ├── filter_expired=false（还没到10s）→ 不进PROBE_RTT
+</span></span><span class=line><span class=cl>│   │   └── delivered&gt;0 → idle_restart=0
+</span></span><span class=line><span class=cl>│   │
+</span></span><span class=line><span class=cl>│   └── bbr_update_gains()
+</span></span><span class=line><span class=cl>│       ├── mode=PROBE_BW
+</span></span><span class=line><span class=cl>│       ├── pacing_gain = gain_cycle[3] = BBR_UNIT (1.0)
+</span></span><span class=line><span class=cl>│       └── cwnd_gain = 2.0
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>├── bw = bbr_bw() = bbr_max_bw() = 8500 (滤波器当前最大值)
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>├── bbr_set_pacing_rate(bw=8500, gain=1.0)
+</span></span><span class=line><span class=cl>│   ├── rate = 8500 × 1.0 × mss × 0.99 → 转bytes/sec
+</span></span><span class=line><span class=cl>│   ├── full_bw_reached=1 → 允许上下调整
+</span></span><span class=line><span class=cl>│   └── sk_pacing_rate = rate
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>└── bbr_set_cwnd(acked=5, bw=8500, gain=2.0)
+</span></span><span class=line><span class=cl>    ├── bbr_set_cwnd_to_recover_or_restore() → 不在Recovery → false
+</span></span><span class=line><span class=cl>    ├── target = bbr_bdp(8500, 2.0)
+</span></span><span class=line><span class=cl>    │         = ceil(8500 × 20000 × 2.0 / 2^24 / 2^8) = 20 pkts
+</span></span><span class=line><span class=cl>    ├── target += extra_acked = 20 + 2 = 22
+</span></span><span class=line><span class=cl>    ├── target = quantization_budget(22) → 22 + 3×2 + 取偶 = 28
+</span></span><span class=line><span class=cl>    ├── cwnd = min(cwnd+5, 28) = min(27, 28) = 27
+</span></span><span class=line><span class=cl>    ├── cwnd = max(27, 4) = 27
+</span></span><span class=line><span class=cl>    └── tcp_snd_cwnd_set(27)
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=八关键设计选择总结>八、关键设计选择总结</h2><div class=table-wrapper><table><thead><tr><th>设计选择</th><th>原因</th></tr></thead><tbody><tr><td>基于带宽而非丢包</td><td>避免 bufferbloat 和浅缓冲问题</td></tr><tr><td>BtlBw 取最大值</td><td>噪声只向下偏，取 max 过滤</td></tr><tr><td>RTprop 取最小值</td><td>排队只向上偏，取 min 过滤</td></tr><tr><td>pacing_rate 含 1% 边际</td><td>防止带宽高估导致队列持续积累</td></tr><tr><td>cwnd 不含 1% 边际</td><td>cwnd 是上限，需要宽松余量</td></tr><tr><td>BDP 向上取整</td><td>宁可多0.x包排队，不让管道欠载</td></tr><tr><td>high_gain = 2/ln(2)</td><td>使 paced 慢启动与传统慢启动增长速度匹配</td></tr><tr><td>drain_gain = 1/high_gain</td><td>排空数据量与 STARTUP 多注入量对称</td></tr><tr><td>DRAIN cwnd_gain 不降</td><td>防止突然停发，用 pacing 渐进排空</td></tr><tr><td>8 phase gain cycle</td><td>探测+排空+6轮巡航，带宽均衡</td></tr><tr><td>随机起始 phase</td><td>避免多流同步震荡</td></tr><tr><td>Phase 0 时间+inflight双条件</td><td>保证探测有效性</td></tr><tr><td>Phase 1 时间或inflight任一</td><td>排空越快越好</td></tr><tr><td>10 RTT BtlBw 窗口</td><td>覆盖完整 gain cycle + 余量</td></tr><tr><td>10 秒 RTprop 窗口</td><td>适应路由变化</td></tr><tr><td>PROBE_RTT 200ms/10s</td><td>2% 开销换取准确的 RTprop</td></tr><tr><td>PROBE_RTT 排除 delayed ACK</td><td>防止人为高 RTT 污染 RTprop</td></tr><tr><td>PROBE_RTT 等一个 round_start</td><td>确保排空后的包走完一个来回</td></tr><tr><td>PROBE_RTT 标记 app_limited</td><td>保护 BtlBw 不被低速样本拉低</td></tr><tr><td>cwnd 最小 4 包</td><td>保证 delayed-ACK 下持续发送</td></tr><tr><td>LT 双区间确认</td><td>避免偶发拥塞误判为限速器</td></tr><tr><td>包守恒(packet conservation)</td><td>丢包恢复期间不向拥塞网络注入额外负载</td></tr></tbody></table></div><hr><h2 id=九与-linux-tcp-栈的衔接本树-51578>九、与 Linux TCP 栈的衔接（本树 5.15.78）</h2><h3 id=91-拥塞控制入口每个-ack-一次>9.1 拥塞控制入口：每个 ACK 一次</h3><p>ACK 处理路径在生成 <code>rate_sample</code> 后调用 <code>tcp_cong_control()</code>。若当前算法实现了 <code>cong_control</code>（BBR 如此），则<strong>只调用该回调</strong>，不再走传统的 <code>tcp_cong_avoid()</code> / <code>tcp_cwnd_reduction()</code>，也<strong>不会</strong>在该路径末尾执行 <code>tcp_update_pacing_rate()</code>（BBR 自己在 <code>bbr_main</code> 里设置 <code>sk_pacing_rate</code>）。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-4228:4246:net/ipv4/tcp_input.c data-lang=4228:4246:net/ipv4/tcp_input.c><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_cong_control</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u32</span> <span class=n>ack</span><span class=p>,</span> <span class=n>u32</span> <span class=n>acked_sacked</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>			     <span class=kt>int</span> <span class=n>flag</span><span class=p>,</span> <span class=k>const</span> <span class=k>struct</span> <span class=n>rate_sample</span> <span class=o>*</span><span class=n>rs</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>const</span> <span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_ops</span><span class=o>-&gt;</span><span class=n>cong_control</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_ops</span><span class=o>-&gt;</span><span class=nf>cong_control</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>rs</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_in_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=cm>/* Reduce cwnd if state mandates */</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>acked_sacked</span><span class=p>,</span> <span class=n>rs</span><span class=o>-&gt;</span><span class=n>losses</span><span class=p>,</span> <span class=n>flag</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_may_raise_cwnd</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>flag</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=cm>/* Advance cwnd if state allows */</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_cong_avoid</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ack</span><span class=p>,</span> <span class=n>acked_sacked</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_update_pacing_rate</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>BBR 通过 <code>tcp_congestion_ops</code> 注册 <code>.cong_control = bbr_main</code>（见下文 §十一）。</p><h3 id=92-发送侧pacing_rate-与-cwnd-如何生效>9.2 发送侧：pacing_rate 与 cwnd 如何"生效"</h3><p>拥塞算法更新 <code>snd_cwnd</code> 与 <code>sk_pacing_rate</code> 后，<strong>是否发得出去</strong>仍由发送引擎综合判断：<code>tcp_write_xmit()</code> 中依次受 <strong>pacing</strong>、<strong>拥塞窗口配额</strong>、<strong>对端接收窗口</strong>、Nagle/TSO 推迟、small-queue 等约束。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-3435:3457:net/ipv4/tcp_output.c data-lang=3435:3457:net/ipv4/tcp_output.c><span class=line><span class=cl>		<span class=cm>/* TCP pacing检查：控制发送速率，避免突发流量 */</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_pacing_check</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=k>break</span><span class=p>;</span>  <span class=cm>/* 发送速率受限，暂停发送 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=cm>/* 初始化TSO段数 */</span>
+</span></span><span class=line><span class=cl>		<span class=n>tso_segs</span> <span class=o>=</span> <span class=nf>tcp_init_tso_segs</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>mss_now</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>BUG_ON</span><span class=p>(</span><span class=o>!</span><span class=n>tso_segs</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=cm>/* 拥塞窗口测试：检查是否有足够的拥塞窗口配额 */</span>
+</span></span><span class=line><span class=cl>		<span class=n>cwnd_quota</span> <span class=o>=</span> <span class=nf>tcp_cwnd_test</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>cwnd_quota</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=k>if</span> <span class=p>(</span><span class=n>push_one</span> <span class=o>==</span> <span class=mi>2</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>				<span class=cm>/* 强制发送loss probe包（用于快速丢包检测） */</span>
+</span></span><span class=line><span class=cl>				<span class=n>cwnd_quota</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>			<span class=k>else</span>
+</span></span><span class=line><span class=cl>				<span class=k>break</span><span class=p>;</span>  <span class=cm>/* 拥塞窗口已满，停止发送 */</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=cm>/* 接收窗口测试：检查对端是否有足够的接收空间 */</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=o>!</span><span class=nf>tcp_snd_wnd_test</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>mss_now</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=n>is_rwnd_limited</span> <span class=o>=</span> <span class=nb>true</span><span class=p>;</span>  <span class=cm>/* 接收窗口限制 */</span>
+</span></span><span class=line><span class=cl>			<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>要点</strong>：BBR 侧 <code>pacing_rate</code> 管注入节奏，<code>cwnd</code> 管在途上限；栈侧还有 <strong>rwnd、应用 sndbuf</strong> 等外层限制。</p><h3 id=93-部署提示与源码注释一致>9.3 部署提示（与源码注释一致）</h3><p><code>tcp_bbr.c</code> 文件头建议：<strong>尽量配合 fq qdisc</strong>（<code>man tc-fq</code>），以便由队列规则做 pacing；否则栈内为每连接软件 pacing（定时器），CPU 开销更高。见 <code>net/ipv4/tcp_bbr.c</code> 顶部注释（约 L178–180）。</p><hr><h2 id=十内核关键常量速查tcp_bbrc>十、内核关键常量速查（<code>tcp_bbr.c</code>）</h2><p>以下符号均为 <code>static const</code>，行号对应本仓库 <strong>5.15.78</strong> 版本，便于对照与升级内核时 diff。</p><div class=table-wrapper><table><thead><tr><th>符号</th><th>含义</th><th>典型值 / 说明</th></tr></thead><tbody><tr><td><code>CYCLE_LEN</code></td><td>PROBE_BW 下 pacing_gain 循环长度</td><td>8（L291）</td></tr><tr><td><code>bbr_bw_rtts</code></td><td>BtlBw 滤波窗口（RTT 轮数）</td><td><code>CYCLE_LEN + 2</code> = 10（L303）</td></tr><tr><td><code>bbr_min_rtt_win_sec</code></td><td>RTprop / min_rtt 过期判据</td><td>10 秒 → 触发 PROBE_RTT（L308）</td></tr><tr><td><code>bbr_probe_rtt_mode_ms</code></td><td>PROBE_RTT 最短持续时间</td><td>200 ms（L313）</td></tr><tr><td><code>bbr_pacing_margin_percent</code></td><td>pacing 相对 BtlBw 的下修比例</td><td>1%（L324）</td></tr><tr><td><code>bbr_high_gain</code></td><td>STARTUP pacing/cwnd 增益</td><td>≈ 2/ln(2)（定点，L341）</td></tr><tr><td><code>bbr_drain_gain</code></td><td>DRAIN pacing 增益</td><td>≈ 1/high_gain（L355）</td></tr><tr><td><code>bbr_cwnd_gain</code></td><td>PROBE_BW 下 cwnd 增益</td><td>2.0（L363）</td></tr><tr><td><code>bbr_pacing_gain[]</code></td><td>PROBE_BW 八相位表</td><td>5/4, 3/4, 1×6（L380–385）</td></tr><tr><td><code>bbr_cycle_rand</code></td><td>进入 PROBE_BW 时起始相位随机上界</td><td>7（L392）</td></tr><tr><td><code>bbr_cwnd_min_target</code></td><td>最小 cwnd（包）</td><td>4（L400）</td></tr><tr><td><code>bbr_full_bw_thresh</code></td><td>STARTUP 管道满判定增长阈值</td><td>25%（L411）</td></tr><tr><td><code>bbr_full_bw_cnt</code></td><td>STARTUP 连续停滞轮数判定</td><td>3（L418）</td></tr><tr><td><code>bbr_lt_intvl_min_rtts</code></td><td>LT 采样区间最小 RTT 轮数</td><td>4（L432）</td></tr><tr><td><code>bbr_lt_loss_thresh</code></td><td>LT 高丢包率判定阈值</td><td>50/256 ≈ 20%（L438）</td></tr><tr><td><code>bbr_lt_bw_ratio</code></td><td>LT 带宽一致性相对阈值</td><td>1/8 = 12.5%（L442）</td></tr><tr><td><code>bbr_lt_bw_diff</code></td><td>LT 带宽一致性绝对阈值</td><td>4Kbps = 500 bytes/sec（L447）</td></tr><tr><td><code>bbr_lt_bw_max_rtts</code></td><td>LT lt_bw 使用期限</td><td>48 轮（L451）</td></tr></tbody></table></div><p>带宽定点：<code>BW_SCALE</code>、<code>BW_UNIT</code>（约 L199–200）；增益定点：<code>BBR_SCALE</code>、<code>BBR_UNIT</code>（约 L209–210）。</p><hr><h2 id=十一源码导航tcp_bbrc>十一、源码导航（<code>tcp_bbr.c</code>）</h2><div class=table-wrapper><table><thead><tr><th>区域</th><th>函数 / 符号</th><th>作用</th></tr></thead><tbody><tr><td>状态与模型</td><td><code>enum bbr_mode</code>，<code>struct bbr</code></td><td>每连接私有状态，存于 <code>icsk_ca_priv</code>（约 L216 起）</td></tr><tr><td>主循环</td><td><code>bbr_main()</code> → <code>bbr_update_model()</code></td><td>每 ACK：更新模型 → <code>bbr_set_pacing_rate()</code> → <code>bbr_set_cwnd()</code>（约 L1822–1868）</td></tr><tr><td>带宽</td><td><code>bbr_update_bw()</code>，<code>bbr_bw()</code></td><td>投递速率采样 + <code>minmax</code> 最大窗（BtlBw）</td></tr><tr><td>RTT</td><td><code>bbr_update_min_rtt()</code></td><td>min RTT 窗、PROBE_RTT 进出</td></tr><tr><td>状态机</td><td><code>bbr_check_full_bw_reached()</code>，<code>bbr_check_drain()</code>，<code>bbr_update_cycle_phase()</code></td><td>STARTUP/DRAIN/PROBE_BW/PROBE_RTT 迁移</td></tr><tr><td>LT 限速器</td><td><code>bbr_lt_bw_sampling()</code>，<code>bbr_lt_bw_interval_done()</code></td><td>token-bucket 限速场景（与丢包区间配合）</td></tr><tr><td>cwnd 控制</td><td><code>bbr_set_cwnd()</code>，<code>bbr_bdp()</code>，<code>bbr_quantization_budget()</code></td><td>BDP 计算、量化预算、丢包恢复</td></tr><tr><td>pacing 控制</td><td><code>bbr_set_pacing_rate()</code>，<code>bbr_bw_to_pacing_rate()</code></td><td>速率设置、定点转换、1% 边际</td></tr><tr><td>ACK 聚合</td><td><code>bbr_update_ack_aggregation()</code>，<code>bbr_ack_aggregation_cwnd()</code></td><td>双缓冲追踪、cwnd 补偿</td></tr><tr><td>增益设置</td><td><code>bbr_update_gains()</code></td><td>根据 mode 设置 pacing_gain / cwnd_gain</td></tr><tr><td>栈回调</td><td><code>bbr_init</code>，<code>bbr_ssthresh</code>，<code>bbr_undo_cwnd</code>，<code>bbr_cwnd_event</code>，<code>bbr_set_state</code></td><td>初始化、<code>snd_ssthresh=∞</code>、恢复/空闲/RTO 等</td></tr><tr><td>模块注册</td><td><code>tcp_bbr_cong_ops</code>，<code>bbr_register</code></td><td><code>.name = "bbr"</code>，<code>.cong_control = bbr_main</code>（约 L2104–2127）</td></tr></tbody></table></div><p>诊断：<code>bbr_get_info()</code> → <code>ss</code>/INET_DIAG 可见 <code>bbr_bw*</code>，<code>bbr_min_rtt</code>，<code>bbr_pacing_gain</code>，<code>bbr_cwnd_gain</code>（约 L2015–2045）。</p><hr><h2 id=十二维护与核对清单>十二、维护与核对清单</h2><ol><li><strong>升级内核版本</strong>：优先 diff <code>tcp_bbr.c</code> 中 §十所列常量与 <code>bbr_main</code> 调用链，再同步本文档表格与流程描述。</li><li><strong>区分论文与实现</strong>：队列规则、ECN、与 CUBIC 共存等以<strong>当前内核行为</strong>为准。</li><li><strong>与通用 TCP 文档配合</strong>：拥塞插件接口见 <code>include/net/tcp.h</code> 中 <code>struct tcp_congestion_ops</code>；ACK 总入口见 <code>net/ipv4/tcp_input.c</code> 中 <code>tcp_ack()</code> → <code>tcp_cong_control()</code>。</li></ol><hr><h2 id=十三参考文献>十三、参考文献</h2><ul><li>Neal Cardwell, Yuchung Cheng, C. Stephen Gunn, Soheil Hassas Yeganeh, Van Jacobson.
+&ldquo;BBR: Congestion-Based Congestion Control&rdquo;, ACM Queue, Vol. 14 No. 5, Sep-Oct 2016.</li><li>Linux 内核源码: <code>net/ipv4/tcp_bbr.c</code> (v5.15.78)</li><li>BBR 开发讨论邮件列表: <a class=link href=https://groups.google.com/forum/#!forum/bbr-dev target=_blank rel=noopener>https://groups.google.com/forum/#!forum/bbr-dev</a></li></ul></section><footer class=article-footer><section class=article-tags><a href=/tags/bbr/>BBR</a>
+<a href=/tags/%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6/>拥塞控制</a>
+<a href=/tags/pacing_rate/>Pacing_rate</a>
+<a href=/tags/cwnd/>Cwnd</a>
+<a href=/tags/%E7%8A%B6%E6%80%81%E6%9C%BA/>状态机</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article><article><a href=/p/tcp-%E5%8F%91%E9%80%81%E5%85%A8%E8%B7%AF%E5%BE%84%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90%E4%BB%8E-send-%E5%88%B0%E7%BD%91%E5%8D%A1/><div class=article-details><h2 class=article-title>TCP 发送全路径深度分析——从 send() 到网卡</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E9%97%AE%E7%AD%94%E9%80%9F%E7%8E%87%E9%87%87%E6%A0%B7rack%E9%87%8D%E4%BC%A0%E5%AE%9A%E6%97%B6%E5%99%A8cubicbbr/><div class=article-details><h2 class=article-title>TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR</h2></div></a></article><article><a href=/p/linux-5.15.78-tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E7%AE%97%E6%B3%95%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 5.15.78 TCP 拥塞控制算法实现原理分析</h2></div></a></article><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

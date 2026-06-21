@@ -1,0 +1,1055 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="TCP 拥塞控制四大机制源码实现 基于 Linux 5.15.78，深入分析慢启动、拥塞避免、拥塞发生（丢包检测）、快速恢复（PRR）的实际代码实现。 拥塞控制框架与算法注册机制参见 TCP 协议栈架构 第 8 章，CUBIC 详见 TCP 拥塞控制算法，BBR 详见 BBR 算法原理。\n一、慢启动 (Slow Start) 1.1 设计原理 慢启动的目标是在连接初期快速探测网络可用带宽。每收到一个 ACK，拥塞窗口 snd_cwnd 增加 1 个 MSS，实际效果是每个 RTT 窗口翻倍，呈指数增长。当 cwnd >= ssthresh 时退出慢启动，进入拥塞避免。\n1.2 初始化：新连接的慢启动状态 新连接创建时，tcp_init_sock() 设置初始慢启动参数：\n1 2 3 4 // net/ipv4/tcp.c: tcp_init_sock() tcp_snd_cwnd_set(tp, TCP_INIT_CWND); // 初始 cwnd = 10 (RFC 6928) tp->snd_ssthresh = TCP_INFINITE_SSTHRESH; // ssthresh = 0x7fffffff（无穷大） tp->snd_cwnd_clamp = ~0; // cwnd 上限 = 无限制 TCP_INFINITE_SSTHRESH = 0x7fffffff，意味着新连接始终从慢启动开始（因为 cwnd < ssthresh 永远为真），直到首次发生丢包才确定真正的 ssthresh。\n"><title>TCP 拥塞控制四大机制源码实现</title><link rel=canonical href=https://1bit2.github.io/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP 拥塞控制四大机制源码实现"><meta property='og:description' content="TCP 拥塞控制四大机制源码实现 基于 Linux 5.15.78，深入分析慢启动、拥塞避免、拥塞发生（丢包检测）、快速恢复（PRR）的实际代码实现。 拥塞控制框架与算法注册机制参见 TCP 协议栈架构 第 8 章，CUBIC 详见 TCP 拥塞控制算法，BBR 详见 BBR 算法原理。\n一、慢启动 (Slow Start) 1.1 设计原理 慢启动的目标是在连接初期快速探测网络可用带宽。每收到一个 ACK，拥塞窗口 snd_cwnd 增加 1 个 MSS，实际效果是每个 RTT 窗口翻倍，呈指数增长。当 cwnd >= ssthresh 时退出慢启动，进入拥塞避免。\n1.2 初始化：新连接的慢启动状态 新连接创建时，tcp_init_sock() 设置初始慢启动参数：\n1 2 3 4 // net/ipv4/tcp.c: tcp_init_sock() tcp_snd_cwnd_set(tp, TCP_INIT_CWND); // 初始 cwnd = 10 (RFC 6928) tp->snd_ssthresh = TCP_INFINITE_SSTHRESH; // ssthresh = 0x7fffffff（无穷大） tp->snd_cwnd_clamp = ~0; // cwnd 上限 = 无限制 TCP_INFINITE_SSTHRESH = 0x7fffffff，意味着新连接始终从慢启动开始（因为 cwnd < ssthresh 永远为真），直到首次发生丢包才确定真正的 ssthresh。\n"><meta property='og:url' content='https://1bit2.github.io/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='拥塞控制'><meta property='article:tag' content='慢启动'><meta property='article:tag' content='拥塞避免'><meta property='article:tag' content='PRR'><meta property='article:tag' content='快速恢复'><meta property='article:tag' content='RACK'><meta property='article:tag' content='CUBIC'><meta property='article:tag' content='tcp_enter_recovery'><meta property='article:tag' content='tcp_enter_loss'><meta property='article:published_time' content='2026-04-29T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-29T00:00:00+00:00'><meta name=twitter:title content="TCP 拥塞控制四大机制源码实现"><meta name=twitter:description content="TCP 拥塞控制四大机制源码实现 基于 Linux 5.15.78，深入分析慢启动、拥塞避免、拥塞发生（丢包检测）、快速恢复（PRR）的实际代码实现。 拥塞控制框架与算法注册机制参见 TCP 协议栈架构 第 8 章，CUBIC 详见 TCP 拥塞控制算法，BBR 详见 BBR 算法原理。\n一、慢启动 (Slow Start) 1.1 设计原理 慢启动的目标是在连接初期快速探测网络可用带宽。每收到一个 ACK，拥塞窗口 snd_cwnd 增加 1 个 MSS，实际效果是每个 RTT 窗口翻倍，呈指数增长。当 cwnd >= ssthresh 时退出慢启动，进入拥塞避免。\n1.2 初始化：新连接的慢启动状态 新连接创建时，tcp_init_sock() 设置初始慢启动参数：\n1 2 3 4 // net/ipv4/tcp.c: tcp_init_sock() tcp_snd_cwnd_set(tp, TCP_INIT_CWND); // 初始 cwnd = 10 (RFC 6928) tp->snd_ssthresh = TCP_INFINITE_SSTHRESH; // ssthresh = 0x7fffffff（无穷大） tp->snd_cwnd_clamp = ~0; // cwnd 上限 = 无限制 TCP_INFINITE_SSTHRESH = 0x7fffffff，意味着新连接始终从慢启动开始（因为 cwnd < ssthresh 永远为真），直到首次发生丢包才确定真正的 ssthresh。\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一慢启动-slow-start>一、慢启动 (Slow Start)</a><ol><li><a href=#11-设计原理>1.1 设计原理</a></li><li><a href=#12-初始化新连接的慢启动状态>1.2 初始化：新连接的慢启动状态</a></li><li><a href=#13-核心判断是否在慢启动>1.3 核心判断：是否在慢启动</a></li><li><a href=#14-慢启动核心实现>1.4 慢启动核心实现</a></li><li><a href=#15-调用路径以-reno-和-cubic-为例>1.5 调用路径：以 Reno 和 CUBIC 为例</a></li><li><a href=#16-窗口使用率检查>1.6 窗口使用率检查</a></li><li><a href=#17-慢启动增长过程图示>1.7 慢启动增长过程图示</a></li></ol></li><li><a href=#二拥塞避免-congestion-avoidance>二、拥塞避免 (Congestion Avoidance)</a><ol><li><a href=#21-设计原理>2.1 设计原理</a></li><li><a href=#22-核心实现tcp_cong_avoid_ai>2.2 核心实现：<code>tcp_cong_avoid_ai</code></a></li><li><a href=#23-reno-vs-cubic-的拥塞避免对比>2.3 Reno vs CUBIC 的拥塞避免对比</a></li><li><a href=#24-何时调用拥塞避免>2.4 何时调用拥塞避免</a></li></ol></li><li><a href=#三拥塞发生-congestion-event--loss-detection>三、拥塞发生 (Congestion Event / Loss Detection)</a><ol><li><a href=#31-两种丢包检测机制>3.1 两种丢包检测机制</a></li><li><a href=#32-快速检测路径tcp_fastretrans_alert>3.2 快速检测路径：<code>tcp_fastretrans_alert</code></a></li><li><a href=#33-何时判定需要进入恢复>3.3 何时判定需要进入恢复</a></li><li><a href=#34-进入快速恢复tcp_enter_recovery>3.4 进入快速恢复：<code>tcp_enter_recovery</code></a></li><li><a href=#35-rto-超时路径tcp_enter_loss>3.5 RTO 超时路径：<code>tcp_enter_loss</code></a></li><li><a href=#36-快速恢复-vs-rto-的对比>3.6 快速恢复 vs RTO 的对比</a></li></ol></li><li><a href=#四快速恢复-fast-recovery--prr>四、快速恢复 (Fast Recovery / PRR)</a><ol><li><a href=#41-设计原理>4.1 设计原理</a></li><li><a href=#42-prr-核心实现>4.2 PRR 核心实现</a></li><li><a href=#43-prr-三种情况图示>4.3 PRR 三种情况图示</a></li><li><a href=#44-prr-的关键变量>4.4 PRR 的关键变量</a></li><li><a href=#45-prr_out-的更新位置>4.5 <code>prr_out</code> 的更新位置</a></li><li><a href=#46-重传队列处理>4.6 重传队列处理</a></li><li><a href=#47-恢复结束>4.7 恢复结束</a></li><li><a href=#48-撤销机制>4.8 撤销机制</a></li></ol></li><li><a href=#五四大机制完整调用链路>五、四大机制完整调用链路</a></li><li><a href=#六四大机制对应的-snd_cwnd-变化总结>六、四大机制对应的 <code>snd_cwnd</code> 变化总结</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/>TCP 拥塞控制四大机制源码实现</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 29, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>12 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp-拥塞控制四大机制源码实现>TCP 拥塞控制四大机制源码实现</h1><blockquote><p>基于 Linux 5.15.78，深入分析慢启动、拥塞避免、拥塞发生（丢包检测）、快速恢复（PRR）的实际代码实现。
+拥塞控制框架与算法注册机制参见 <a class=link href=TCP%e5%8d%8f%e8%ae%ae%e6%a0%88%e6%9e%b6%e6%9e%84.md>TCP 协议栈架构</a> 第 8 章，CUBIC 详见 <a class=link href=TCP%e6%8b%a5%e5%a1%9e%e6%8e%a7%e5%88%b6%e7%ae%97%e6%b3%95.md>TCP 拥塞控制算法</a>，BBR 详见 <a class=link href=BBR%e7%ae%97%e6%b3%95%e5%8e%9f%e7%90%86.md>BBR 算法原理</a>。</p></blockquote><h2 id=一慢启动-slow-start>一、慢启动 (Slow Start)</h2><h3 id=11-设计原理>1.1 设计原理</h3><p>慢启动的目标是在连接初期快速探测网络可用带宽。每收到一个 ACK，拥塞窗口 <code>snd_cwnd</code> 增加 1 个 MSS，实际效果是每个 RTT 窗口翻倍，呈指数增长。当 <code>cwnd >= ssthresh</code> 时退出慢启动，进入拥塞避免。</p><h3 id=12-初始化新连接的慢启动状态>1.2 初始化：新连接的慢启动状态</h3><p>新连接创建时，<code>tcp_init_sock()</code> 设置初始慢启动参数：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c: tcp_init_sock()
+</span></span></span><span class=line><span class=cl><span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>TCP_INIT_CWND</span><span class=p>);</span>      <span class=c1>// 初始 cwnd = 10 (RFC 6928)
+</span></span></span><span class=line><span class=cl><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span> <span class=o>=</span> <span class=n>TCP_INFINITE_SSTHRESH</span><span class=p>;</span>  <span class=c1>// ssthresh = 0x7fffffff（无穷大）
+</span></span></span><span class=line><span class=cl><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_clamp</span> <span class=o>=</span> <span class=o>~</span><span class=mi>0</span><span class=p>;</span>                   <span class=c1>// cwnd 上限 = 无限制
+</span></span></span></code></pre></td></tr></table></div></div><p><code>TCP_INFINITE_SSTHRESH = 0x7fffffff</code>，意味着新连接<strong>始终从慢启动开始</strong>（因为 <code>cwnd &lt; ssthresh</code> 永远为真），直到首次发生丢包才确定真正的 <code>ssthresh</code>。</p><h3 id=13-核心判断是否在慢启动>1.3 核心判断：是否在慢启动</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>tcp_in_slow_start</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&lt;</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>tcp_in_initial_slowstart</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span> <span class=o>&gt;=</span> <span class=n>TCP_INFINITE_SSTHRESH</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=14-慢启动核心实现>1.4 慢启动核心实现</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_cong.c
+</span></span></span><span class=line><span class=cl><span class=n>u32</span> <span class=nf>tcp_slow_start</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>,</span> <span class=n>u32</span> <span class=n>acked</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>cwnd</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>+</span> <span class=n>acked</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>acked</span> <span class=o>-=</span> <span class=n>cwnd</span> <span class=o>-</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>    <span class=c1>// 剩余 acked 留给拥塞避免
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>min</span><span class=p>(</span><span class=n>cwnd</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_clamp</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>acked</span><span class=p>;</span>  <span class=c1>// 返回未消耗的 acked 计数
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键设计点</strong>：</p><ol><li><strong><code>cwnd += acked</code></strong>：每个 ACK 确认 N 个段，cwnd 就增加 N，处理 stretch ACK</li><li><strong><code>min(..., snd_ssthresh)</code></strong>：cwnd 增长被 ssthresh 封顶，防止越界</li><li><strong>返回剩余 acked</strong>：如果增长到 ssthresh 后还有多余的 acked 计数，返回给调用方用于拥塞避免阶段的增长。这实现了<strong>慢启动到拥塞避免的平滑过渡</strong></li></ol><h3 id=15-调用路径以-reno-和-cubic-为例>1.5 调用路径：以 Reno 和 CUBIC 为例</h3><p><strong>Reno 的调用</strong>（<code>net/ipv4/tcp_cong.c</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_reno_cong_avoid</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u32</span> <span class=n>ack</span><span class=p>,</span> <span class=n>u32</span> <span class=n>acked</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_is_cwnd_limited</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>   <span class=c1>// 窗口没用满就不增长
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_in_slow_start</span><span class=p>(</span><span class=n>tp</span><span class=p>))</span> <span class=p>{</span>    <span class=c1>// cwnd &lt; ssthresh → 慢启动
+</span></span></span><span class=line><span class=cl>        <span class=n>acked</span> <span class=o>=</span> <span class=nf>tcp_slow_start</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>acked</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>acked</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span><span class=p>;</span>                 <span class=c1>// 全部被慢启动消耗
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 剩余 acked 进入拥塞避免
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_cong_avoid_ai</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>),</span> <span class=n>acked</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>CUBIC 的调用</strong>（<code>net/ipv4/tcp_cubic.c</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>cubictcp_cong_avoid</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u32</span> <span class=n>ack</span><span class=p>,</span> <span class=n>u32</span> <span class=n>acked</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>bictcp</span> <span class=o>*</span><span class=n>ca</span> <span class=o>=</span> <span class=nf>inet_csk_ca</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_is_cwnd_limited</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_in_slow_start</span><span class=p>(</span><span class=n>tp</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>acked</span> <span class=o>=</span> <span class=nf>tcp_slow_start</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>acked</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>acked</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>bictcp_update</span><span class=p>(</span><span class=n>ca</span><span class=p>,</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>),</span> <span class=n>acked</span><span class=p>);</span>  <span class=c1>// CUBIC 曲线计算
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_cong_avoid_ai</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>cnt</span><span class=p>,</span> <span class=n>acked</span><span class=p>);</span>        <span class=c1>// 按 CUBIC 的 cnt 增长
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>两者在慢启动阶段的行为完全相同</strong>：都调用 <code>tcp_slow_start()</code>。差异只在拥塞避免阶段——Reno 线性增长，CUBIC 按三次函数增长。</p><h3 id=16-窗口使用率检查>1.6 窗口使用率检查</h3><p>只有窗口被充分利用时才增长 cwnd，避免应用限速场景下的窗口虚增：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>tcp_is_cwnd_limited</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>is_cwnd_limited</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>true</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 慢启动中允许更激进：cwnd 被用了一半就算&#34;受限&#34;
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_in_slow_start</span><span class=p>(</span><span class=n>tp</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&lt;</span> <span class=mi>2</span> <span class=o>*</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>max_packets_out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=17-慢启动增长过程图示>1.7 慢启动增长过程图示</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>     cwnd
+</span></span><span class=line><span class=cl>      ▲
+</span></span><span class=line><span class=cl>      │                                  ┌── ssthresh
+</span></span><span class=line><span class=cl>      │                              ╱───┘
+</span></span><span class=line><span class=cl>  20  │                          ╱──╱  ← 到达 ssthresh，切换到拥塞避免
+</span></span><span class=line><span class=cl>      │                      ╱──╱      （线性增长：每 RTT 加 1）
+</span></span><span class=line><span class=cl>  16  │                  ╱──╱
+</span></span><span class=line><span class=cl>      │              ╱──╱
+</span></span><span class=line><span class=cl>   8  │          ╱──╱
+</span></span><span class=line><span class=cl>      │      ╱──╱
+</span></span><span class=line><span class=cl>   4  │  ╱──╱         慢启动阶段
+</span></span><span class=line><span class=cl>      │╱╱             （指数增长：每 RTT 翻倍）
+</span></span><span class=line><span class=cl>   2  │╱
+</span></span><span class=line><span class=cl>   1  │
+</span></span><span class=line><span class=cl>      └────────────────────────────────── RTT →
+</span></span><span class=line><span class=cl>      0    1    2    3    4    5    6    7
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=二拥塞避免-congestion-avoidance>二、拥塞避免 (Congestion Avoidance)</h2><h3 id=21-设计原理>2.1 设计原理</h3><p>当 <code>cwnd >= ssthresh</code> 后，进入拥塞避免阶段。此阶段谨慎增长窗口：理论上每个 RTT 增加 1 个 MSS（加法增大，Additive Increase）。</p><h3 id=22-核心实现tcp_cong_avoid_ai>2.2 核心实现：<code>tcp_cong_avoid_ai</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_cong.c
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_cong_avoid_ai</span><span class=p>(</span><span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>,</span> <span class=n>u32</span> <span class=n>w</span><span class=p>,</span> <span class=n>u32</span> <span class=n>acked</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 如果之前在更高 w 时积累了 credits，现在温和地应用
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_cnt</span> <span class=o>&gt;=</span> <span class=n>w</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_cnt</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>+</span> <span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_cnt</span> <span class=o>+=</span> <span class=n>acked</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_cnt</span> <span class=o>&gt;=</span> <span class=n>w</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>u32</span> <span class=n>delta</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_cnt</span> <span class=o>/</span> <span class=n>w</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_cnt</span> <span class=o>-=</span> <span class=n>delta</span> <span class=o>*</span> <span class=n>w</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>+</span> <span class=n>delta</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>min</span><span class=p>(</span><span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>),</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_clamp</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>参数 <code>w</code> 的含义</strong>：每收到 <code>w</code> 个 ACK，cwnd 增加 1。</p><ul><li><strong>Reno</strong>：<code>w = cwnd</code>，即每 cwnd 个 ACK（约一个 RTT）增加 1</li><li><strong>CUBIC</strong>：<code>w = ca->cnt</code>，由三次函数 <code>bictcp_update()</code> 计算得出</li></ul><p><strong><code>snd_cwnd_cnt</code> 的作用</strong>：这是一个分数计数器。因为 cwnd 是整数，无法直接实现 &ldquo;cwnd += 1/cwnd&rdquo;，所以用计数器累积 acked，当累积到 <code>w</code> 时才加 1。</p><h3 id=23-reno-vs-cubic-的拥塞避免对比>2.3 Reno vs CUBIC 的拥塞避免对比</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>Reno:   tcp_cong_avoid_ai(tp, tcp_snd_cwnd(tp), acked)
+</span></span><span class=line><span class=cl>        → w = cwnd，每 cwnd 个 ACK 加 1
+</span></span><span class=line><span class=cl>        → 每 RTT cwnd 线性增 1（经典 AIMD）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>CUBIC:  bictcp_update(ca, cwnd, acked)
+</span></span><span class=line><span class=cl>        → 计算 W(t) = C*(t-K)³ + W_max
+</span></span><span class=line><span class=cl>        → ca-&gt;cnt = cwnd / (W(t) - cwnd)
+</span></span><span class=line><span class=cl>        tcp_cong_avoid_ai(tp, ca-&gt;cnt, acked)
+</span></span><span class=line><span class=cl>        → cnt 小则增长快，cnt 大则增长慢
+</span></span><span class=line><span class=cl>        → 三次函数曲线：远离 W_max 时增长快，接近时增长慢
+</span></span></code></pre></td></tr></table></div></div><h3 id=24-何时调用拥塞避免>2.4 何时调用拥塞避免</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_cong_control</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u32</span> <span class=n>ack</span><span class=p>,</span> <span class=n>u32</span> <span class=n>acked_sacked</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                             <span class=kt>int</span> <span class=n>flag</span><span class=p>,</span> <span class=k>const</span> <span class=k>struct</span> <span class=n>rate_sample</span> <span class=o>*</span><span class=n>rs</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_ops</span><span class=o>-&gt;</span><span class=n>cong_control</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_ops</span><span class=o>-&gt;</span><span class=nf>cong_control</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>rs</span><span class=p>);</span>  <span class=c1>// BBR 路径：全权控制
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_in_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>acked_sacked</span><span class=p>,</span> <span class=n>rs</span><span class=o>-&gt;</span><span class=n>losses</span><span class=p>,</span> <span class=n>flag</span><span class=p>);</span>  <span class=c1>// 恢复中：PRR
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_may_raise_cwnd</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>flag</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_cong_avoid</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ack</span><span class=p>,</span> <span class=n>acked_sacked</span><span class=p>);</span>  <span class=c1>// 正常：慢启动/拥塞避免
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_update_pacing_rate</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>三个分支</strong>：</p><ol><li><strong><code>cong_control</code> 存在</strong>（BBR）：算法自己管一切，不走以下路径</li><li><strong>在 cwnd 减小阶段</strong>（Recovery/CWR）：走 PRR 算法</li><li><strong>正常状态</strong>（Open/Disorder）：走 <code>tcp_cong_avoid()</code> → 算法的 <code>cong_avoid</code> 回调</li></ol><hr><h2 id=三拥塞发生-congestion-event--loss-detection>三、拥塞发生 (Congestion Event / Loss Detection)</h2><h3 id=31-两种丢包检测机制>3.1 两种丢包检测机制</h3><p>Linux 内核有两种判定丢包的路径：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                    丢包检测
+</span></span><span class=line><span class=cl>                   ╱        ╲
+</span></span><span class=line><span class=cl>              快速检测         超时检测
+</span></span><span class=line><span class=cl>             (ACK驱动)        (定时器驱动)
+</span></span><span class=line><span class=cl>            ╱        ╲            │
+</span></span><span class=line><span class=cl>       DupACK计数    RACK       RTO超时
+</span></span><span class=line><span class=cl>       (Reno模式)  (时间模式)      │
+</span></span><span class=line><span class=cl>            │          │          │
+</span></span><span class=line><span class=cl>     tcp_time_to_    tcp_rack_  tcp_retransmit_
+</span></span><span class=line><span class=cl>     recover()      mark_lost() timer()
+</span></span><span class=line><span class=cl>            │          │          │
+</span></span><span class=line><span class=cl>            ▼          ▼          ▼
+</span></span><span class=line><span class=cl>     tcp_enter_     tcp_enter_  tcp_enter_
+</span></span><span class=line><span class=cl>     recovery()    recovery()   loss()
+</span></span><span class=line><span class=cl>       (快速恢复)   (快速恢复)   (RTO恢复)
+</span></span></code></pre></td></tr></table></div></div><h3 id=32-快速检测路径tcp_fastretrans_alert>3.2 快速检测路径：<code>tcp_fastretrans_alert</code></h3><p>这是拥塞状态机的核心，在每次 <code>tcp_ack()</code> 处理中被调用：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_fastretrans_alert</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>const</span> <span class=n>u32</span> <span class=n>prior_snd_una</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                  <span class=kt>int</span> <span class=n>num_dupack</span><span class=p>,</span> <span class=kt>int</span> <span class=o>*</span><span class=n>ack_flag</span><span class=p>,</span> <span class=kt>int</span> <span class=o>*</span><span class=n>rexmit</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>fast_rexmit</span> <span class=o>=</span> <span class=mi>0</span><span class=p>,</span> <span class=n>flag</span> <span class=o>=</span> <span class=o>*</span><span class=n>ack_flag</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>ece_ack</span> <span class=o>=</span> <span class=n>flag</span> <span class=o>&amp;</span> <span class=n>FLAG_ECE</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// A. ECE 标记 → 禁止撤销（拥塞确实发生了）
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>ece_ack</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_ssthresh</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// B. 检查 SACK reneging（对端撤回已 SACK 的数据）
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_check_sack_reneging</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>flag</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// C. 一致性验证
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_verify_left_out</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// D. 状态退出条件：snd_una 越过 high_seq
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>before</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_una</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>high_seq</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>switch</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_state</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>case</span> <span class=nl>TCP_CA_CWR</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>            <span class=nf>tcp_end_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=nf>tcp_set_ca_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_CA_Open</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>case</span> <span class=nl>TCP_CA_Recovery</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_try_undo_recovery</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>                <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=nf>tcp_end_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// E. 各状态处理
+</span></span></span><span class=line><span class=cl>    <span class=k>switch</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_state</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>case</span> <span class=nl>TCP_CA_Recovery</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// Recovery 中收到新 ACK：尝试部分撤销或继续恢复
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_identify_packet_loss</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ack_flag</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>case</span> <span class=nl>TCP_CA_Loss</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// Loss 中：F-RTO 检测虚假超时 / 继续重传
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_process_loss</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>flag</span><span class=p>,</span> <span class=n>num_dupack</span><span class=p>,</span> <span class=n>rexmit</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_identify_packet_loss</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ack_flag</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>default</span><span class=o>:</span>  <span class=c1>// Open 或 Disorder
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_identify_packet_loss</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ack_flag</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_time_to_recover</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>flag</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=nf>tcp_try_to_open</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>flag</span><span class=p>);</span>  <span class=c1>// 尝试回到 Open
+</span></span></span><span class=line><span class=cl>            <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 满足恢复条件 → 进入 Recovery
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_enter_recovery</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ece_ack</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>fast_rexmit</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 非 RACK 模式下更新记分板
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_is_rack</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=n>do_lost</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_update_scoreboard</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>fast_rexmit</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=o>*</span><span class=n>rexmit</span> <span class=o>=</span> <span class=n>REXMIT_LOST</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=33-何时判定需要进入恢复>3.3 何时判定需要进入恢复</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>bool</span> <span class=nf>tcp_time_to_recover</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>flag</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 条件1：已有确认丢包的包（RACK 或 SACK 记分板标记了 LOST）
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>lost_out</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>true</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 条件2：非 RACK 模式下，DupACK 数超过重排序容忍度
+</span></span></span><span class=line><span class=cl>    <span class=c1>// tcp_dupack_heuristics = sacked_out + 1（Reno 估计）
+</span></span></span><span class=line><span class=cl>    <span class=c1>// tp-&gt;reordering 初始值 = 3（sysctl_tcp_reordering）
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_is_rack</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=nf>tcp_dupack_heuristics</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&gt;</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>reordering</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>true</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>经典的 &ldquo;3 个重复 ACK&rdquo; 规则</strong>：<code>tp->reordering</code> 默认为 3，当 <code>sacked_out + 1 > 3</code> 即 <code>sacked_out >= 3</code> 时触发。</p><h3 id=34-进入快速恢复tcp_enter_recovery>3.4 进入快速恢复：<code>tcp_enter_recovery</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_enter_recovery</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>bool</span> <span class=n>ece_ack</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_ssthresh</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_init_undo</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_in_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>ece_ack</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_ssthresh</span> <span class=o>=</span> <span class=nf>tcp_current_ssthresh</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>  <span class=c1>// 保存旧 ssthresh 用于撤销
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_init_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>  <span class=c1>// 核心：计算新 ssthresh、初始化 PRR
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_set_ca_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_CA_Recovery</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong><code>tcp_init_cwnd_reduction</code></strong> 是关键——它调用拥塞算法的 <code>ssthresh()</code> 回调：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_init_cwnd_reduction</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>high_seq</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_nxt</span><span class=p>;</span>       <span class=c1>// 恢复的目标：ACK 越过此序号即恢复完成
+</span></span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>tlp_high_seq</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_cnt</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_cwnd</span> <span class=o>=</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span> <span class=c1>// 保存进入前的 cwnd（PRR 使用）
+</span></span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_delivered</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>              <span class=c1>// PRR 计数器清零
+</span></span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_out</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ca_ops</span><span class=o>-&gt;</span><span class=nf>ssthresh</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>  <span class=c1>// ★ 调用算法
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_ecn_queue_cwr</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>CUBIC 的 ssthresh 计算</strong>（<code>net/ipv4/tcp_cubic.c</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=n>u32</span> <span class=nf>cubictcp_recalc_ssthresh</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>bictcp</span> <span class=o>*</span><span class=n>ca</span> <span class=o>=</span> <span class=nf>inet_csk_ca</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>ca</span><span class=o>-&gt;</span><span class=n>epoch_start</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// 重置 CUBIC epoch
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// Fast Convergence：如果 cwnd &lt; 上次最大值，更积极减小
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&lt;</span> <span class=n>ca</span><span class=o>-&gt;</span><span class=n>last_max_cwnd</span> <span class=o>&amp;&amp;</span> <span class=n>fast_convergence</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>ca</span><span class=o>-&gt;</span><span class=n>last_max_cwnd</span> <span class=o>=</span> <span class=p>(</span><span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>*</span> <span class=p>(</span><span class=n>BICTCP_BETA_SCALE</span> <span class=o>+</span> <span class=n>beta</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>                            <span class=o>/</span> <span class=p>(</span><span class=mi>2</span> <span class=o>*</span> <span class=n>BICTCP_BETA_SCALE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>else</span>
+</span></span><span class=line><span class=cl>        <span class=n>ca</span><span class=o>-&gt;</span><span class=n>last_max_cwnd</span> <span class=o>=</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 新 ssthresh = cwnd * beta（beta 默认 717/1024 ≈ 0.7）
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>max</span><span class=p>((</span><span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>*</span> <span class=n>beta</span><span class=p>)</span> <span class=o>/</span> <span class=n>BICTCP_BETA_SCALE</span><span class=p>,</span> <span class=mi>2U</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>Reno 的 ssthresh 计算</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_cong.c
+</span></span></span><span class=line><span class=cl><span class=n>u32</span> <span class=nf>tcp_reno_ssthresh</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 经典 AIMD：ssthresh = cwnd / 2，最小值 2
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>max</span><span class=p>(</span><span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&gt;&gt;</span> <span class=mi>1U</span><span class=p>,</span> <span class=mi>2U</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=35-rto-超时路径tcp_enter_loss>3.5 RTO 超时路径：<code>tcp_enter_loss</code></h3><p>当重传定时器超时时，走更严格的丢包恢复路径：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_enter_loss</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 1. 标记所有在途包为 LOST
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_timeout_mark_lost</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 2. 减小 ssthresh（仅在当前窗口内首次执行）
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_state</span> <span class=o>&lt;=</span> <span class=n>TCP_CA_Disorder</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=o>!</span><span class=nf>after</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>high_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_una</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_state</span> <span class=o>==</span> <span class=n>TCP_CA_Loss</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_ssthresh</span> <span class=o>=</span> <span class=nf>tcp_current_ssthresh</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_cwnd</span> <span class=o>=</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_ops</span><span class=o>-&gt;</span><span class=nf>ssthresh</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>  <span class=c1>// 调用算法
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_ca_event</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>CA_EVENT_LOSS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_init_undo</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 3. cwnd 设为 in_flight + 1（比快速恢复更激进的减小）
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>tcp_packets_in_flight</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>+</span> <span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_cwnd_cnt</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 4. 进入 Loss 状态
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_set_ca_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_CA_Loss</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>high_seq</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_nxt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 5. F-RTO 检测虚假超时
+</span></span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>frto</span> <span class=o>=</span> <span class=n>sysctl_tcp_frto</span> <span class=o>&amp;&amp;</span> <span class=p>(</span><span class=n>new_recovery</span> <span class=o>||</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>               <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_mtup</span><span class=p>.</span><span class=n>probe_size</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=36-快速恢复-vs-rto-的对比>3.6 快速恢复 vs RTO 的对比</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                          快速恢复 (Recovery)              RTO (Loss)
+</span></span><span class=line><span class=cl>                          ─────────────────              ──────────
+</span></span><span class=line><span class=cl>  触发条件                 3 个 DupACK / RACK             重传定时器超时
+</span></span><span class=line><span class=cl>                          检测到丢包                      所有包可能丢失
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  ssthresh                ca_ops-&gt;ssthresh()              ca_ops-&gt;ssthresh()
+</span></span><span class=line><span class=cl>                          CUBIC: cwnd*0.7                 CUBIC: cwnd*0.7
+</span></span><span class=line><span class=cl>                          Reno:  cwnd/2                   Reno:  cwnd/2
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  cwnd                    PRR 动态控制                     in_flight + 1
+</span></span><span class=line><span class=cl>                          (逐步减至 ssthresh)              (接近从 1 重启)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  状态                    TCP_CA_Recovery                  TCP_CA_Loss
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  恢复方式                PRR + 选择性重传                 从头重传 + 慢启动
+</span></span><span class=line><span class=cl>                          (保持数据流)                     (F-RTO 检测虚假超时)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  结束条件                snd_una &gt;= high_seq              snd_una &gt;= high_seq
+</span></span><span class=line><span class=cl>                          → cwnd = ssthresh                → Open + 慢启动
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四快速恢复-fast-recovery--prr>四、快速恢复 (Fast Recovery / PRR)</h2><h3 id=41-设计原理>4.1 设计原理</h3><p>Linux 使用 <strong>PRR (Proportional Rate Reduction, RFC 6937)</strong> 取代了传统的 RFC 3517 快速恢复。PRR 的核心思想：在恢复阶段<strong>平滑地</strong>将 cwnd 从 <code>prior_cwnd</code> 降至 <code>ssthresh</code>，而不是一步到位，从而保持数据流的平稳。</p><h3 id=42-prr-核心实现>4.2 PRR 核心实现</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_cwnd_reduction</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>newly_acked_sacked</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=kt>int</span> <span class=n>newly_lost</span><span class=p>,</span> <span class=kt>int</span> <span class=n>flag</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>sndcnt</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>delta</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span> <span class=o>-</span> <span class=nf>tcp_packets_in_flight</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>newly_acked_sacked</span> <span class=o>&lt;=</span> <span class=mi>0</span> <span class=o>||</span> <span class=nf>WARN_ON_ONCE</span><span class=p>(</span><span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_cwnd</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_delivered</span> <span class=o>+=</span> <span class=n>newly_acked_sacked</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>delta</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 情况1：in_flight &gt; ssthresh（仍需减小）
+</span></span></span><span class=line><span class=cl>        <span class=c1>// 按比例减小：sndcnt = ssthresh * prr_delivered / prior_cwnd - prr_out
+</span></span></span><span class=line><span class=cl>        <span class=n>u64</span> <span class=n>dividend</span> <span class=o>=</span> <span class=p>(</span><span class=n>u64</span><span class=p>)</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span> <span class=o>*</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_delivered</span> <span class=o>+</span>
+</span></span><span class=line><span class=cl>                       <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_cwnd</span> <span class=o>-</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>sndcnt</span> <span class=o>=</span> <span class=nf>div_u64</span><span class=p>(</span><span class=n>dividend</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_cwnd</span><span class=p>)</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>flag</span> <span class=o>&amp;</span> <span class=n>FLAG_SND_UNA_ADVANCED</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>newly_lost</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 情况2：in_flight &lt;= ssthresh 且有进展无新丢包
+</span></span></span><span class=line><span class=cl>        <span class=c1>// 包守恒 + 适度加速恢复
+</span></span></span><span class=line><span class=cl>        <span class=n>sndcnt</span> <span class=o>=</span> <span class=kt>min_t</span><span class=p>(</span><span class=kt>int</span><span class=p>,</span> <span class=n>delta</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                       <span class=kt>max_t</span><span class=p>(</span><span class=kt>int</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_delivered</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_out</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                             <span class=n>newly_acked_sacked</span><span class=p>)</span> <span class=o>+</span> <span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 情况3：保守策略
+</span></span></span><span class=line><span class=cl>        <span class=n>sndcnt</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=n>delta</span><span class=p>,</span> <span class=n>newly_acked_sacked</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 首次进入恢复时至少允许发 1 个包（触发快速重传）
+</span></span></span><span class=line><span class=cl>    <span class=n>sndcnt</span> <span class=o>=</span> <span class=nf>max</span><span class=p>(</span><span class=n>sndcnt</span><span class=p>,</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_out</span> <span class=o>?</span> <span class=mi>0</span> <span class=o>:</span> <span class=mi>1</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 设置 cwnd = 当前在途 + 允许发送数
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=nf>tcp_packets_in_flight</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>+</span> <span class=n>sndcnt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=43-prr-三种情况图示>4.3 PRR 三种情况图示</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>  cwnd
+</span></span><span class=line><span class=cl>   ▲
+</span></span><span class=line><span class=cl>   │  prior_cwnd ─────┐
+</span></span><span class=line><span class=cl>   │                   ╲  情况1: delta &lt; 0
+</span></span><span class=line><span class=cl>   │                    ╲ in_flight &gt; ssthresh
+</span></span><span class=line><span class=cl>   │                     ╲ 按比例平滑减小
+</span></span><span class=line><span class=cl>   │  ssthresh ───────────╲────────────────────
+</span></span><span class=line><span class=cl>   │                       ╲  情况2: delta &gt;= 0
+</span></span><span class=line><span class=cl>   │                        ╲ in_flight &lt;= ssthresh
+</span></span><span class=line><span class=cl>   │                         └─ 包守恒 + 加速恢复
+</span></span><span class=line><span class=cl>   │
+</span></span><span class=line><span class=cl>   │              恢复完成 →  cwnd = ssthresh
+</span></span><span class=line><span class=cl>   └─────────────────────────────────────────── ACK 序号 →
+</span></span><span class=line><span class=cl>         high_seq 被 ACK 时恢复结束
+</span></span></code></pre></td></tr></table></div></div><h3 id=44-prr-的关键变量>4.4 PRR 的关键变量</h3><div class=table-wrapper><table><thead><tr><th>变量</th><th>初始化</th><th>更新时机</th><th>含义</th></tr></thead><tbody><tr><td><code>prior_cwnd</code></td><td>进入恢复时的 cwnd</td><td>不变</td><td>PRR 比例计算的分母</td></tr><tr><td><code>prr_delivered</code></td><td>0</td><td>每次 ACK 累加 <code>newly_acked_sacked</code></td><td>恢复期间确认的总段数</td></tr><tr><td><code>prr_out</code></td><td>0</td><td>发送时累加 <code>sent_pkts</code></td><td>恢复期间发出的总段数（新数据+重传）</td></tr><tr><td><code>high_seq</code></td><td>进入时的 <code>snd_nxt</code></td><td>不变</td><td>恢复目标：ACK 越过此值即完成</td></tr><tr><td><code>snd_ssthresh</code></td><td><code>ca_ops->ssthresh()</code></td><td>不变</td><td>PRR 的目标 cwnd</td></tr></tbody></table></div><h3 id=45-prr_out-的更新位置>4.5 <code>prr_out</code> 的更新位置</h3><p>在实际发送时（不管是新数据还是重传），<code>prr_out</code> 才会增加：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c: tcp_write_xmit() 末尾
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>tcp_in_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_out</span> <span class=o>+=</span> <span class=n>sent_pkts</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c: tcp_xmit_retransmit_queue() 中
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>tcp_in_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_out</span> <span class=o>+=</span> <span class=nf>tcp_skb_pcount</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=46-重传队列处理>4.6 重传队列处理</h3><p>PRR 设置的 cwnd 直接限制了重传速率：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c: tcp_xmit_retransmit_queue()
+</span></span></span><span class=line><span class=cl><span class=nf>skb_rbtree_walk_from</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>segs</span> <span class=o>=</span> <span class=nf>tcp_snd_cwnd</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>-</span> <span class=nf>tcp_packets_in_flight</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>segs</span> <span class=o>&lt;=</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>break</span><span class=p>;</span>        <span class=c1>// cwnd 用满，不能再发
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>sacked</span> <span class=o>&amp;</span> <span class=n>TCPCB_LOST</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>continue</span><span class=p>;</span>     <span class=c1>// 只重传标记为 LOST 的包
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_retransmit_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>segs</span><span class=p>);</span>  <span class=c1>// 实际重传
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_in_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prr_out</span> <span class=o>+=</span> <span class=nf>tcp_skb_pcount</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=47-恢复结束>4.7 恢复结束</h3><p>当 <code>snd_una</code> 越过 <code>high_seq</code> 时，恢复完成：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c: tcp_fastretrans_alert() 中
+</span></span></span><span class=line><span class=cl><span class=k>case</span> <span class=nl>TCP_CA_Recovery</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_try_undo_recovery</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>   <span class=c1>// 尝试撤销（虚假恢复）
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_end_cwnd_reduction</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>       <span class=c1>// 结束：cwnd = ssthresh
+</span></span></span><span class=line><span class=cl>    <span class=k>break</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>tcp_end_cwnd_reduction</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ca_ops</span><span class=o>-&gt;</span><span class=n>cong_control</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>    <span class=c1>// BBR 等自主管理，不干预
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 将 cwnd 设为 ssthresh
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span> <span class=o>&lt;</span> <span class=n>TCP_INFINITE_SSTHRESH</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=p>(</span><span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ca_state</span> <span class=o>==</span> <span class=n>TCP_CA_CWR</span> <span class=o>||</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>undo_marker</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_ca_event</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>CA_EVENT_COMPLETE_CWR</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=48-撤销机制>4.8 撤销机制</h3><p>如果内核发现丢包判断是错误的（如乱序而非真正丢包），可以撤销恢复：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_undo_cwnd_reduction</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>bool</span> <span class=n>unmark_loss</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>unmark_loss</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 清除所有 LOST 标记
+</span></span></span><span class=line><span class=cl>        <span class=nf>skb_rbtree_walk</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>tcp_rtx_queue</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>sacked</span> <span class=o>&amp;=</span> <span class=o>~</span><span class=n>TCPCB_LOST</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=n>tp</span><span class=o>-&gt;</span><span class=n>lost_out</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_ssthresh</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 恢复 cwnd（调用算法的 undo_cwnd）
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_snd_cwnd_set</span><span class=p>(</span><span class=n>tp</span><span class=p>,</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ca_ops</span><span class=o>-&gt;</span><span class=nf>undo_cwnd</span><span class=p>(</span><span class=n>sk</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 恢复 ssthresh
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_ssthresh</span> <span class=o>&gt;</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_ssthresh</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>prior_ssthresh</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>undo_marker</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=五四大机制完整调用链路>五、四大机制完整调用链路</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>收到 ACK
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>tcp_ack()                                  ← ACK 处理入口
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├─ tcp_clean_rtx_queue()                ← 清理已确认的重传队列
+</span></span><span class=line><span class=cl>  │    └─ tcp_rate_skb_delivered()         ← 速率采样
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├─ tcp_fastretrans_alert()              ← ★ 拥塞状态机
+</span></span><span class=line><span class=cl>  │    │
+</span></span><span class=line><span class=cl>  │    ├─ [Open/Disorder] tcp_identify_packet_loss()
+</span></span><span class=line><span class=cl>  │    │    ├─ [RACK] tcp_rack_mark_lost() → 标记 LOST
+</span></span><span class=line><span class=cl>  │    │    └─ [Reno] tcp_newreno_mark_lost()
+</span></span><span class=line><span class=cl>  │    │
+</span></span><span class=line><span class=cl>  │    ├─ tcp_time_to_recover()?
+</span></span><span class=line><span class=cl>  │    │    ├─ lost_out &gt; 0 → true
+</span></span><span class=line><span class=cl>  │    │    └─ sacked_out+1 &gt; reordering(3) → true
+</span></span><span class=line><span class=cl>  │    │
+</span></span><span class=line><span class=cl>  │    ├─ [进入恢复] tcp_enter_recovery()
+</span></span><span class=line><span class=cl>  │    │    └─ tcp_init_cwnd_reduction()
+</span></span><span class=line><span class=cl>  │    │         └─ ssthresh = ca_ops-&gt;ssthresh()   ← 拥塞发生
+</span></span><span class=line><span class=cl>  │    │              CUBIC: cwnd * 0.7
+</span></span><span class=line><span class=cl>  │    │              Reno:  cwnd / 2
+</span></span><span class=line><span class=cl>  │    │
+</span></span><span class=line><span class=cl>  │    ├─ [Recovery 中] 继续 PRR + 丢包识别
+</span></span><span class=line><span class=cl>  │    │
+</span></span><span class=line><span class=cl>  │    └─ [恢复结束] snd_una &gt;= high_seq
+</span></span><span class=line><span class=cl>  │         ├─ tcp_try_undo_recovery()    ← 虚假恢复撤销
+</span></span><span class=line><span class=cl>  │         └─ tcp_end_cwnd_reduction()   ← cwnd = ssthresh
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├─ tcp_rate_gen()                       ← 生成速率样本
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├─ tcp_cong_control()                   ← ★ 窗口调整核心
+</span></span><span class=line><span class=cl>  │    ├─ [有 cong_control] → BBR 自主控制
+</span></span><span class=line><span class=cl>  │    ├─ [Recovery/CWR 中] → tcp_cwnd_reduction()      ← 快速恢复 PRR
+</span></span><span class=line><span class=cl>  │    └─ [正常状态] → tcp_cong_avoid()
+</span></span><span class=line><span class=cl>  │         └─ ca_ops-&gt;cong_avoid()
+</span></span><span class=line><span class=cl>  │              ├─ tcp_in_slow_start()? → tcp_slow_start()    ← 慢启动
+</span></span><span class=line><span class=cl>  │              └─ else → tcp_cong_avoid_ai()                  ← 拥塞避免
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  └─ tcp_xmit_recovery()                 ← 触发重传/新数据发送
+</span></span><span class=line><span class=cl>       └─ tcp_xmit_retransmit_queue()     ← 按 cwnd 限速重传 LOST 包
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>RTO 超时（另一条路径）:
+</span></span><span class=line><span class=cl>  tcp_retransmit_timer()
+</span></span><span class=line><span class=cl>    └─ tcp_enter_loss()                   ← 拥塞发生（严重）
+</span></span><span class=line><span class=cl>         ├─ tcp_timeout_mark_lost()       ← 所有在途包标 LOST
+</span></span><span class=line><span class=cl>         ├─ ssthresh = ca_ops-&gt;ssthresh()
+</span></span><span class=line><span class=cl>         ├─ cwnd = in_flight + 1
+</span></span><span class=line><span class=cl>         └─ 状态 → TCP_CA_Loss + 慢启动
+</span></span></code></pre></td></tr></table></div></div><h2 id=六四大机制对应的-snd_cwnd-变化总结>六、四大机制对应的 <code>snd_cwnd</code> 变化总结</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>cwnd
+</span></span><span class=line><span class=cl> ▲
+</span></span><span class=line><span class=cl> │     ╱╲ prior_cwnd
+</span></span><span class=line><span class=cl> │    ╱  ╲
+</span></span><span class=line><span class=cl> │   ╱    ╲  ① 拥塞发生
+</span></span><span class=line><span class=cl> │  ╱  ①   ╲──────────╲
+</span></span><span class=line><span class=cl> │ ╱        ② PRR 平滑  ╲ ssthresh = cwnd*β
+</span></span><span class=line><span class=cl> │╱    ②     下降          ╲
+</span></span><span class=line><span class=cl> │─────────────────────────╲───────── ssthresh
+</span></span><span class=line><span class=cl> │  ③ 慢启动                ╲③
+</span></span><span class=line><span class=cl> │  (指数增长)                ╲
+</span></span><span class=line><span class=cl> │                    ④ 拥塞避免
+</span></span><span class=line><span class=cl> │                    (线性增长)
+</span></span><span class=line><span class=cl> │
+</span></span><span class=line><span class=cl> └──────────────────────────────────── 时间 →
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl> 阶段 ①: tcp_init_cwnd_reduction() → ssthresh = ca_ops-&gt;ssthresh()
+</span></span><span class=line><span class=cl> 阶段 ②: tcp_cwnd_reduction() (PRR)  → cwnd 平滑减至 ssthresh
+</span></span><span class=line><span class=cl> 阶段 ③: tcp_slow_start()            → cwnd 指数增长至 ssthresh
+</span></span><span class=line><span class=cl> 阶段 ④: tcp_cong_avoid_ai()         → cwnd 线性增长（每 RTT +1）
+</span></span></code></pre></td></tr></table></div></div></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6/>拥塞控制</a>
+<a href=/tags/%E6%85%A2%E5%90%AF%E5%8A%A8/>慢启动</a>
+<a href=/tags/%E6%8B%A5%E5%A1%9E%E9%81%BF%E5%85%8D/>拥塞避免</a>
+<a href=/tags/prr/>PRR</a>
+<a href=/tags/%E5%BF%AB%E9%80%9F%E6%81%A2%E5%A4%8D/>快速恢复</a>
+<a href=/tags/rack/>RACK</a>
+<a href=/tags/cubic/>CUBIC</a>
+<a href=/tags/tcp_enter_recovery/>Tcp_enter_recovery</a>
+<a href=/tags/tcp_enter_loss/>Tcp_enter_loss</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp-%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E9%97%AE%E7%AD%94%E9%80%9F%E7%8E%87%E9%87%87%E6%A0%B7rack%E9%87%8D%E4%BC%A0%E5%AE%9A%E6%97%B6%E5%99%A8cubicbbr/><div class=article-details><h2 class=article-title>TCP 内部机制深度问答：速率采样、RACK、重传定时器、CUBIC、BBR</h2></div></a></article><article><a href=/p/linux-5.15.78-tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E7%AE%97%E6%B3%95%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 5.15.78 TCP 拥塞控制算法实现原理分析</h2></div></a></article><article><a href=/p/tcp-%E9%87%8D%E4%BC%A0%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 重传机制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%8F%91%E9%80%81%E5%85%A8%E8%B7%AF%E5%BE%84%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90%E4%BB%8E-send-%E5%88%B0%E7%BD%91%E5%8D%A1/><div class=article-details><h2 class=article-title>TCP 发送全路径深度分析——从 send() 到网卡</h2></div></a></article><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

@@ -1,0 +1,892 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='本文基于 Linux 5.15.78 内核源码，梳理 close()/shutdown() 触发的发送 FIN、对端 FIN 处理、进入 TIME_WAIT、孤儿套接字与 tcp_tw_reuse 复用等与四次挥手相关的实现。文中凡引用符号、路径、行号均以仓库内源码为准。\n一、全景调用链与状态转换表 1.1 应用层 close 到 TCP 栈 用户进程执行 close(fd) 时，VFS 最终调用到 INET 的 inet_release()，由其根据 SO_LINGER 计算超时并调用协议 close。对 TCP 而言即 tcp_close() → __tcp_close()。\n1 2 3 4 5 6 7 8 9 10 11 12 flowchart TB subgraph userspace [用户态] A["close(fd)"] end subgraph kernel [内核协议栈] B["inet_release()<br/>net/ipv4/af_inet.c:457-483"] C["sk_prot->close → tcp_close()<br/>net/ipv4/tcp.c:3417-3423"] D["__tcp_close()<br/>net/ipv4/tcp.c:3278-3415"] end A --> B B -->|"timeout, SO_LINGER"| C C --> D 对应源码中 inet_release() 对 SO_LINGER 与 tcp_close 的衔接如下。\n'><title>TCP 四次挥手与 close 深度源码分析</title><link rel=canonical href=https://1bit2.github.io/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP 四次挥手与 close 深度源码分析"><meta property='og:description' content='本文基于 Linux 5.15.78 内核源码，梳理 close()/shutdown() 触发的发送 FIN、对端 FIN 处理、进入 TIME_WAIT、孤儿套接字与 tcp_tw_reuse 复用等与四次挥手相关的实现。文中凡引用符号、路径、行号均以仓库内源码为准。\n一、全景调用链与状态转换表 1.1 应用层 close 到 TCP 栈 用户进程执行 close(fd) 时，VFS 最终调用到 INET 的 inet_release()，由其根据 SO_LINGER 计算超时并调用协议 close。对 TCP 而言即 tcp_close() → __tcp_close()。\n1 2 3 4 5 6 7 8 9 10 11 12 flowchart TB subgraph userspace [用户态] A["close(fd)"] end subgraph kernel [内核协议栈] B["inet_release()<br/>net/ipv4/af_inet.c:457-483"] C["sk_prot->close → tcp_close()<br/>net/ipv4/tcp.c:3417-3423"] D["__tcp_close()<br/>net/ipv4/tcp.c:3278-3415"] end A --> B B -->|"timeout, SO_LINGER"| C C --> D 对应源码中 inet_release() 对 SO_LINGER 与 tcp_close 的衔接如下。\n'><meta property='og:url' content='https://1bit2.github.io/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='close'><meta property='article:tag' content='shutdown'><meta property='article:tag' content='FIN'><meta property='article:tag' content='TIME_WAIT'><meta property='article:tag' content='tcp_close'><meta property='article:tag' content='tcp_send_fin'><meta property='article:tag' content='tcp_fin'><meta property='article:tag' content='tcp_time_wait'><meta property='article:tag' content='SO_LINGER'><meta property='article:tag' content='orphan'><meta property='article:tag' content='inet_twsk_hashdance'><meta property='article:published_time' content='2026-04-29T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-29T00:00:00+00:00'><meta name=twitter:title content="TCP 四次挥手与 close 深度源码分析"><meta name=twitter:description content='本文基于 Linux 5.15.78 内核源码，梳理 close()/shutdown() 触发的发送 FIN、对端 FIN 处理、进入 TIME_WAIT、孤儿套接字与 tcp_tw_reuse 复用等与四次挥手相关的实现。文中凡引用符号、路径、行号均以仓库内源码为准。\n一、全景调用链与状态转换表 1.1 应用层 close 到 TCP 栈 用户进程执行 close(fd) 时，VFS 最终调用到 INET 的 inet_release()，由其根据 SO_LINGER 计算超时并调用协议 close。对 TCP 而言即 tcp_close() → __tcp_close()。\n1 2 3 4 5 6 7 8 9 10 11 12 flowchart TB subgraph userspace [用户态] A["close(fd)"] end subgraph kernel [内核协议栈] B["inet_release()<br/>net/ipv4/af_inet.c:457-483"] C["sk_prot->close → tcp_close()<br/>net/ipv4/tcp.c:3417-3423"] D["__tcp_close()<br/>net/ipv4/tcp.c:3278-3415"] end A --> B B -->|"timeout, SO_LINGER"| C C --> D 对应源码中 inet_release() 对 SO_LINGER 与 tcp_close 的衔接如下。\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一全景调用链与状态转换表>一、全景调用链与状态转换表</a><ol><li><a href=#11-应用层-close-到-tcp-栈>1.1 应用层 close 到 TCP 栈</a></li><li><a href=#12-tcp_close_state-与-new_state>1.2 <code>tcp_close_state()</code> 与 <code>new_state[]</code></a></li><li><a href=#13-与四次挥手条款的对应概念层>1.3 与四次挥手条款的对应（概念层）</a></li></ol></li><li><a href=#二tcp_close-完整路径>二、<code>tcp_close()</code> 完整路径</a><ol><li><a href=#21-总览__tcp_close-入口行为>2.1 总览：<code>__tcp_close()</code> 入口行为</a></li><li><a href=#22-接收队列排空与-rst--fin-决策>2.2 接收队列排空与 RST / FIN 决策</a></li><li><a href=#23-so_linger-与-sk_stream_wait_close>2.3 <code>SO_LINGER</code> 与 <code>sk_stream_wait_close()</code></a></li><li><a href=#24-sock_orphan-与-tcp_orphan_count>2.4 <code>sock_orphan()</code> 与 <code>tcp_orphan_count</code></a></li><li><a href=#25-tcp_close_state-再述哪些状态会触发-fin>2.5 <code>tcp_close_state()</code> 再述：哪些状态会触发 FIN</a></li><li><a href=#26-fin_wait2-与-linger2tcp_time_wait>2.6 <code>FIN_WAIT2</code> 与 <code>linger2</code>、<code>tcp_time_wait</code></a></li></ol></li><li><a href=#三fin-发送>三、FIN 发送</a><ol><li><a href=#31-tcp_shutdown半关闭只影响发送侧>3.1 <code>tcp_shutdown()</code>：半关闭只影响发送侧</a></li><li><a href=#32-tcp_send_fin尾包-piggyback内存压力下-borrow-rtxmss-推送>3.2 <code>tcp_send_fin()</code>：尾包 piggyback、内存压力下 borrow rtx、mss 推送</a></li></ol></li><li><a href=#四fin-接收>四、FIN 接收</a><ol><li><a href=#41-tcp_fin>4.1 <code>tcp_fin()</code></a></li><li><a href=#42-从-tcp_data_queue-调用-tcp_fin>4.2 从 <code>tcp_data_queue()</code> 调用 <code>tcp_fin()</code></a></li><li><a href=#43-tcp_rcv_state_processack-驱动状态与-fin数据步序>4.3 <code>tcp_rcv_state_process()</code>：ACK 驱动状态与 FIN/数据步序</a></li></ol></li><li><a href=#五time_wait-管理>五、<code>TIME_WAIT</code> 管理</a><ol><li><a href=#51-tcp_time_wait分配-inet_timewait_sock定时inet_twsk_hashdance>5.1 <code>tcp_time_wait()</code>：分配 <code>inet_timewait_sock</code>、定时、<code>inet_twsk_hashdance</code></a></li><li><a href=#52-struct-inet_timewait_sock-与-struct-tcp_timewait_sock>5.2 <code>struct inet_timewait_sock</code> 与 <code>struct tcp_timewait_sock</code></a></li><li><a href=#53-inet_twsk_hashdance>5.3 <code>inet_twsk_hashdance()</code></a></li><li><a href=#54-定时器回调与-tcp_timewait_len>5.4 定时器回调与 <code>TCP_TIMEWAIT_LEN</code></a></li><li><a href=#55-sysctl_max_tw_buckets-与-inet_twsk_alloc>5.5 <code>sysctl_max_tw_buckets</code> 与 <code>inet_twsk_alloc()</code></a></li><li><a href=#56-命名空间清理inet_twsk_purge>5.6 命名空间清理：<code>inet_twsk_purge()</code></a></li></ol></li><li><a href=#六time_wait-复用>六、<code>TIME_WAIT</code> 复用</a><ol><li><a href=#61-tcp_tw_reuse-sysctl>6.1 <code>tcp_tw_reuse</code> sysctl</a></li><li><a href=#62-__inet_check_established-与-twsk_unique>6.2 <code>__inet_check_established()</code> 与 <code>twsk_unique()</code></a></li><li><a href=#63-tcp_twsk_unique时间戳reuse2-环回限制>6.3 <code>tcp_twsk_unique()</code>：时间戳、<code>reuse==2</code> 环回限制</a></li></ol></li><li><a href=#七orphan-socket-管理>七、Orphan Socket 管理</a><ol><li><a href=#71-计数聚合与-tcp_too_many_orphans--tcp_check_oom>7.1 计数聚合与 <code>tcp_too_many_orphans</code> / <code>tcp_check_oom</code></a></li><li><a href=#72-__tcp_close-中的-oom-路径>7.2 <code>__tcp_close</code> 中的 OOM 路径</a></li><li><a href=#73-orphan-fin_wait2-与-tcp_time_wait>7.3 Orphan <code>FIN_WAIT2</code> 与 <code>tcp_time_wait</code></a></li></ol></li><li><a href=#八shutdown-系统调用>八、<code>shutdown()</code> 系统调用</a><ol><li><a href=#81-inet_shutdownhow-与-shutdown_mask>8.1 <code>inet_shutdown()</code>：<code>how++</code> 与 <code>SHUTDOWN_MASK</code></a></li><li><a href=#82-shut_wr-路径>8.2 <code>SHUT_WR</code> 路径</a></li><li><a href=#83-与-tcp_close-的差异源码层>8.3 与 <code>tcp_close()</code> 的差异（源码层）</a></li><li><a href=#84-终结销毁inet_csk_destroy_sock>8.4 终结销毁：<code>inet_csk_destroy_sock()</code></a></li></ol></li><li><a href=#附录-a关键源文件与行号索引>附录 A：关键源文件与行号索引</a></li><li><a href=#附录-b阅读建议>附录 B：阅读建议</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/>TCP 四次挥手与 close 深度源码分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 29, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>12 minute read</time></div></footer></div></header><section class=article-content><p>本文基于 <strong>Linux 5.15.78</strong> 内核源码，梳理 <code>close()</code>/<code>shutdown()</code> 触发的发送 FIN、对端 FIN 处理、进入 <code>TIME_WAIT</code>、孤儿套接字与 <code>tcp_tw_reuse</code> 复用等与四次挥手相关的实现。文中凡引用符号、路径、行号均以仓库内源码为准。</p><hr><h2 id=一全景调用链与状态转换表>一、全景调用链与状态转换表</h2><h3 id=11-应用层-close-到-tcp-栈>1.1 应用层 close 到 TCP 栈</h3><p>用户进程执行 <code>close(fd)</code> 时，VFS 最终调用到 INET 的 <code>inet_release()</code>，由其根据 <code>SO_LINGER</code> 计算超时并调用协议 <code>close</code>。对 TCP 而言即 <code>tcp_close()</code> → <code>__tcp_close()</code>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>flowchart TB
+</span></span><span class=line><span class=cl>    subgraph userspace [用户态]
+</span></span><span class=line><span class=cl>        A[&#34;close(fd)&#34;]
+</span></span><span class=line><span class=cl>    end
+</span></span><span class=line><span class=cl>    subgraph kernel [内核协议栈]
+</span></span><span class=line><span class=cl>        B[&#34;inet_release()&lt;br/&gt;net/ipv4/af_inet.c:457-483&#34;]
+</span></span><span class=line><span class=cl>        C[&#34;sk_prot-&gt;close → tcp_close()&lt;br/&gt;net/ipv4/tcp.c:3417-3423&#34;]
+</span></span><span class=line><span class=cl>        D[&#34;__tcp_close()&lt;br/&gt;net/ipv4/tcp.c:3278-3415&#34;]
+</span></span><span class=line><span class=cl>    end
+</span></span><span class=line><span class=cl>    A --&gt; B
+</span></span><span class=line><span class=cl>    B --&gt;|&#34;timeout, SO_LINGER&#34;| C
+</span></span><span class=line><span class=cl>    C --&gt; D
+</span></span></code></pre></td></tr></table></div></div><p>对应源码中 <code>inet_release()</code> 对 <code>SO_LINGER</code> 与 <code>tcp_close</code> 的衔接如下。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/af_inet.c:471-479
+</span></span></span><span class=line><span class=cl>		<span class=n>timeout</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_LINGER</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>		    <span class=o>!</span><span class=p>(</span><span class=n>current</span><span class=o>-&gt;</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>PF_EXITING</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=n>timeout</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_lingertime</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=cm>/* 调用协议特定close: tcp_close() */</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>close</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>timeout</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>struct proto tcp_proto</code> 将 <code>close</code> 成员指向 <code>tcp_close</code>（<code>net/ipv4/tcp_ipv4.c:3838</code>）。</p><p><code>tcp_close()</code> 仅加锁并委托 <code>__tcp_close()</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c:3417-3423
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_close</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>long</span> <span class=n>timeout</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>lock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>__tcp_close</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>release_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_put</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=12-tcp_close_state-与-new_state>1.2 <code>tcp_close_state()</code> 与 <code>new_state[]</code></h3><p><code>tcp_close_state()</code> 根据当前 <code>sk->sk_state</code> 查表 <code>new_state[]</code>，低 4 位为 RFC 状态（<code>TCP_STATE_MASK</code>），若高位含 <code>TCP_ACTION_FIN</code> 则表示本路径需要发送 FIN。<code>TCP_ACTION_FIN</code> 定义为 <code>(1 &lt;&lt; TCP_CLOSE)</code>，即与枚举值 <code>TCP_CLOSE</code>（值为 9）组合编码进数组元素中。</p><p>宏与状态掩码定义见 <code>include/net/tcp_states.h:12-31</code>。</p><p><code>new_state[]</code> 与 <code>tcp_close_state()</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c:3169-3194
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>const</span> <span class=kt>unsigned</span> <span class=kt>char</span> <span class=n>new_state</span><span class=p>[</span><span class=mi>16</span><span class=p>]</span> <span class=o>=</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>  <span class=cm>/* current state:        new state:      action:	*/</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=mi>0</span> <span class=cm>/* (Invalid) */</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_CLOSE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_ESTABLISHED</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_FIN_WAIT1</span> <span class=o>|</span> <span class=n>TCP_ACTION_FIN</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_SYN_SENT</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_CLOSE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_SYN_RECV</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_FIN_WAIT1</span> <span class=o>|</span> <span class=n>TCP_ACTION_FIN</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_FIN_WAIT1</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_FIN_WAIT1</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_FIN_WAIT2</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_FIN_WAIT2</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_TIME_WAIT</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_CLOSE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_CLOSE</span><span class=p>]</span>		<span class=o>=</span> <span class=n>TCP_CLOSE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_CLOSE_WAIT</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_LAST_ACK</span>  <span class=o>|</span> <span class=n>TCP_ACTION_FIN</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_LAST_ACK</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_LAST_ACK</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_LISTEN</span><span class=p>]</span>		<span class=o>=</span> <span class=n>TCP_CLOSE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_CLOSING</span><span class=p>]</span>		<span class=o>=</span> <span class=n>TCP_CLOSING</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>  <span class=p>[</span><span class=n>TCP_NEW_SYN_RECV</span><span class=p>]</span>	<span class=o>=</span> <span class=n>TCP_CLOSE</span><span class=p>,</span>	<span class=cm>/* should not happen ! */</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>tcp_close_state</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>next</span> <span class=o>=</span> <span class=p>(</span><span class=kt>int</span><span class=p>)</span><span class=n>new_state</span><span class=p>[</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>];</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>ns</span> <span class=o>=</span> <span class=n>next</span> <span class=o>&amp;</span> <span class=n>TCP_STATE_MASK</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_set_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ns</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>next</span> <span class=o>&amp;</span> <span class=n>TCP_ACTION_FIN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>下表归纳「当前状态 → 关闭发送侧后的新状态 → 是否置 <code>TCP_ACTION_FIN</code>（需要 <code>tcp_send_fin</code>）」。</p><div class=table-wrapper><table><thead><tr><th>当前状态 (<code>sk_state</code>)</th><th><code>new_state[]</code> 中新状态 (掩码后)</th><th>含 <code>TCP_ACTION_FIN</code></th><th>说明</th></tr></thead><tbody><tr><td>无效 (0)</td><td><code>TCP_CLOSE</code></td><td>否</td><td>异常占位</td></tr><tr><td><code>TCP_ESTABLISHED</code></td><td><code>TCP_FIN_WAIT1</code></td><td><strong>是</strong></td><td>主动发 FIN</td></tr><tr><td><code>TCP_SYN_SENT</code></td><td><code>TCP_CLOSE</code></td><td>否</td><td>未建立则不组合 FIN 等待</td></tr><tr><td><code>TCP_SYN_RECV</code></td><td><code>TCP_FIN_WAIT1</code></td><td><strong>是</strong></td><td>并发打开等场景</td></tr><tr><td><code>TCP_FIN_WAIT1</code></td><td><code>TCP_FIN_WAIT1</code></td><td>否</td><td>已发/将发 FIN，由状态机继续</td></tr><tr><td><code>TCP_FIN_WAIT2</code></td><td><code>TCP_FIN_WAIT2</code></td><td>否</td><td>仅接收侧相关</td></tr><tr><td><code>TCP_TIME_WAIT</code></td><td><code>TCP_CLOSE</code></td><td>否</td><td>不应再发 FIN</td></tr><tr><td><code>TCP_CLOSE</code></td><td><code>TCP_CLOSE</code></td><td>否</td><td>已关闭</td></tr><tr><td><code>TCP_CLOSE_WAIT</code></td><td><code>TCP_LAST_ACK</code></td><td><strong>是</strong></td><td>被动方应用 close，补发 FIN</td></tr><tr><td><code>TCP_LAST_ACK</code></td><td><code>TCP_LAST_ACK</code></td><td>否</td><td>已发 FIN，等 ACK</td></tr><tr><td><code>TCP_LISTEN</code></td><td><code>TCP_CLOSE</code></td><td>否</td><td>由 <code>__tcp_close</code> 另分支处理</td></tr><tr><td><code>TCP_CLOSING</code></td><td><code>TCP_CLOSING</code></td><td>否</td><td>同时关闭进行中</td></tr><tr><td><code>TCP_NEW_SYN_RECV</code></td><td><code>TCP_CLOSE</code></td><td>否</td><td>注释声明不应发生</td></tr></tbody></table></div><h3 id=13-与四次挥手条款的对应概念层>1.3 与四次挥手条款的对应（概念层）</h3><ul><li>主动关闭方在能够优雅关闭且接收队列已排空时，经 <code>tcp_close_state</code> + <code>tcp_send_fin</code> 进入 <code>FIN_WAIT1</code>，随后在 ACK/FIN 交互下经 <code>FIN_WAIT2</code>、<code>TIME_WAIT</code> 到释放。</li><li>被动方收到 FIN 后先 <code>CLOSE_WAIT</code>，应用 <code>close</code> 后再发 FIN 进入 <code>LAST_ACK</code>。</li><li>上述「概念」均由下文「二」至「五」节对应源码路径支撑；具体是否发 RST、是否进入 <code>TIME_WAIT</code> 取决于未读数据、<code>SO_LINGER</code>、<code>linger2</code>、孤儿限制等分支。</li></ul><hr><h2 id=二tcp_close-完整路径>二、<code>tcp_close()</code> 完整路径</h2><h3 id=21-总览__tcp_close-入口行为>2.1 总览：<code>__tcp_close()</code> 入口行为</h3><p><code>__tcp_close()</code>（<code>net/ipv4/tcp.c:3278-3415</code>）是关闭逻辑核心：设置全双工 shutdown、LISTEN 特判、清空接收队列并统计未读长度、在多种条件下选择 RST / <code>disconnect</code> / 正常 FIN，然后 <code>sk_stream_wait_close</code>、<code>sock_orphan</code>、递增每 CPU 孤儿计数、处理 <code>FIN_WAIT2</code> 定时与 OOM、最终在 <code>TCP_CLOSE</code> 时 <code>inet_csk_destroy_sock</code>。</p><p>关键开头与 LISTEN 分支：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c:3278-3293
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>__tcp_close</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>long</span> <span class=n>timeout</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>data_was_unread</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>state</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=cm>/* 设置关闭标志: 不再发送和接收 */</span>
+</span></span><span class=line><span class=cl>	<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_shutdown</span> <span class=o>=</span> <span class=n>SHUTDOWN_MASK</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=cm>/* 情况1: 监听socket直接关闭 */</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_LISTEN</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_set_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_CLOSE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=cm>/* 关闭accept队列, 向已连接client发RST */</span>
+</span></span><span class=line><span class=cl>		<span class=nf>inet_csk_listen_stop</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>adjudge_to_death</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>其中 <code>SHUTDOWN_MASK</code> 表示同时关闭读与写方向，定义于 <code>include/net/sock.h:1463-1465</code>（<code>RCV_SHUTDOWN</code> 与 <code>SEND_SHUTDOWN</code> 的按位组合为 3）。</p><h3 id=22-接收队列排空与-rst--fin-决策>2.2 接收队列排空与 RST / FIN 决策</h3><p><code>__tcp_close</code> 将 <code>sk_receive_queue</code> 上 skb 全部 dequeue，并对每段计算「非 FIN 负载长度」累加到 <code>data_was_unread</code>。若队列末尾 skb 带 <code>TCPHDR_FIN</code>，长度减一（FIN 占序列空间但不计入「未读数据」长度统计）。</p><p>随后逻辑（节选）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c:3295-3330
+</span></span></span><span class=line><span class=cl>	<span class=cm>/* 清空接收队列, 统计未读数据量 */</span>
+</span></span><span class=line><span class=cl>	<span class=k>while</span> <span class=p>((</span><span class=n>skb</span> <span class=o>=</span> <span class=nf>__skb_dequeue</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_receive_queue</span><span class=p>))</span> <span class=o>!=</span> <span class=nb>NULL</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>u32</span> <span class=n>len</span> <span class=o>=</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span> <span class=o>-</span> <span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>tcp_flags</span> <span class=o>&amp;</span> <span class=n>TCPHDR_FIN</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=n>len</span><span class=o>--</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>data_was_unread</span> <span class=o>+=</span> <span class=n>len</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__kfree_skb</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_CLOSE</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>adjudge_to_death</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>repair</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>disconnect</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>data_was_unread</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_TCPABORTONCLOSE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_set_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_CLOSE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_active_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_allocation</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_LINGER</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_lingertime</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>disconnect</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_TCPABORTONDATA</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_close_state</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_fin</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_stream_wait_close</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>timeout</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p>含义归纳：</p><ol><li><strong><code>data_was_unread != 0</code></strong>：接收侧仍有应用未读数据时直接 <code>TCP_CLOSE</code> 并 <code>tcp_send_active_reset</code>（RST），统计 <code>TCPABORTONCLOSE</code>。</li><li><strong><code>SO_LINGER</code> 且 <code>sk_lingertime == 0</code></strong>：调用 <code>disconnect</code> 走中止路径，统计 <code>TCPABORTONDATA</code>（与「正常 FIN 四次挥手」区分）。</li><li><strong>否则</strong>若 <code>tcp_close_state()</code> 返回真则 <code>tcp_send_fin()</code> 发 FIN。</li></ol><h3 id=23-so_linger-与-sk_stream_wait_close>2.3 <code>SO_LINGER</code> 与 <code>sk_stream_wait_close()</code></h3><p>非零 <code>timeout</code>（来自 <code>inet_release</code> 传入的 <code>sk_lingertime</code>， jiffies）时，<code>sk_stream_wait_close()</code> 会把当前进程放到 <code>sk_sleep</code> 上等待，直到「不再处于需等待发送 FIN 确认的阶段」或超时、信号。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/core/stream.c:90-110
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>int</span> <span class=nf>sk_stream_closing</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=p>(</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span>
+</span></span><span class=line><span class=cl>	       <span class=p>(</span><span class=n>TCPF_FIN_WAIT1</span> <span class=o>|</span> <span class=n>TCPF_CLOSING</span> <span class=o>|</span> <span class=n>TCPF_LAST_ACK</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>sk_stream_wait_close</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>long</span> <span class=n>timeout</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>timeout</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>DEFINE_WAIT_FUNC</span><span class=p>(</span><span class=n>wait</span><span class=p>,</span> <span class=n>woken_wake_function</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=nf>add_wait_queue</span><span class=p>(</span><span class=nf>sk_sleep</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=o>&amp;</span><span class=n>wait</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>do</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=k>if</span> <span class=p>(</span><span class=nf>sk_wait_event</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>timeout</span><span class=p>,</span> <span class=o>!</span><span class=nf>sk_stream_closing</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=o>&amp;</span><span class=n>wait</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>				<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span> <span class=k>while</span> <span class=p>(</span><span class=o>!</span><span class=nf>signal_pending</span><span class=p>(</span><span class=n>current</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=n>timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=nf>remove_wait_queue</span><span class=p>(</span><span class=nf>sk_sleep</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=o>&amp;</span><span class=n>wait</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>等待条件 <code>!sk_stream_closing(sk)</code>：一旦状态离开 <code>FIN_WAIT1</code>/<code>CLOSING</code>/<code>LAST_ACK</code>（例如进入 <code>FIN_WAIT2</code>、<code>TIME_WAIT</code> 或由 RST 直接 <code>CLOSE</code>），等待结束。</p><h3 id=24-sock_orphan-与-tcp_orphan_count>2.4 <code>sock_orphan()</code> 与 <code>tcp_orphan_count</code></h3><p><code>adjudge_to_death</code> 标签后，<code>__tcp_close</code> 调用 <code>sock_orphan(sk)</code>，将套接字与 <code>struct socket</code> 解绑并置 <code>SOCK_DEAD</code>，随后在本 CPU 上 <code>tcp_orphan_count</code> 自增。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c:3335-3346
+</span></span></span><span class=line><span class=cl><span class=nl>adjudge_to_death</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=n>state</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_hold</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_orphan</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>local_bh_disable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>	<span class=nf>bh_lock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>__release_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>this_cpu_inc</span><span class=p>(</span><span class=n>tcp_orphan_count</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>sock_orphan</code> 本体（设置死标志、断开 <code>sk_socket</code>/<code>sk_wq</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/sock.h:1960-1967
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>sock_orphan</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>write_lock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_callback_lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_set_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_set_socket</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_wq</span>  <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=nf>write_unlock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_callback_lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>每 CPU 计数器定义：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c:290-291
+</span></span></span><span class=line><span class=cl><span class=nf>DEFINE_PER_CPU</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span><span class=p>,</span> <span class=n>tcp_orphan_count</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nf>EXPORT_PER_CPU_SYMBOL_GPL</span><span class=p>(</span><span class=n>tcp_orphan_count</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=25-tcp_close_state-再述哪些状态会触发-fin>2.5 <code>tcp_close_state()</code> 再述：哪些状态会触发 FIN</h3><p>已在第一章说明：<code>TCP_ESTABLISHED</code>、<code>TCP_SYN_RECV</code>、<code>TCP_CLOSE_WAIT</code> 在「无 RST/abort 前置条件」下会置 <code>TCP_ACTION_FIN</code>，从而执行 <code>tcp_send_fin()</code>。<code>FIN_WAIT1/2</code>、<code>CLOSING</code>、<code>LAST_ACK</code> 等不会在 <code>tcp_close_state</code> 里再次请求 FIN。</p><h3 id=26-fin_wait2-与-linger2tcp_time_wait>2.6 <code>FIN_WAIT2</code> 与 <code>linger2</code>、<code>tcp_time_wait</code></h3><p><code>__tcp_close</code> 在 orphan 之后若状态为 <code>TCP_FIN_WAIT2</code>，根据 <code>linger2</code>、<code>tcp_fin_time(sk)</code>、<code>TCP_TIMEWAIT_LEN</code> 决定 reset、<code>keepalive</code> 定时器或立即 <code>tcp_time_wait(sk, TCP_FIN_WAIT2, tmo)</code>（见 <code>net/ipv4/tcp.c:3365-3381</code>）。第七节展开孤儿与 OOM 检查。</p><hr><h2 id=三fin-发送>三、FIN 发送</h2><h3 id=31-tcp_shutdown半关闭只影响发送侧>3.1 <code>tcp_shutdown()</code>：半关闭只影响发送侧</h3><p><code>shutdown(SHUT_WR)</code> 最终走到 <code>tcp_shutdown()</code>。仅当 <code>how</code> 含 <code>SEND_SHUTDOWN</code> 且状态属于可发 FIN 的集合时，才 <code>tcp_close_state</code> + <code>tcp_send_fin</code>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c:3201-3218
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_shutdown</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>how</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>how</span> <span class=o>&amp;</span> <span class=n>SEND_SHUTDOWN</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>((</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=p>(</span><span class=n>TCPF_ESTABLISHED</span> <span class=o>|</span> <span class=n>TCPF_SYN_SENT</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>	     <span class=n>TCPF_SYN_RECV</span> <span class=o>|</span> <span class=n>TCPF_CLOSE_WAIT</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_close_state</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_send_fin</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>与 <code>__tcp_close</code> 的差异之一：<code>tcp_shutdown</code> <strong>不会</strong>设置 <code>SHUTDOWN_MASK</code>、不会 drain 接收队列、不会 <code>sock_orphan</code>（文件 <code>tcp.c:3196-3198</code> 注释已说明）。</p><h3 id=32-tcp_send_fin尾包-piggyback内存压力下-borrow-rtxmss-推送>3.2 <code>tcp_send_fin()</code>：尾包 piggyback、内存压力下 borrow rtx、mss 推送</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:4341-4383
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_send_fin</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>,</span> <span class=o>*</span><span class=n>tskb</span><span class=p>,</span> <span class=o>*</span><span class=n>tail</span> <span class=o>=</span> <span class=nf>tcp_write_queue_tail</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>tskb</span> <span class=o>=</span> <span class=n>tail</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>tskb</span> <span class=o>&amp;&amp;</span> <span class=nf>tcp_under_memory_pressure</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=n>tskb</span> <span class=o>=</span> <span class=nf>skb_rb_last</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>tcp_rtx_queue</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tskb</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>tskb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>tcp_flags</span> <span class=o>|=</span> <span class=n>TCPHDR_FIN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>tskb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>tail</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_nxt</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_nxt</span> <span class=o>+</span> <span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>skb</span> <span class=o>=</span> <span class=nf>alloc_skb_fclone</span><span class=p>(</span><span class=n>MAX_TCP_HEADER</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_allocation</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=o>!</span><span class=n>skb</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>		<span class=nf>tcp_init_nondata_skb</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				     <span class=n>TCPHDR_ACK</span> <span class=o>|</span> <span class=n>TCPHDR_FIN</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_queue_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=nf>__tcp_push_pending_frames</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nf>tcp_current_mss</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>TCP_NAGLE_OFF</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>要点：</p><ul><li><strong>优先</strong>在写队列尾部未发 skb 上打 FIN 位并推进 <code>write_seq</code>。</li><li><strong>无尾包且处于 memory pressure</strong> 时，尝试在 <strong>重传队列</strong> 最后一 skb 上挂 FIN（注释说明：栈会认为该 FIN「已发送」，需通过超时路径送出）。</li><li><strong>否则</strong>分配精简 skb，<code>tcp_init_nondata_skb(..., TCPHDR_ACK | TCPHDR_FIN)</code> 入队并 <code>__tcp_push_pending_frames</code>。</li></ul><hr><h2 id=四fin-接收>四、FIN 接收</h2><h3 id=41-tcp_fin>4.1 <code>tcp_fin()</code></h3><p>对<strong>已进入序列空间且被接收路径识别</strong>的对端 FIN，<code>tcp_fin()</code> 完成 <code>RCV_SHUTDOWN</code>、<code>SOCK_DONE</code>、按状态迁移，并清理乱序队列。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:5277-5344
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_fin</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_csk_schedule_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_shutdown</span> <span class=o>|=</span> <span class=n>RCV_SHUTDOWN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_set_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DONE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>switch</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_SYN_RECV</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_ESTABLISHED</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_set_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_CLOSE_WAIT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>inet_csk_enter_pingpong_mode</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_CLOSE_WAIT</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_CLOSING</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_LAST_ACK</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_FIN_WAIT1</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_set_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_CLOSING</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_FIN_WAIT2</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_time_wait</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_TIME_WAIT</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>default</span><span class=o>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>pr_err</span><span class=p>(</span><span class=s>&#34;%s: Impossible, sk-&gt;sk_state=%d</span><span class=se>\n</span><span class=s>&#34;</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>		       <span class=n>__func__</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>skb_rbtree_purge</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=nf>sk_state_change</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_shutdown</span> <span class=o>==</span> <span class=n>SHUTDOWN_MASK</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>		    <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_CLOSE</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=nf>sk_wake_async</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_WAKE_WAITD</span><span class=p>,</span> <span class=n>POLL_HUP</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>else</span>
+</span></span><span class=line><span class=cl>			<span class=nf>sk_wake_async</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_WAKE_WAITD</span><span class=p>,</span> <span class=n>POLL_IN</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>状态对照：</p><div class=table-wrapper><table><thead><tr><th>收 FIN 前状态</th><th><code>tcp_fin</code> 中行为</th></tr></thead><tbody><tr><td><code>SYN_RECV</code> / <code>ESTABLISHED</code></td><td><code>CLOSE_WAIT</code>（被动关闭）</td></tr><tr><td><code>FIN_WAIT1</code></td><td>回 ACK，<code>CLOSING</code>（同时关闭）</td></tr><tr><td><code>FIN_WAIT2</code></td><td>回 ACK，<code>tcp_time_wait(..., TCP_TIME_WAIT, 0)</code></td></tr><tr><td><code>CLOSE_WAIT</code> / <code>CLOSING</code> / <code>LAST_ACK</code></td><td>忽略重传 FIN 或保持 <code>LAST_ACK</code></td></tr></tbody></table></div><h3 id=42-从-tcp_data_queue-调用-tcp_fin>4.2 从 <code>tcp_data_queue()</code> 调用 <code>tcp_fin()</code></h3><p>ESTABLISHED 快速路径上，按序数据入接收队列后若当前 skb 带 FIN 标志则调用 <code>tcp_fin</code>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6086-6094
+</span></span></span><span class=line><span class=cl>		<span class=n>eaten</span> <span class=o>=</span> <span class=nf>tcp_queue_rcv</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fragstolen</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>skb</span><span class=o>-&gt;</span><span class=n>len</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_event_data_recv</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>tcp_flags</span> <span class=o>&amp;</span> <span class=n>TCPHDR_FIN</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_fin</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p>乱序填补路径 <code>tcp_ofo_queue()</code> 在把带 FIN 的乱序段并入接收侧后同样调用 <code>tcp_fin</code>（<code>net/ipv4/tcp_input.c:5698-5702</code>）。</p><h3 id=43-tcp_rcv_state_processack-驱动状态与-fin数据步序>4.3 <code>tcp_rcv_state_process()</code>：ACK 驱动状态与 FIN/数据步序</h3><p>对 <code>FIN_WAIT1</code>、<code>CLOSING</code>、<code>LAST_ACK</code> 等非 ESTABLISHED 状态，包经 <code>tcp_rcv_state_process()</code>：先 <code>tcp_validate_incoming</code>、<code>tcp_ack</code>，再在 <code>switch (sk->sk_state)</code> 中处理「我方 FIN 是否被确认」，最后 <code>tcp_data_queue()</code> 处理数据与 FIN。</p><p><strong><code>FIN_WAIT1</code> → <code>FIN_WAIT2</code>（收到对端 ACK 清掉我方 FIN）</strong>（节选）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:7887-7905
+</span></span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_FIN_WAIT1</span><span class=p>:</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=kt>int</span> <span class=n>tmo</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_una</span> <span class=o>!=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_set_state</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_FIN_WAIT2</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_shutdown</span> <span class=o>|=</span> <span class=n>SEND_SHUTDOWN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>sk_dst_confirm</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=n>sk</span><span class=o>-&gt;</span><span class=nf>sk_state_change</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=cm>/* orphan 路径: linger2、数据、定时器或直接进入 tcp_time_wait — 见同 case 后续行 */</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong><code>CLOSING</code> → <code>TIME_WAIT</code></strong>：当 <code>snd_una == write_seq</code>（我方 FIN 已被确认），调用 <code>tcp_time_wait(sk, TCP_TIME_WAIT, 0)</code>（<code>net/ipv4/tcp_input.c:7980-7987</code>）。</p><p><strong><code>LAST_ACK</code> → 关闭</strong>：同上条件满足时 <code>tcp_update_metrics</code> + <code>tcp_done</code>（<code>net/ipv4/tcp_input.c:7990-8000</code>）。</p><p><strong>数据与 FIN</strong>：在 <code>TCP_FIN_WAIT1</code>/<code>FIN_WAIT2</code> 等分支后，共用 <code>tcp_data_queue(sk, skb)</code>（<code>net/ipv4/tcp_input.c:8008-8051</code>），其中 FIN 仍由 <code>tcp_fin</code> 处理。</p><hr><h2 id=五time_wait-管理>五、<code>TIME_WAIT</code> 管理</h2><h3 id=51-tcp_time_wait分配-inet_timewait_sock定时inet_twsk_hashdance>5.1 <code>tcp_time_wait()</code>：分配 <code>inet_timewait_sock</code>、定时、<code>inet_twsk_hashdance</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_minisocks.c:308-397
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_time_wait</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>state</span><span class=p>,</span> <span class=kt>int</span> <span class=n>timeo</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>const</span> <span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=o>*</span><span class=n>tw</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_timewait_death_row</span> <span class=o>*</span><span class=n>tcp_death_row</span> <span class=o>=</span> <span class=o>&amp;</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>tcp_death_row</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>tw</span> <span class=o>=</span> <span class=nf>inet_twsk_alloc</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>tcp_death_row</span><span class=p>,</span> <span class=n>state</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tw</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>struct</span> <span class=n>tcp_timewait_sock</span> <span class=o>*</span><span class=n>tcptw</span> <span class=o>=</span> <span class=nf>tcp_twsk</span><span class=p>((</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tw</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ... 拷贝 tw 字段、MD5 等 ...
+</span></span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>timeo</span> <span class=o>&lt;</span> <span class=n>rto</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=n>timeo</span> <span class=o>=</span> <span class=n>rto</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>state</span> <span class=o>==</span> <span class=n>TCP_TIME_WAIT</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=n>timeo</span> <span class=o>=</span> <span class=n>TCP_TIMEWAIT_LEN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=nf>local_bh_disable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>		<span class=nf>inet_twsk_schedule</span><span class=p>(</span><span class=n>tw</span><span class=p>,</span> <span class=n>timeo</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>inet_twsk_hashdance</span><span class=p>(</span><span class=n>tw</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tcp_hashinfo</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>local_bh_enable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_TCPTIMEWAITOVERFLOW</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_update_metrics</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_done</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>要点：</p><ul><li><code>inet_twsk_alloc</code> 失败时仅统计 <code>TCPTIMEWAITOVERFLOW</code> 并仍 <code>tcp_done</code> 结束主 sock。</li><li><code>state == TCP_TIME_WAIT</code> 时超时固定为 <code>TCP_TIMEWAIT_LEN</code>（见 5.3）。</li><li><code>inet_twsk_schedule</code> 封装 <code>__inet_twsk_schedule</code>（<code>include/net/inet_timewait_sock.h:101-103</code>）。</li><li><code>inet_twsk_hashdance</code> 将 TW 插入哈希并从 ehash 移除原 <code>sk</code>（下一小节）。</li></ul><h3 id=52-struct-inet_timewait_sock-与-struct-tcp_timewait_sock>5.2 <code>struct inet_timewait_sock</code> 与 <code>struct tcp_timewait_sock</code></h3><p>轻量 TW 结构（节选字段）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/inet_timewait_sock.h:33-77
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sock_common</span>	<span class=n>__tw_common</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ... 宏映射 skc_* ...
+</span></span></span><span class=line><span class=cl>	<span class=n>__u32</span>			<span class=n>tw_mark</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>volatile</span> <span class=kt>unsigned</span> <span class=kt>char</span>	<span class=n>tw_substate</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>unsigned</span> <span class=kt>char</span>		<span class=n>tw_rcv_wscale</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>__be16</span>			<span class=n>tw_sport</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>unsigned</span> <span class=kt>int</span>		<span class=nl>tw_kill</span>		<span class=p>:</span> <span class=mi>1</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				<span class=nl>tw_transparent</span>  <span class=p>:</span> <span class=mi>1</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				<span class=nl>tw_flowlabel</span>	<span class=p>:</span> <span class=mi>20</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				<span class=nl>tw_pad</span>		<span class=p>:</span> <span class=mi>2</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				<span class=nl>tw_tos</span>		<span class=p>:</span> <span class=mi>8</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>u32</span>			<span class=n>tw_txhash</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>u32</span>			<span class=n>tw_priority</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>timer_list</span>	<span class=n>tw_timer</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_bind_bucket</span>	<span class=o>*</span><span class=n>tw_tb</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p>TCP 专有扩展：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/tcp.h:441-457
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>tcp_timewait_sock</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=n>tw_sk</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>u32</span>			  <span class=n>tw_rcv_wnd</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>u32</span>			  <span class=n>tw_ts_offset</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>u32</span>			  <span class=n>tw_ts_recent</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>u32</span>			  <span class=n>tw_last_oow_ack_time</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span>			  <span class=n>tw_ts_recent_stamp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>u32</span>			  <span class=n>tw_tx_delay</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_TCP_MD5SIG
+</span></span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_md5sig_key</span>	  <span class=o>*</span><span class=n>tw_md5_key</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=53-inet_twsk_hashdance>5.3 <code>inet_twsk_hashdance()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_timewait_sock.c:171-211
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>inet_twsk_hashdance</span><span class=p>(</span><span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=o>*</span><span class=n>tw</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>			   <span class=k>struct</span> <span class=n>inet_hashinfo</span> <span class=o>*</span><span class=n>hashinfo</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ... bhash: 将 tw 挂入 bind bucket ...
+</span></span></span><span class=line><span class=cl>	<span class=nf>spin_lock</span><span class=p>(</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_twsk_add_node_rcu</span><span class=p>(</span><span class=n>tw</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>ehead</span><span class=o>-&gt;</span><span class=n>chain</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=cm>/* Step 3: Remove SK from hash chain */</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>__sk_nulls_del_node_init_rcu</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=nf>sock_prot_inuse_add</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=p>,</span> <span class=o>-</span><span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>spin_unlock</span><span class=p>(</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>refcount_set</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tw</span><span class=o>-&gt;</span><span class=n>tw_refcnt</span><span class=p>,</span> <span class=mi>3</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>注释写明 <code>tw_refcnt</code> 初值为 3：bhash、ehash、定时器各一。</p><h3 id=54-定时器回调与-tcp_timewait_len>5.4 定时器回调与 <code>TCP_TIMEWAIT_LEN</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_timewait_sock.c:214-223
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tw_timer_handler</span><span class=p>(</span><span class=k>struct</span> <span class=n>timer_list</span> <span class=o>*</span><span class=n>t</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=o>*</span><span class=n>tw</span> <span class=o>=</span> <span class=nf>from_timer</span><span class=p>(</span><span class=n>tw</span><span class=p>,</span> <span class=n>t</span><span class=p>,</span> <span class=n>tw_timer</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tw</span><span class=o>-&gt;</span><span class=n>tw_kill</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__NET_INC_STATS</span><span class=p>(</span><span class=nf>twsk_net</span><span class=p>(</span><span class=n>tw</span><span class=p>),</span> <span class=n>LINUX_MIB_TIMEWAITKILLED</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>else</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__NET_INC_STATS</span><span class=p>(</span><span class=nf>twsk_net</span><span class=p>(</span><span class=n>tw</span><span class=p>),</span> <span class=n>LINUX_MIB_TIMEWAITED</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_twsk_kill</span><span class=p>(</span><span class=n>tw</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>固定 60 秒（以 <code>HZ</code> 计）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h:123-125
+</span></span></span><span class=line><span class=cl><span class=cp>#define TCP_TIMEWAIT_LEN (60*HZ) </span><span class=cm>/* how long to wait to destroy TIME-WAIT
+</span></span></span><span class=line><span class=cl><span class=cm>				  * state, about 60 seconds	*/</span><span class=cp>
+</span></span></span></code></pre></td></tr></table></div></div><p>注意注释中写明这是「约 60 秒」的销毁等待，与教科书「2MSL」在数值上由实现选定；<code>__inet_twsk_schedule</code> 上方长注释 further 讨论 MSL/RTO/PAWS（<code>net/ipv4/inet_timewait_sock.c:343-368</code>）。</p><p><code>inet_twsk_deschedule_put()</code>：尝试 <code>del_timer_sync</code>，若取消成功则 <code>inet_twsk_kill</code>，最后 <code>inet_twsk_put</code>（<code>net/ipv4/inet_timewait_sock.c:328-340</code>）。</p><h3 id=55-sysctl_max_tw_buckets-与-inet_twsk_alloc>5.5 <code>sysctl_max_tw_buckets</code> 与 <code>inet_twsk_alloc()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_timewait_sock.c:225-232
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=o>*</span><span class=nf>inet_twsk_alloc</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					   <span class=k>struct</span> <span class=n>inet_timewait_death_row</span> <span class=o>*</span><span class=n>dr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					   <span class=k>const</span> <span class=kt>int</span> <span class=n>state</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=o>*</span><span class=n>tw</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>atomic_read</span><span class=p>(</span><span class=o>&amp;</span><span class=n>dr</span><span class=o>-&gt;</span><span class=n>tw_count</span><span class=p>)</span> <span class=o>&gt;=</span> <span class=n>dr</span><span class=o>-&gt;</span><span class=n>sysctl_max_tw_buckets</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>超过配额时 <code>tcp_time_wait</code> 走 <code>TCPTIMEWAITOVERFLOW</code> 分支。</p><h3 id=56-命名空间清理inet_twsk_purge>5.6 命名空间清理：<code>inet_twsk_purge()</code></h3><p>遍历 ehash，对匹配 family 且引用可用的 <code>TCP_TIME_WAIT</code> 条目调用 <code>inet_twsk_deschedule_put</code>（<code>net/ipv4/inet_timewait_sock.c:380-424</code>）。</p><hr><h2 id=六time_wait-复用>六、<code>TIME_WAIT</code> 复用</h2><h3 id=61-tcp_tw_reuse-sysctl>6.1 <code>tcp_tw_reuse</code> sysctl</h3><p><code>net->ipv4.sysctl_tcp_tw_reuse</code> 默认在 IPv4 初始化中可设为 2（具体初始化见 <code>net/ipv4/tcp_ipv4.c:3916</code> 等），运行时可调。语义由 <code>tcp_twsk_unique()</code> 实现。</p><h3 id=62-__inet_check_established-与-twsk_unique>6.2 <code>__inet_check_established()</code> 与 <code>twsk_unique()</code></h3><p><code>connect()</code> 选本地端口并检查四元组冲突时，内联 <code>twsk_unique()</code> 通过 <code>sk->sk_prot->twsk_prot->twsk_unique</code> 调到 TCP 的 <code>tcp_twsk_unique</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/timewait_sock.h:23-27
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>int</span> <span class=nf>twsk_unique</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sktw</span><span class=p>,</span> <span class=kt>void</span> <span class=o>*</span><span class=n>twp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=n>twsk_prot</span><span class=o>-&gt;</span><span class=n>twsk_unique</span> <span class=o>!=</span> <span class=nb>NULL</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=n>twsk_prot</span><span class=o>-&gt;</span><span class=nf>twsk_unique</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>sktw</span><span class=p>,</span> <span class=n>twp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>__inet_check_established()</code>（<code>net/ipv4/inet_hashtables.c:554-647</code>）在 ehash 冲突且对端为 <code>TCP_TIME_WAIT</code> 时调用 <code>twsk_unique</code>；成功则插入新 <code>sk</code> 并 <code>sk_nulls_del_node_init_rcu</code> 去掉原 tw，统计 <code>TIMEWAITRECYCLED</code>（<code>net/ipv4/inet_hashtables.c:596-627</code>）。</p><h3 id=63-tcp_twsk_unique时间戳reuse2-环回限制>6.3 <code>tcp_twsk_unique()</code>：时间戳、<code>reuse==2</code> 环回限制</h3><p>核心实现 <code>net/ipv4/tcp_ipv4.c:278-364</code>：</p><ul><li><code>reuse == 2</code>：若四元组对应的 TW <strong>非 loopback</strong>（绑定 lo、或 IPv4/IPv6 环回地址检测），将 <strong><code>reuse</code> 降为 0</strong>（<code>net/ipv4/tcp_ipv4.c:289-317</code>）。</li><li>复用条件：<code>tcptw->tw_ts_recent_stamp</code> 非零，且 <code>!twp || (reuse && time_after32(ktime_get_seconds(), tcptw->tw_ts_recent_stamp))</code>（同文件 336-338）。非 repair 路径下同步调整 <code>write_seq</code> 与 <code>ts_recent</code> 字段（340-354）。</li></ul><hr><h2 id=七orphan-socket-管理>七、Orphan Socket 管理</h2><h3 id=71-计数聚合与-tcp_too_many_orphans--tcp_check_oom>7.1 计数聚合与 <code>tcp_too_many_orphans</code> / <code>tcp_check_oom</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp.c:3241-3258
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>bool</span> <span class=nf>tcp_too_many_orphans</span><span class=p>(</span><span class=kt>int</span> <span class=n>shift</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>tcp_orphan_cache</span><span class=p>)</span> <span class=o>&lt;&lt;</span> <span class=n>shift</span> <span class=o>&gt;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>sysctl_tcp_max_orphans</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=kt>bool</span> <span class=nf>tcp_check_oom</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>shift</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=kt>bool</span> <span class=n>too_many_orphans</span><span class=p>,</span> <span class=n>out_of_socket_memory</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>too_many_orphans</span> <span class=o>=</span> <span class=nf>tcp_too_many_orphans</span><span class=p>(</span><span class=n>shift</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=n>out_of_socket_memory</span> <span class=o>=</span> <span class=nf>tcp_out_of_memory</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>too_many_orphans</span> <span class=o>||</span> <span class=n>out_of_socket_memory</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>tcp_orphan_cache</code> 由周期定时器 <code>tcp_orphan_update</code> 刷新（<code>net/ipv4/tcp.c:3235-3238</code>）。</p><h3 id=72-__tcp_close-中的-oom-路径>7.2 <code>__tcp_close</code> 中的 OOM 路径</h3><p>在 orphan 之后若状态非 <code>TCP_CLOSE</code>，可能调用 <code>tcp_check_oom</code> 并主动 reset（<code>net/ipv4/tcp.c:3384-3394</code>）。</p><h3 id=73-orphan-fin_wait2-与-tcp_time_wait>7.3 Orphan <code>FIN_WAIT2</code> 与 <code>tcp_time_wait</code></h3><p>当 <code>FIN_WAIT1</code> 已收 ACK 进入 <code>FIN_WAIT2</code> 且 <code>SOCK_DEAD</code>，<code>__tcp_close</code> 中根据 <code>linger2</code>、<code>tcp_fin_time</code>、<code>TCP_TIMEWAIT_LEN</code> 与是否已收到 FIN 等，选择 <code>tcp_time_wait(sk, TCP_FIN_WAIT2, tmo)</code> 或 keepalive 定时（<code>net/ipv4/tcp.c:3365-3381</code>）。这与第四节 <code>tcp_rcv_state_process</code> 内 orphan <code>FIN_WAIT2</code> 逻辑互补（同文件 7918-7976）。</p><hr><h2 id=八shutdown-系统调用>八、<code>shutdown()</code> 系统调用</h2><h3 id=81-inet_shutdownhow-与-shutdown_mask>8.1 <code>inet_shutdown()</code>：<code>how++</code> 与 <code>SHUTDOWN_MASK</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/af_inet.c:962-1014
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>inet_shutdown</span><span class=p>(</span><span class=k>struct</span> <span class=n>socket</span> <span class=o>*</span><span class=n>sock</span><span class=p>,</span> <span class=kt>int</span> <span class=n>how</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span> <span class=o>=</span> <span class=n>sock</span><span class=o>-&gt;</span><span class=n>sk</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>err</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>how</span><span class=o>++</span><span class=p>;</span> <span class=cm>/* maps 0-&gt;1 has the advantage of making bit 1 rcvs and
+</span></span></span><span class=line><span class=cl><span class=cm>		       1-&gt;2 bit 2 snds.
+</span></span></span><span class=line><span class=cl><span class=cm>		       2-&gt;3 */</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>((</span><span class=n>how</span> <span class=o>&amp;</span> <span class=o>~</span><span class=n>SHUTDOWN_MASK</span><span class=p>)</span> <span class=o>||</span> <span class=o>!</span><span class=n>how</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span> <span class=o>-</span><span class=n>EINVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>lock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>	<span class=k>switch</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>TCP_CLOSE</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=n>err</span> <span class=o>=</span> <span class=o>-</span><span class=n>ENOTCONN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>fallthrough</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>default</span><span class=o>:</span>
+</span></span><span class=line><span class=cl>		<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_shutdown</span> <span class=o>|=</span> <span class=n>how</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=n>shutdown</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>shutdown</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>how</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// LISTEN / SYN_SENT 特判 ...
+</span></span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>sk</span><span class=o>-&gt;</span><span class=nf>sk_state_change</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>release_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>用户态 <code>SHUT_RD=0</code>、<code>SHUT_WR=1</code>、<code>SHUT_RDWR=2</code> 经 <code>how++</code> 后变为 <code>1/2/3</code>，与 <code>include/net/sock.h</code> 中 <code>RCV_SHUTDOWN=1</code>、<code>SEND_SHUTDOWN=2</code> 及掩码 <code>SHUTDOWN_MASK=3</code> 对齐。</p><h3 id=82-shut_wr-路径>8.2 <code>SHUT_WR</code> 路径</h3><p><code>sk->sk_shutdown |= how</code> 后调用 <code>tcp_shutdown(sk, how)</code>（<code>tcp_ipv4.c</code> proto 表的 <code>.shutdown = tcp_shutdown</code>）。<code>tcp_shutdown</code> 在发送侧允许的状态下调用 <code>tcp_close_state</code> + <code>tcp_send_fin</code>（第三节）。</p><h3 id=83-与-tcp_close-的差异源码层>8.3 与 <code>tcp_close()</code> 的差异（源码层）</h3><div class=table-wrapper><table><thead><tr><th>维度</th><th><code>tcp_close</code> / <code>__tcp_close</code></th><th><code>tcp_shutdown</code></th></tr></thead><tbody><tr><td><code>sk_shutdown</code></td><td>直接 <code>SHUTDOWN_MASK</code></td><td>按 <code>how</code> 增量关闭</td></tr><tr><td>接收队列</td><td>清空并统计未读</td><td>不清空</td></tr><tr><td><code>sock_orphan</code></td><td>是</td><td>否</td></tr><tr><td><code>tcp_orphan_count</code></td><td>递增</td><td>不经此路径递增</td></tr><tr><td>FIN 发送</td><td>条件满足时 <code>tcp_send_fin</code></td><td>仅发送侧且状态集更小</td></tr></tbody></table></div><h3 id=84-终结销毁inet_csk_destroy_sock>8.4 终结销毁：<code>inet_csk_destroy_sock()</code></h3><p>当状态已为 <code>TCP_CLOSE</code>、未在哈希表中且为 orphan 时，<code>__tcp_close</code> 调用 <code>inet_csk_destroy_sock(sk)</code>（<code>net/ipv4/tcp.c:3397-3408</code>）。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c:1103-1125
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>inet_csk_destroy_sock</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>WARN_ON</span><span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_CLOSE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>WARN_ON</span><span class=p>(</span><span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>	<span class=nf>WARN_ON</span><span class=p>(</span><span class=o>!</span><span class=nf>sk_unhashed</span><span class=p>(</span><span class=n>sk</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>	<span class=nf>WARN_ON</span><span class=p>(</span><span class=nf>inet_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>inet_num</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_bind_hash</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=nf>destroy</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_stream_kill_queues</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>xfrm_sk_free_policy</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_refcnt_debug_release</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>this_cpu_dec</span><span class=p>(</span><span class=o>*</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=o>-&gt;</span><span class=n>orphan_count</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_put</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>此处 <code>orphan_count</code> 为 per-proto 指针（TCP 绑定 <code>tcp_orphan_count</code>），与 <code>__tcp_close</code> 中 <code>this_cpu_inc(tcp_orphan_count)</code> 成对递减。</p><hr><h2 id=附录-a关键源文件与行号索引>附录 A：关键源文件与行号索引</h2><div class=table-wrapper><table><thead><tr><th>主题</th><th>文件</th><th>大致行号</th></tr></thead><tbody><tr><td><code>tcp_orphan_count</code></td><td><code>net/ipv4/tcp.c</code></td><td>290-291</td></tr><tr><td><code>new_state[]</code> / <code>tcp_close_state</code></td><td><code>net/ipv4/tcp.c</code></td><td>3169-3194</td></tr><tr><td><code>tcp_shutdown</code></td><td><code>net/ipv4/tcp.c</code></td><td>3201-3218</td></tr><tr><td><code>tcp_too_many_orphans</code> / <code>tcp_check_oom</code></td><td><code>net/ipv4/tcp.c</code></td><td>3241-3258</td></tr><tr><td><code>__tcp_close</code> / <code>tcp_close</code></td><td><code>net/ipv4/tcp.c</code></td><td>3278-3423</td></tr><tr><td><code>sk_stream_wait_close</code></td><td><code>net/core/stream.c</code></td><td>96-110</td></tr><tr><td><code>sock_orphan</code></td><td><code>include/net/sock.h</code></td><td>1960-1967</td></tr><tr><td><code>SHUTDOWN_MASK</code> / shutdown 位</td><td><code>include/net/sock.h</code></td><td>1463-1465</td></tr><tr><td><code>tcp_send_fin</code></td><td><code>net/ipv4/tcp_output.c</code></td><td>4341-4383</td></tr><tr><td><code>tcp_fin</code></td><td><code>net/ipv4/tcp_input.c</code></td><td>5277-5344</td></tr><tr><td><code>tcp_ofo_queue</code> 中 <code>tcp_fin</code></td><td><code>net/ipv4/tcp_input.c</code></td><td>5698-5702</td></tr><tr><td><code>tcp_data_queue</code> 中 <code>tcp_fin</code></td><td><code>net/ipv4/tcp_input.c</code></td><td>6092-6094</td></tr><tr><td><code>tcp_rcv_state_process</code></td><td><code>net/ipv4/tcp_input.c</code></td><td>7672-8071</td></tr><tr><td><code>tcp_time_wait</code></td><td><code>net/ipv4/tcp_minisocks.c</code></td><td>308-397</td></tr><tr><td><code>inet_timewait_sock</code> 结构</td><td><code>include/net/inet_timewait_sock.h</code></td><td>33-77</td></tr><tr><td><code>tcp_timewait_sock</code> 结构</td><td><code>include/linux/tcp.h</code></td><td>441-457</td></tr><tr><td><code>TCP_TIMEWAIT_LEN</code></td><td><code>include/net/tcp.h</code></td><td>123-125</td></tr><tr><td><code>inet_twsk_hashdance</code> / 定时器 / alloc / purge / deschedule</td><td><code>net/ipv4/inet_timewait_sock.c</code></td><td>171-211, 214-223, 225-271, 328-340, 343-377, 380-424</td></tr><tr><td><code>inet_release</code></td><td><code>net/ipv4/af_inet.c</code></td><td>457-483</td></tr><tr><td><code>inet_shutdown</code></td><td><code>net/ipv4/af_inet.c</code></td><td>962-1014</td></tr><tr><td><code>__inet_check_established</code></td><td><code>net/ipv4/inet_hashtables.c</code></td><td>554-647</td></tr><tr><td><code>twsk_unique</code></td><td><code>include/net/timewait_sock.h</code></td><td>23-27</td></tr><tr><td><code>tcp_twsk_unique</code></td><td><code>net/ipv4/tcp_ipv4.c</code></td><td>278-364</td></tr><tr><td><code>inet_csk_destroy_sock</code></td><td><code>net/ipv4/inet_connection_sock.c</code></td><td>1103-1125</td></tr><tr><td><code>TCP_ACTION_FIN</code> / 状态枚举</td><td><code>include/net/tcp_states.h</code></td><td>12-31</td></tr></tbody></table></div><hr><h2 id=附录-b阅读建议>附录 B：阅读建议</h2><ol><li>先对照 <strong>第一章状态表</strong> 明确「谁在什么状态下会发 FIN」。</li><li>再读 <strong><code>__tcp_close</code> 分支</strong>，区分「未读数据 RST」「<code>SO_LINGER=0</code> abort」与「正常 FIN」。</li><li><strong>收包路径</strong> 同时跟踪 <code>tcp_rcv_state_process</code>（ACK 推进）与 <code>tcp_data_queue</code>/<code>tcp_fin</code>（对端 FIN）。</li><li><strong><code>tcp_time_wait</code> + <code>inet_twsk_hashdance</code></strong> 理解主 <code>sock</code> 如何被轻量 <code>tw</code> 替换。</li><li><strong>复用</strong> 以 <code>inet_hashtables.c</code> + <code>tcp_twsk_unique</code> 连线，避免与 <code>SO_REUSEADDR</code> 混淆（源码注释 <code>tcp_ipv4.c:260-274</code> 已对比说明）。</li></ol><hr><p><em>文档完。</em></p></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/close/>Close</a>
+<a href=/tags/shutdown/>Shutdown</a>
+<a href=/tags/fin/>FIN</a>
+<a href=/tags/time_wait/>TIME_WAIT</a>
+<a href=/tags/tcp_close/>Tcp_close</a>
+<a href=/tags/tcp_send_fin/>Tcp_send_fin</a>
+<a href=/tags/tcp_fin/>Tcp_fin</a>
+<a href=/tags/tcp_time_wait/>Tcp_time_wait</a>
+<a href=/tags/so_linger/>SO_LINGER</a>
+<a href=/tags/orphan/>Orphan</a>
+<a href=/tags/inet_twsk_hashdance/>Inet_twsk_hashdance</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/closesocket-%E7%9A%84-fd-%E5%BD%92%E8%BF%98%E6%97%B6%E6%9C%BA%E4%B8%8E-time_wait-%E8%B5%84%E6%BA%90%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>close(socket) 的 fd 归还时机与 TIME_WAIT 资源分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

@@ -1,0 +1,568 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='Linux 调度器执行时机深度分析 基于 Linux 5.15.78 内核源码分析\n前置阅读：上下文切换实现原理 — context_switch 的内部机制\n目录 零、30 秒理解调度器 一、核心设计思想：标记与检查分离 二、唯一的切换入口：__schedule() 三、五大触发路径 四、need_resched 双层标志机制 五、周期性调度：scheduler_tick 链路 六、唤醒抢占：高优先级任务如何抢占 七、典型场景时序分析 八、设计思考 九、源码位置速查表 零、30 秒理解调度器 一句话：调度器决定"哪个进程占用 CPU"——它不是一直在运行的守护进程，而是被特定事件触发时才执行的一段代码。\n类比：想象一个只有一个窗口的银行（= 一个 CPU 核心）。客户（= 进程）排队等候。柜员（= CPU）正在服务当前客户。调度器就是那个叫号系统——它不会随时打断柜员，而是在以下时刻才响：\n当前客户主动说"我要等取款机回复"（主动睡眠） 计时器响了：当前客户已占用太久（时间片到期） VIP 客户走进来（高优先级唤醒） 柜员处理完一个中断事务后（中断返回） CPU 时间线：谁在运行？什么时候切换？ 进程 A 运行 调 进程 B 运行 调 进程 A 运行 调 进程 C 运行 A 主动睡眠 (等 I/O) 时间片到期 (tick 中断) VIP 唤醒抢占 (IPI) 进程运行中 调度器执行（极短） 另一个进程 核心机制：标记 → 检查 → 切换 触发事件只设置\' 需要调度\"标志；真正的切换在安全点（中断返回/preempt_enable）才发生 一、核心设计思想：标记与检查分离 linux 调度器的执行采用异步两阶段模型：\n"><title>Linux 调度器执行时机深度分析</title><link rel=canonical href=https://1bit2.github.io/p/linux-%E8%B0%83%E5%BA%A6%E5%99%A8%E6%89%A7%E8%A1%8C%E6%97%B6%E6%9C%BA%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Linux 调度器执行时机深度分析"><meta property='og:description' content='Linux 调度器执行时机深度分析 基于 Linux 5.15.78 内核源码分析\n前置阅读：上下文切换实现原理 — context_switch 的内部机制\n目录 零、30 秒理解调度器 一、核心设计思想：标记与检查分离 二、唯一的切换入口：__schedule() 三、五大触发路径 四、need_resched 双层标志机制 五、周期性调度：scheduler_tick 链路 六、唤醒抢占：高优先级任务如何抢占 七、典型场景时序分析 八、设计思考 九、源码位置速查表 零、30 秒理解调度器 一句话：调度器决定"哪个进程占用 CPU"——它不是一直在运行的守护进程，而是被特定事件触发时才执行的一段代码。\n类比：想象一个只有一个窗口的银行（= 一个 CPU 核心）。客户（= 进程）排队等候。柜员（= CPU）正在服务当前客户。调度器就是那个叫号系统——它不会随时打断柜员，而是在以下时刻才响：\n当前客户主动说"我要等取款机回复"（主动睡眠） 计时器响了：当前客户已占用太久（时间片到期） VIP 客户走进来（高优先级唤醒） 柜员处理完一个中断事务后（中断返回） CPU 时间线：谁在运行？什么时候切换？ 进程 A 运行 调 进程 B 运行 调 进程 A 运行 调 进程 C 运行 A 主动睡眠 (等 I/O) 时间片到期 (tick 中断) VIP 唤醒抢占 (IPI) 进程运行中 调度器执行（极短） 另一个进程 核心机制：标记 → 检查 → 切换 触发事件只设置\' 需要调度\"标志；真正的切换在安全点（中断返回/preempt_enable）才发生 一、核心设计思想：标记与检查分离 linux 调度器的执行采用异步两阶段模型：\n"><meta property='og:url' content='https://1bit2.github.io/p/linux-%E8%B0%83%E5%BA%A6%E5%99%A8%E6%89%A7%E8%A1%8C%E6%97%B6%E6%9C%BA%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='调度器'><meta property='article:tag' content='schedule'><meta property='article:tag' content='__schedule'><meta property='article:tag' content='need_resched'><meta property='article:tag' content='preempt'><meta property='article:tag' content='scheduler_tick'><meta property='article:tag' content='CFS'><meta property='article:tag' content='抢占'><meta property='article:published_time' content='2026-05-29T00:00:00+00:00'><meta property='article:modified_time' content='2026-05-29T00:00:00+00:00'><meta name=twitter:title content="Linux 调度器执行时机深度分析"><meta name=twitter:description content='Linux 调度器执行时机深度分析 基于 Linux 5.15.78 内核源码分析\n前置阅读：上下文切换实现原理 — context_switch 的内部机制\n目录 零、30 秒理解调度器 一、核心设计思想：标记与检查分离 二、唯一的切换入口：__schedule() 三、五大触发路径 四、need_resched 双层标志机制 五、周期性调度：scheduler_tick 链路 六、唤醒抢占：高优先级任务如何抢占 七、典型场景时序分析 八、设计思考 九、源码位置速查表 零、30 秒理解调度器 一句话：调度器决定"哪个进程占用 CPU"——它不是一直在运行的守护进程，而是被特定事件触发时才执行的一段代码。\n类比：想象一个只有一个窗口的银行（= 一个 CPU 核心）。客户（= 进程）排队等候。柜员（= CPU）正在服务当前客户。调度器就是那个叫号系统——它不会随时打断柜员，而是在以下时刻才响：\n当前客户主动说"我要等取款机回复"（主动睡眠） 计时器响了：当前客户已占用太久（时间片到期） VIP 客户走进来（高优先级唤醒） 柜员处理完一个中断事务后（中断返回） CPU 时间线：谁在运行？什么时候切换？ 进程 A 运行 调 进程 B 运行 调 进程 A 运行 调 进程 C 运行 A 主动睡眠 (等 I/O) 时间片到期 (tick 中断) VIP 唤醒抢占 (IPI) 进程运行中 调度器执行（极短） 另一个进程 核心机制：标记 → 检查 → 切换 触发事件只设置\' 需要调度\"标志；真正的切换在安全点（中断返回/preempt_enable）才发生 一、核心设计思想：标记与检查分离 linux 调度器的执行采用异步两阶段模型：\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#目录>目录</a></li><li><a href=#零30-秒理解调度器>零、30 秒理解调度器</a></li><li><a href=#一核心设计思想标记与检查分离>一、核心设计思想：标记与检查分离</a></li><li><a href=#二唯一的切换入口__schedule>二、唯一的切换入口：__schedule()</a><ol><li><a href=#sched_mode-语义>sched_mode 语义</a></li><li><a href=#schedule-包装>schedule() 包装</a></li></ol></li><li><a href=#三五大触发路径>三、五大触发路径</a><ol><li><a href=#a-主动调度进程自己调用-schedule>A. 主动调度：进程自己调用 schedule()</a></li><li><a href=#b-内核抢占preempt_enable--spin_unlock>B. 内核抢占：preempt_enable() / spin_unlock()</a></li><li><a href=#c-中断返回内核态config_preemptiony>C. 中断返回内核态（CONFIG_PREEMPTION=y）</a></li><li><a href=#d-返回用户态系统调用中断返回>D. 返回用户态（系统调用/中断返回）</a></li><li><a href=#e-协作式调度cond_resched>E. 协作式调度：cond_resched()</a></li></ol></li><li><a href=#四need_resched-双层标志机制>四、need_resched 双层标志机制</a><ol><li><a href=#层1tif_need_reschedthread_infoflags>层1：TIF_NEED_RESCHED（thread_info.flags）</a></li><li><a href=#层2折叠进-preempt_countx86-优化>层2：折叠进 preempt_count（x86 优化）</a></li><li><a href=#核心设置函数resched_curr>核心设置函数：resched_curr()</a></li><li><a href=#清除时机>清除时机</a></li></ol></li><li><a href=#五周期性调度scheduler_tick-链路>五、周期性调度：scheduler_tick 链路</a><ol><li><a href=#触发链>触发链</a></li><li><a href=#scheduler_tick-本体>scheduler_tick() 本体</a></li><li><a href=#cfs-回调链task_tick_fair--check_preempt_tick>CFS 回调链：task_tick_fair → check_preempt_tick</a></li></ol></li><li><a href=#六唤醒抢占高优先级任务如何抢占>六、唤醒抢占：高优先级任务如何抢占</a><ol><li><a href=#唤醒路径>唤醒路径</a></li><li><a href=#cfs-唤醒抢占检查>CFS 唤醒抢占检查</a></li><li><a href=#跨核唤醒>跨核唤醒</a></li></ol></li><li><a href=#七典型场景时序分析>七、典型场景时序分析</a><ol><li><a href=#场景1时间片到期preempt-内核>场景1：时间片到期（PREEMPT 内核）</a></li><li><a href=#场景2时间片到期非-preempt-内核>场景2：时间片到期（非 PREEMPT 内核）</a></li><li><a href=#场景3mutex-阻塞>场景3：mutex 阻塞</a></li><li><a href=#场景4高优先级任务被唤醒>场景4：高优先级任务被唤醒</a></li></ol></li><li><a href=#八设计思考>八、设计思考</a><ol><li><a href=#1-为什么-scheduler_tick-不直接-schedule>1. 为什么 scheduler_tick 不直接 schedule()？</a></li><li><a href=#2-为什么-x86-要折叠-need_resched-到-preempt_count>2. 为什么 x86 要折叠 NEED_RESCHED 到 preempt_count？</a></li><li><a href=#3-idle-进程的特殊处理>3. idle 进程的特殊处理</a></li><li><a href=#4-preempt_none-vs-preempt_voluntary-vs-preempt>4. PREEMPT_NONE vs PREEMPT_VOLUNTARY vs PREEMPT</a></li></ol></li><li><a href=#九源码位置速查表>九、源码位置速查表</a></li><li><a href=#参考文件>参考文件</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E8%BF%9B%E7%A8%8B/ style=background-color:#fbbc04;color:#fff>进程</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/linux-%E8%B0%83%E5%BA%A6%E5%99%A8%E6%89%A7%E8%A1%8C%E6%97%B6%E6%9C%BA%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/>Linux 调度器执行时机深度分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>May 29, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>8 minute read</time></div></footer></div></header><section class=article-content><h1 id=linux-调度器执行时机深度分析>Linux 调度器执行时机深度分析</h1><blockquote><p>基于 Linux 5.15.78 内核源码分析</p><p>前置阅读：<a class=link href=%e4%b8%8a%e4%b8%8b%e6%96%87%e5%88%87%e6%8d%a2%e5%ae%9e%e7%8e%b0%e5%8e%9f%e7%90%86.md>上下文切换实现原理</a> — <code>context_switch</code> 的内部机制</p></blockquote><hr><h2 id=目录>目录</h2><ul><li><a class=link href=#%e9%9b%b630-%e7%a7%92%e7%90%86%e8%a7%a3%e8%b0%83%e5%ba%a6%e5%99%a8>零、30 秒理解调度器</a></li><li><a class=link href=#%e4%b8%80%e6%a0%b8%e5%bf%83%e8%ae%be%e8%ae%a1%e6%80%9d%e6%83%b3%e6%a0%87%e8%ae%b0%e4%b8%8e%e6%a3%80%e6%9f%a5%e5%88%86%e7%a6%bb>一、核心设计思想：标记与检查分离</a></li><li><a class=link href=#%e4%ba%8c%e5%94%af%e4%b8%80%e7%9a%84%e5%88%87%e6%8d%a2%e5%85%a5%e5%8f%a3__schedule>二、唯一的切换入口：__schedule()</a></li><li><a class=link href=#%e4%b8%89%e4%ba%94%e5%a4%a7%e8%a7%a6%e5%8f%91%e8%b7%af%e5%be%84>三、五大触发路径</a></li><li><a class=link href=#%e5%9b%9bneed_resched-%e5%8f%8c%e5%b1%82%e6%a0%87%e5%bf%97%e6%9c%ba%e5%88%b6>四、need_resched 双层标志机制</a></li><li><a class=link href=#%e4%ba%94%e5%91%a8%e6%9c%9f%e6%80%a7%e8%b0%83%e5%ba%a6scheduler_tick-%e9%93%be%e8%b7%af>五、周期性调度：scheduler_tick 链路</a></li><li><a class=link href=#%e5%85%ad%e5%94%a4%e9%86%92%e6%8a%a2%e5%8d%a0%e9%ab%98%e4%bc%98%e5%85%88%e7%ba%a7%e4%bb%bb%e5%8a%a1%e5%a6%82%e4%bd%95%e6%8a%a2%e5%8d%a0>六、唤醒抢占：高优先级任务如何抢占</a></li><li><a class=link href=#%e4%b8%83%e5%85%b8%e5%9e%8b%e5%9c%ba%e6%99%af%e6%97%b6%e5%ba%8f%e5%88%86%e6%9e%90>七、典型场景时序分析</a></li><li><a class=link href=#%e5%85%ab%e8%ae%be%e8%ae%a1%e6%80%9d%e8%80%83>八、设计思考</a></li><li><a class=link href=#%e4%b9%9d%e6%ba%90%e7%a0%81%e4%bd%8d%e7%bd%ae%e9%80%9f%e6%9f%a5%e8%a1%a8>九、源码位置速查表</a></li></ul><hr><h2 id=零30-秒理解调度器>零、30 秒理解调度器</h2><p><strong>一句话</strong>：调度器决定"哪个进程占用 CPU"——它不是一直在运行的守护进程，而是被特定事件<strong>触发</strong>时才执行的一段代码。</p><p><strong>类比</strong>：想象一个只有一个窗口的银行（= 一个 CPU 核心）。客户（= 进程）排队等候。柜员（= CPU）正在服务当前客户。调度器就是那个<strong>叫号系统</strong>——它不会随时打断柜员，而是在以下时刻才响：</p><ol><li>当前客户主动说"我要等取款机回复"（<strong>主动睡眠</strong>）</li><li>计时器响了：当前客户已占用太久（<strong>时间片到期</strong>）</li><li>VIP 客户走进来（<strong>高优先级唤醒</strong>）</li><li>柜员处理完一个中断事务后（<strong>中断返回</strong>）</li></ol><svg viewBox="0 0 680 260" style="max-width:680px;font-family:system-ui,sans-serif;font-size:12px"><rect width="680" height="260" fill="#fafbfc" rx="8"/><text x="20" y="30" font-weight="bold" fill="#333" font-size="13">CPU 时间线：谁在运行？什么时候切换？</text><rect x="40" y="50" width="600" height="30" fill="#e3f2fd" rx="4" stroke="#90caf9"/><rect x="40" y="50" width="140" height="30" fill="#4caf50" rx="4" opacity=".85"/><text x="80" y="70" fill="#fff" font-weight="bold">进程 A 运行</text><rect x="180" y="50" width="20" height="30" fill="#ff9800" rx="2"/><text x="183" y="70" fill="#fff" font-size="10">调</text><rect x="200" y="50" width="120" height="30" fill="#2196f3" rx="4" opacity=".85"/><text x="225" y="70" fill="#fff" font-weight="bold">进程 B 运行</text><rect x="320" y="50" width="20" height="30" fill="#ff9800" rx="2"/><text x="323" y="70" fill="#fff" font-size="10">调</text><rect x="340" y="50" width="160" height="30" fill="#4caf50" rx="4" opacity=".85"/><text x="385" y="70" fill="#fff" font-weight="bold">进程 A 运行</text><rect x="500" y="50" width="20" height="30" fill="#ff9800" rx="2"/><text x="503" y="70" fill="#fff" font-size="10">调</text><rect x="520" y="50" width="120" height="30" fill="#9c27b0" rx="4" opacity=".85"/><text x="545" y="70" fill="#fff" font-weight="bold">进程 C 运行</text><line x1="190" y1="85" x2="190" y2="110" stroke="#ff9800" stroke-width="2"/><text x="155" y="125" fill="#e65100" font-size="11">A 主动睡眠</text><text x="155" y="140" fill="#e65100" font-size="10">(等 I/O)</text><line x1="330" y1="85" x2="330" y2="110" stroke="#ff9800" stroke-width="2"/><text x="295" y="125" fill="#e65100" font-size="11">时间片到期</text><text x="290" y="140" fill="#e65100" font-size="10">(tick 中断)</text><line x1="510" y1="85" x2="510" y2="110" stroke="#ff9800" stroke-width="2"/><text x="470" y="125" fill="#e65100" font-size="11">VIP 唤醒抢占</text><text x="478" y="140" fill="#e65100" font-size="10">(IPI)</text><rect x="40" y="170" width="16" height="16" fill="#4caf50" rx="3"/><text x="62" y="183" fill="#333">进程运行中</text><rect x="160" y="170" width="16" height="16" fill="#ff9800" rx="3"/><text x="182" y="183" fill="#333">调度器执行（极短）</text><rect x="340" y="170" width="16" height="16" fill="#2196f3" rx="3"/><text x="362" y="183" fill="#333">另一个进程</text><rect x="40" y="200" width="600" height="45" fill="#fff3e0" rx="6" stroke="#ffb74d"/><text x="60" y="220" fill="#e65100" font-weight="bold" font-size="12">核心机制：标记 → 检查 → 切换</text><text x="60" y="237" fill="#555" font-size="11">触发事件只设置"需要调度"标志；真正的切换在安全点（中断返回/preempt_enable）才发生</text></svg><hr><h2 id=一核心设计思想标记与检查分离>一、核心设计思想：标记与检查分离</h2><p>Linux 调度器的执行采用<strong>异步两阶段模型</strong>：</p><svg viewBox="0 0 660 280" style="max-width:660px;font-family:system-ui,sans-serif;font-size:11px"><rect width="660" height="280" fill="#fafbfc" rx="8"/><rect x="30" y="20" width="280" height="120" fill="#fff3e0" rx="8" stroke="#ff9800" stroke-width="2"/><text x="100" y="42" font-weight="bold" fill="#e65100" font-size="13">阶段1：标记</text><text x="45" y="62" fill="#555" font-size="11">设置 TIF_NEED_RESCHED 标志</text><circle cx="50" cy="82" r="4" fill="#ff9800"/><text x="60" y="86" fill="#333">scheduler_tick → check_preempt_tick</text><circle cx="50" cy="102" r="4" fill="#ff9800"/><text x="60" y="106" fill="#333">try_to_wake_up → check_preempt_wakeup</text><circle cx="50" cy="122" r="4" fill="#ff9800"/><text x="60" y="126" fill="#333">reschedule IPI（跨核通知）</text><defs><marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 10 5 0 10z" fill="#ff9800"/></marker></defs><line x1="310" y1="80" x2="360" y2="80" stroke="#ff9800" stroke-width="3" marker-end="url(#arrowOrange)"/><text x="315" y="100" fill="#e65100" font-size="10" font-weight="bold">只设标志</text><text x="312" y="113" fill="#e65100" font-size="10">不立即切换</text><rect x="370" y="20" width="270" height="120" fill="#e3f2fd" rx="8" stroke="#2196f3" stroke-width="2"/><text x="430" y="42" font-weight="bold" fill="#1565c0" font-size="13">阶段2：检查并执行</text><text x="385" y="62" fill="#555" font-size="11">在安全点调用 schedule()</text><circle cx="385" cy="82" r="4" fill="#2196f3"/><text x="395" y="86" fill="#333">preempt_enable() 计数归零</text><circle cx="385" cy="102" r="4" fill="#2196f3"/><text x="395" y="106" fill="#333">IRQ返回内核态 → preempt_schedule_irq</text><circle cx="385" cy="122" r="4" fill="#2196f3"/><text x="395" y="126" fill="#333">返回用户态 → exit_to_user_mode_loop</text><defs><marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 10 5 0 10z" fill="#388e3c"/></marker></defs><line x1="505" y1="140" x2="505" y2="165" stroke="#388e3c" stroke-width="3" marker-end="url(#arrowGreen)"/><rect x="410" y="170" width="190" height="40" fill="#c8e6c9" rx="8" stroke="#388e3c" stroke-width="2"/><text x="435" y="195" font-weight="bold" fill="#1b5e20" font-size="13">__schedule()</text><text x="436" y="195" fill="#1b5e20" font-size="13"/><rect x="30" y="225" width="610" height="40" fill="#f3e5f5" rx="6" stroke="#9c27b0"/><text x="50" y="245" font-weight="bold" fill="#6a1b9a" font-size="11">为什么分两步？</text><text x="170" y="245" fill="#555" font-size="11">中断上下文中直接 schedule() → 持锁被切走 → 死锁。标记-检查保证只在安全点切换。</text></svg><p><strong>为什么这样设计？</strong> 直接在中断上下文中调用 <code>schedule()</code> 会带来死锁风险（持锁时被抢占）、栈嵌套溢出等问题。标记-检查分离让内核可以在<strong>安全点</strong>（<code>preempt_count == 0</code>、返回用户态边界）才执行调度，同时保证响应延迟可控。</p><hr><h2 id=二唯一的切换入口__schedule>二、唯一的切换入口：__schedule()</h2><p>整个内核中，<strong>真正做上下文切换的只有 <code>__schedule()</code> 一个函数</strong>，所有路径最终都汇聚于此。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:6291
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=n>__sched</span> <span class=n>notrace</span> <span class=nf>__schedule</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>sched_mode</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>cpu</span> <span class=o>=</span> <span class=nf>smp_processor_id</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>rq</span> <span class=o>=</span> <span class=nf>cpu_rq</span><span class=p>(</span><span class=n>cpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>prev</span> <span class=o>=</span> <span class=n>rq</span><span class=o>-&gt;</span><span class=n>curr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>local_irq_disable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=nf>rq_lock</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>update_rq_clock</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 非抢占 + 任务要睡 → 出队
+</span></span></span><span class=line><span class=cl>    <span class=n>prev_state</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>__state</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>sched_mode</span> <span class=o>&amp;</span> <span class=n>SM_MASK_PREEMPT</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=n>prev_state</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>signal_pending_state</span><span class=p>(</span><span class=n>prev_state</span><span class=p>,</span> <span class=n>prev</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>prev</span><span class=o>-&gt;</span><span class=n>__state</span><span class=p>,</span> <span class=n>TASK_RUNNING</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=nf>deactivate_task</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>DEQUEUE_SLEEP</span> <span class=o>|</span> <span class=n>DEQUEUE_NOCLOCK</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>next</span> <span class=o>=</span> <span class=nf>pick_next_task</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>clear_tsk_need_resched</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>clear_preempt_need_resched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>likely</span><span class=p>(</span><span class=n>prev</span> <span class=o>!=</span> <span class=n>next</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>rq</span> <span class=o>=</span> <span class=nf>context_switch</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>next</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=sched_mode-语义>sched_mode 语义</h3><div class=table-wrapper><table><thead><tr><th>模式</th><th>值</th><th>含义</th></tr></thead><tbody><tr><td><code>SM_NONE</code></td><td>0x0</td><td>主动睡眠：若 <code>prev->__state != 0</code> 则出队</td></tr><tr><td><code>SM_PREEMPT</code></td><td>0x1</td><td>抢占：不出队当前任务（仍 RUNNING）</td></tr><tr><td><code>SM_RTLOCK_WAIT</code></td><td>0x2</td><td>RT 锁等待</td></tr></tbody></table></div><h3 id=schedule-包装>schedule() 包装</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:6489
+</span></span></span><span class=line><span class=cl><span class=n>asmlinkage</span> <span class=n>__visible</span> <span class=kt>void</span> <span class=n>__sched</span> <span class=nf>schedule</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span> <span class=o>=</span> <span class=n>current</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sched_submit_work</span><span class=p>(</span><span class=n>tsk</span><span class=p>);</span>      <span class=c1>// 处理 workqueue/blk plug
+</span></span></span><span class=line><span class=cl>    <span class=k>do</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>preempt_disable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=nf>__schedule</span><span class=p>(</span><span class=n>SM_NONE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>sched_preempt_enable_no_resched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>while</span> <span class=p>(</span><span class=nf>need_resched</span><span class=p>());</span>    <span class=c1>// 循环直到标志清除
+</span></span></span><span class=line><span class=cl>    <span class=nf>sched_update_worker</span><span class=p>(</span><span class=n>tsk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=三五大触发路径>三、五大触发路径</h2><svg viewBox="0 0 680 320" style="max-width:680px;font-family:system-ui,sans-serif;font-size:11px"><rect width="680" height="320" fill="#fafbfc" rx="8"/><text x="240" y="25" font-weight="bold" fill="#333" font-size="14">五大路径汇聚 __schedule()</text><rect x="20" y="45" width="115" height="50" fill="#e8f5e9" rx="6" stroke="#4caf50" stroke-width="1.5"/><text x="35" y="65" fill="#2e7d32" font-weight="bold" font-size="11">A. 主动调度</text><text x="35" y="80" fill="#555" font-size="10">mutex/IO/yield</text><rect x="150" y="45" width="115" height="50" fill="#e3f2fd" rx="6" stroke="#2196f3" stroke-width="1.5"/><text x="162" y="65" fill="#1565c0" font-weight="bold" font-size="11">B. 内核抢占</text><text x="160" y="80" fill="#555" font-size="10">preempt_enable()</text><rect x="280" y="45" width="115" height="50" fill="#fce4ec" rx="6" stroke="#e91e63" stroke-width="1.5"/><text x="290" y="65" fill="#880e4f" font-weight="bold" font-size="11">C. IRQ返回内核</text><text x="288" y="80" fill="#555" font-size="10">preempt_schedule_irq</text><rect x="410" y="45" width="115" height="50" fill="#f3e5f5" rx="6" stroke="#9c27b0" stroke-width="1.5"/><text x="422" y="65" fill="#6a1b9a" font-weight="bold" font-size="11">D. 返回用户态</text><text x="418" y="80" fill="#555" font-size="10">exit_to_user_mode</text><rect x="540" y="45" width="120" height="50" fill="#fff3e0" rx="6" stroke="#ff9800" stroke-width="1.5"/><text x="553" y="65" fill="#e65100" font-weight="bold" font-size="11">E. 协作式</text><text x="553" y="80" fill="#555" font-size="10">cond_resched()</text><p><defs><marker id="arrowBlk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0 10 5 0 10z" fill="#555"/></marker></defs><line x1="77" y1="95" x2="310" y2="145" stroke="#4caf50" stroke-width="1.5" marker-end="url(#arrowBlk)"/><line x1="207" y1="95" x2="310" y2="145" stroke="#2196f3" stroke-width="1.5" marker-end="url(#arrowBlk)"/><line x1="337" y1="95" x2="337" y2="145" stroke="#e91e63" stroke-width="1.5" marker-end="url(#arrowBlk)"/><line x1="467" y1="95" x2="365" y2="145" stroke="#9c27b0" stroke-width="1.5" marker-end="url(#arrowBlk)"/><line x1="600" y1="95" x2="365" y2="145" stroke="#ff9800" stroke-width="1.5" marker-end="url(#arrowBlk)"/></p><rect x="270" y="150" width="140" height="45" fill="#c8e6c9" rx="10" stroke="#388e3c" stroke-width="2.5"/><text x="295" y="178" font-weight="bold" fill="#1b5e20" font-size="14">__schedule()</text><line x1="340" y1="195" x2="340" y2="215" stroke="#388e3c" stroke-width="2" marker-end="url(#arrowBlk)"/><rect x="200" y="220" width="280" height="80" fill="#e8f5e9" rx="6" stroke="#a5d6a7"/><text x="220" y="242" fill="#333" font-size="11">1. pick_next_task() — 选下一个进程</text><text x="220" y="260" fill="#333" font-size="11">2. clear need_resched — 清除标志</text><text x="220" y="278" fill="#333" font-size="11">3. context_switch() — 切换进程上下文</text><text x="220" y="295" fill="#333" font-size="11">4. (SM_NONE 模式: 还会先将 prev 出队)</text></svg><h3 id=a-主动调度进程自己调用-schedule>A. 主动调度：进程自己调用 schedule()</h3><p>进程因资源不可用而主动放弃 CPU。</p><div class=table-wrapper><table><thead><tr><th>场景</th><th>典型代码</th></tr></thead><tbody><tr><td>mutex 获取失败</td><td><code>set_current_state(TASK_UNINTERRUPTIBLE); schedule();</code></td></tr><tr><td>等待 I/O</td><td><code>io_schedule()</code></td></tr><tr><td>定时睡眠</td><td><code>schedule_timeout()</code></td></tr><tr><td>让出 CPU</td><td><code>sched_yield()</code> → <code>do_sched_yield()</code> → <code>schedule()</code></td></tr><tr><td>线程退出</td><td><code>do_task_dead()</code> → <code>__schedule(SM_NONE)</code></td></tr></tbody></table></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:8267
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>do_sched_yield</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>current</span><span class=o>-&gt;</span><span class=n>sched_class</span><span class=o>-&gt;</span><span class=nf>yield_task</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>schedule</span><span class=p>();</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=b-内核抢占preempt_enable--spin_unlock>B. 内核抢占：preempt_enable() / spin_unlock()</h3><p>当 <code>preempt_count</code> 递减归零且 <code>need_resched</code> 已设置时，触发抢占。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/preempt.h:196
+</span></span></span><span class=line><span class=cl><span class=cp>#define preempt_enable() \
+</span></span></span><span class=line><span class=cl><span class=cp>do { \
+</span></span></span><span class=line><span class=cl><span class=cp>    barrier(); \
+</span></span></span><span class=line><span class=cl><span class=cp>    if (unlikely(preempt_count_dec_and_test())) \
+</span></span></span><span class=line><span class=cl><span class=cp>        __preempt_schedule(); \
+</span></span></span><span class=line><span class=cl><span class=cp>} while (0)
+</span></span></span></code></pre></td></tr></table></div></div><p><code>__preempt_schedule()</code> 最终调用：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:6571
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=n>__sched</span> <span class=nf>preempt_schedule_common</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>do</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>preempt_disable_notrace</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=nf>__schedule</span><span class=p>(</span><span class=n>SM_PREEMPT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>preempt_enable_no_resched_notrace</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>while</span> <span class=p>(</span><span class=nf>need_resched</span><span class=p>());</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=c-中断返回内核态config_preemptiony>C. 中断返回内核态（CONFIG_PREEMPTION=y）</h3><p>中断处理完毕，返回内核态时检查：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/entry/common.c:383
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>irqentry_exit_cond_resched</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>preempt_count</span><span class=p>())</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>rcu_irq_exit_check_preempt</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>need_resched</span><span class=p>())</span>
+</span></span><span class=line><span class=cl>            <span class=nf>preempt_schedule_irq</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:6805
+</span></span></span><span class=line><span class=cl><span class=n>asmlinkage</span> <span class=n>__visible</span> <span class=kt>void</span> <span class=n>__sched</span> <span class=nf>preempt_schedule_irq</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>do</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>preempt_disable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=nf>local_irq_enable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=nf>__schedule</span><span class=p>(</span><span class=n>SM_PREEMPT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>local_irq_disable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=nf>sched_preempt_enable_no_resched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>while</span> <span class=p>(</span><span class=nf>need_resched</span><span class=p>());</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=d-返回用户态系统调用中断返回>D. 返回用户态（系统调用/中断返回）</h3><p>无论内核是否配置 <code>CONFIG_PREEMPTION</code>，返回用户态时都会检查：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/entry/common.c:151
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=nf>exit_to_user_mode_loop</span><span class=p>(</span><span class=k>struct</span> <span class=n>pt_regs</span> <span class=o>*</span><span class=n>regs</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>ti_work</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>while</span> <span class=p>(</span><span class=n>ti_work</span> <span class=o>&amp;</span> <span class=n>EXIT_TO_USER_MODE_WORK</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>local_irq_enable_exit_to_user</span><span class=p>(</span><span class=n>ti_work</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>ti_work</span> <span class=o>&amp;</span> <span class=n>_TIF_NEED_RESCHED</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=nf>schedule</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// signal、uprobe、livepatch 等处理 ...
+</span></span></span><span class=line><span class=cl>        <span class=n>ti_work</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>current_thread_info</span><span class=p>()</span><span class=o>-&gt;</span><span class=n>flags</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ti_work</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>调用路径：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>syscall_exit_to_user_mode() → exit_to_user_mode_prepare()
+</span></span><span class=line><span class=cl>  → exit_to_user_mode_loop()
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>irqentry_exit() → irqentry_exit_to_user_mode()
+</span></span><span class=line><span class=cl>  → exit_to_user_mode_prepare()
+</span></span><span class=line><span class=cl>    → exit_to_user_mode_loop()
+</span></span></code></pre></td></tr></table></div></div><h3 id=e-协作式调度cond_resched>E. 协作式调度：cond_resched()</h3><p>非抢占内核（<code>CONFIG_PREEMPTION=n</code>）中，长循环必须调用 <code>cond_resched()</code> 给其他任务执行机会：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:8299
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>__sched</span> <span class=nf>__cond_resched</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>should_resched</span><span class=p>(</span><span class=mi>0</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>preempt_schedule_common</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四need_resched-双层标志机制>四、need_resched 双层标志机制</h2><h3 id=层1tif_need_reschedthread_infoflags>层1：TIF_NEED_RESCHED（thread_info.flags）</h3><p>通用标志，所有架构共用：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/sched.h:2001
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>set_tsk_need_resched</span><span class=p>(</span><span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>set_tsk_thread_flag</span><span class=p>(</span><span class=n>tsk</span><span class=p>,</span> <span class=n>TIF_NEED_RESCHED</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// include/linux/sched.h:2113
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=n>__always_inline</span> <span class=kt>bool</span> <span class=nf>need_resched</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>unlikely</span><span class=p>(</span><span class=nf>tif_need_resched</span><span class=p>());</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=层2折叠进-preempt_countx86-优化>层2：折叠进 preempt_count（x86 优化）</h3><p>x86 将 <code>NEED_RESCHED</code> 反向编码到 <code>preempt_count</code> 中，使 <code>preempt_enable()</code> 递减后能<strong>单条指令</strong>同时检测"计数归零"+&ldquo;需要调度&rdquo;：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/preempt.h:50
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=n>__always_inline</span> <span class=kt>void</span> <span class=nf>set_preempt_need_resched</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>raw_cpu_and_4</span><span class=p>(</span><span class=n>__preempt_count</span><span class=p>,</span> <span class=o>~</span><span class=n>PREEMPT_NEED_RESCHED</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=n>__always_inline</span> <span class=kt>bool</span> <span class=nf>should_resched</span><span class=p>(</span><span class=kt>int</span> <span class=n>preempt_offset</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>unlikely</span><span class=p>(</span><span class=nf>raw_cpu_read_4</span><span class=p>(</span><span class=n>__preempt_count</span><span class=p>)</span> <span class=o>==</span> <span class=n>preempt_offset</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>当 <code>PREEMPT_NEED_RESCHED</code> 位被清零（注意是反向逻辑），且 <code>preempt_count</code> 正好等于 <code>preempt_offset</code>（通常为 0），则 <code>should_resched</code> 为 true。</p><h3 id=核心设置函数resched_curr>核心设置函数：resched_curr()</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:962
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>resched_curr</span><span class=p>(</span><span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span><span class=n>rq</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>curr</span> <span class=o>=</span> <span class=n>rq</span><span class=o>-&gt;</span><span class=n>curr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>test_tsk_need_resched</span><span class=p>(</span><span class=n>curr</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>cpu</span> <span class=o>==</span> <span class=nf>smp_processor_id</span><span class=p>())</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>set_tsk_need_resched</span><span class=p>(</span><span class=n>curr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>set_preempt_need_resched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 远程 CPU：设标志 + 发 IPI
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>set_nr_and_not_polling</span><span class=p>(</span><span class=n>curr</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=nf>smp_send_reschedule</span><span class=p>(</span><span class=n>cpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>场景</th><th>行为</th></tr></thead><tbody><tr><td>本 CPU</td><td>设 <code>TIF_NEED_RESCHED</code> + 折叠到 <code>preempt_count</code></td></tr><tr><td>远程 CPU（非 idle polling）</td><td>发 reschedule IPI</td></tr><tr><td>远程 CPU（idle polling）</td><td>只设标志，idle 循环自己检查</td></tr></tbody></table></div><h3 id=清除时机>清除时机</h3><p>在 <code>__schedule()</code> 中选出 <code>next</code> 后立即清除：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:6378
+</span></span></span><span class=line><span class=cl><span class=nf>clear_tsk_need_resched</span><span class=p>(</span><span class=n>prev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nf>clear_preempt_need_resched</span><span class=p>();</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=五周期性调度scheduler_tick-链路>五、周期性调度：scheduler_tick 链路</h2><svg viewBox="0 0 680 250" style="max-width:680px;font-family:system-ui,sans-serif;font-size:11px"><rect width="680" height="250" fill="#fafbfc" rx="8"/><text x="200" y="22" font-weight="bold" fill="#333" font-size="13">scheduler_tick 时序：从硬件中断到设置标志</text><line x1="30" y1="60" x2="650" y2="60" stroke="#ccc" stroke-width="1" stroke-dasharray="4"/><text x="10" y="64" fill="#999" font-size="10">时间</text><rect x="40" y="40" width="90" height="36" fill="#ffcdd2" rx="6" stroke="#e53935" stroke-width="1.5"/><text x="53" y="55" fill="#b71c1c" font-weight="bold" font-size="10">时钟中断</text><text x="53" y="68" fill="#c62828" font-size="9">HW IRQ</text><line x1="130" y1="58" x2="155" y2="58" stroke="#e53935" stroke-width="1.5" marker-end="url(#arrowBlk)"/><rect x="158" y="40" width="110" height="36" fill="#ffecb3" rx="6" stroke="#ff8f00" stroke-width="1.5"/><text x="168" y="55" fill="#e65100" font-weight="bold" font-size="10">tick_periodic()</text><text x="168" y="68" fill="#e65100" font-size="9">update_process_times</text><line x1="268" y1="58" x2="293" y2="58" stroke="#ff8f00" stroke-width="1.5" marker-end="url(#arrowBlk)"/><rect x="296" y="40" width="110" height="36" fill="#c8e6c9" rx="6" stroke="#388e3c" stroke-width="1.5"/><text x="308" y="55" fill="#1b5e20" font-weight="bold" font-size="10">scheduler_tick()</text><text x="308" y="68" fill="#2e7d32" font-size="9">task_tick 回调</text><line x1="406" y1="58" x2="431" y2="58" stroke="#388e3c" stroke-width="1.5" marker-end="url(#arrowBlk)"/><rect x="434" y="40" width="110" height="36" fill="#e3f2fd" rx="6" stroke="#1976d2" stroke-width="1.5"/><text x="440" y="55" fill="#0d47a1" font-weight="bold" font-size="10">check_preempt_tick</text><text x="440" y="68" fill="#1565c0" font-size="9">CFS: 时间片到了？</text><line x1="544" y1="58" x2="569" y2="58" stroke="#1976d2" stroke-width="1.5" marker-end="url(#arrowBlk)"/><rect x="572" y="40" width="90" height="36" fill="#fff3e0" rx="6" stroke="#ff9800" stroke-width="2"/><text x="580" y="55" fill="#e65100" font-weight="bold" font-size="10">resched_curr()</text><text x="580" y="68" fill="#ef6c00" font-size="9">设 NEED_RESCHED</text><rect x="40" y="100" width="600" height="55" fill="#f5f5f5" rx="6" stroke="#e0e0e0"/><text x="60" y="118" fill="#333" font-weight="bold" font-size="11">CFS check_preempt_tick 判定逻辑：</text><text x="60" y="136" fill="#555" font-size="11">① delta_exec > sched_slice(cfs_rq, curr) → 时间片耗尽 → resched_curr()</text><text x="60" y="152" fill="#555" font-size="11">② curr->vruntime - leftmost->vruntime > ideal_runtime → 落后太多 → resched_curr()</text><rect x="40" y="175" width="600" height="60" fill="#e8eaf6" rx="6" stroke="#5c6bc0"/><text x="60" y="195" fill="#283593" font-weight="bold" font-size="11">关键设计：scheduler_tick 永远不直接调用 schedule()</text><text x="60" y="213" fill="#555" font-size="11">原因：tick 在中断上下文中执行，当前任务可能持锁。直接切换 → 死锁风险。</text><text x="60" y="228" fill="#555" font-size="11">因此只设标志，等中断返回后在安全点（路径 C/D）才执行真正的 __schedule()。</text></svg><h3 id=触发链>触发链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时钟中断
+</span></span><span class=line><span class=cl>  → tick_periodic() / tick_sched_handle()
+</span></span><span class=line><span class=cl>    → update_process_times()           [kernel/time/timer.c:1779]
+</span></span><span class=line><span class=cl>      → scheduler_tick()               [kernel/sched/core.c:5320]
+</span></span></code></pre></td></tr></table></div></div><h3 id=scheduler_tick-本体>scheduler_tick() 本体</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/core.c:5320
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>scheduler_tick</span><span class=p>(</span><span class=kt>void</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>cpu</span> <span class=o>=</span> <span class=nf>smp_processor_id</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span><span class=n>rq</span> <span class=o>=</span> <span class=nf>cpu_rq</span><span class=p>(</span><span class=n>cpu</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>curr</span> <span class=o>=</span> <span class=n>rq</span><span class=o>-&gt;</span><span class=n>curr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>rq_lock</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>update_rq_clock</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>curr</span><span class=o>-&gt;</span><span class=n>sched_class</span><span class=o>-&gt;</span><span class=nf>task_tick</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=n>curr</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>  <span class=c1>// 调度类回调
+</span></span></span><span class=line><span class=cl>    <span class=nf>calc_global_load_tick</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>rq_unlock</span><span class=p>(</span><span class=n>rq</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>trigger_load_balance</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>  <span class=c1>// SMP 负载均衡检查
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键：<code>scheduler_tick</code> 从不直接调用 <code>schedule()</code></strong>。它只通过调度类回调间接设置 <code>TIF_NEED_RESCHED</code>。</p><h3 id=cfs-回调链task_tick_fair--check_preempt_tick>CFS 回调链：task_tick_fair → check_preempt_tick</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/fair.c:4609
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>entity_tick</span><span class=p>(</span><span class=k>struct</span> <span class=n>cfs_rq</span> <span class=o>*</span><span class=n>cfs_rq</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sched_entity</span> <span class=o>*</span><span class=n>curr</span><span class=p>,</span> <span class=kt>int</span> <span class=n>queued</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>update_curr</span><span class=p>(</span><span class=n>cfs_rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>cfs_rq</span><span class=o>-&gt;</span><span class=n>nr_running</span> <span class=o>&gt;</span> <span class=mi>1</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>check_preempt_tick</span><span class=p>(</span><span class=n>cfs_rq</span><span class=p>,</span> <span class=n>curr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/fair.c:4452
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>check_preempt_tick</span><span class=p>(</span><span class=k>struct</span> <span class=n>cfs_rq</span> <span class=o>*</span><span class=n>cfs_rq</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sched_entity</span> <span class=o>*</span><span class=n>curr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>ideal_runtime</span> <span class=o>=</span> <span class=nf>sched_slice</span><span class=p>(</span><span class=n>cfs_rq</span><span class=p>,</span> <span class=n>curr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>delta_exec</span> <span class=o>=</span> <span class=n>curr</span><span class=o>-&gt;</span><span class=n>sum_exec_runtime</span> <span class=o>-</span> <span class=n>curr</span><span class=o>-&gt;</span><span class=n>prev_sum_exec_runtime</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>delta_exec</span> <span class=o>&gt;</span> <span class=n>ideal_runtime</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>resched_curr</span><span class=p>(</span><span class=nf>rq_of</span><span class=p>(</span><span class=n>cfs_rq</span><span class=p>));</span>  <span class=c1>// 时间片耗尽 → 标记需要调度
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 最小粒度保护：即使份额未用完，若 vruntime 差值过大也抢占
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sched_entity</span> <span class=o>*</span><span class=n>se</span> <span class=o>=</span> <span class=nf>__pick_first_entity</span><span class=p>(</span><span class=n>cfs_rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>s64</span> <span class=n>delta</span> <span class=o>=</span> <span class=n>curr</span><span class=o>-&gt;</span><span class=n>vruntime</span> <span class=o>-</span> <span class=n>se</span><span class=o>-&gt;</span><span class=n>vruntime</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>delta</span> <span class=o>&gt;</span> <span class=n>ideal_runtime</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>resched_curr</span><span class=p>(</span><span class=nf>rq_of</span><span class=p>(</span><span class=n>cfs_rq</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>设计要点：</p><ul><li><code>sched_slice()</code> 根据权重和队列中的实体数动态计算每个任务的"理想运行时间"</li><li>不是固定时间片，而是<strong>按比例公平分配</strong></li><li>设置标志后，切换发生在中断返回（路径 C/D）</li></ul><hr><h2 id=六唤醒抢占高优先级任务如何抢占>六、唤醒抢占：高优先级任务如何抢占</h2><h3 id=唤醒路径>唤醒路径</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>wake_up_process()
+</span></span><span class=line><span class=cl>  → try_to_wake_up()
+</span></span><span class=line><span class=cl>    → ttwu_do_wakeup()
+</span></span><span class=line><span class=cl>      → check_preempt_curr(rq, p, wake_flags)
+</span></span><span class=line><span class=cl>        → rq-&gt;curr-&gt;sched_class-&gt;check_preempt_curr(rq, p, wake_flags)
+</span></span></code></pre></td></tr></table></div></div><h3 id=cfs-唤醒抢占检查>CFS 唤醒抢占检查</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/fair.c:7155
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>check_preempt_wakeup</span><span class=p>(</span><span class=k>struct</span> <span class=n>rq</span> <span class=o>*</span><span class=n>rq</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>p</span><span class=p>,</span> <span class=kt>int</span> <span class=n>wake_flags</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sched_entity</span> <span class=o>*</span><span class=n>se</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>curr</span><span class=o>-&gt;</span><span class=n>se</span><span class=p>,</span> <span class=o>*</span><span class=n>pse</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>p</span><span class=o>-&gt;</span><span class=n>se</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 如果 buddy 提示 + 同组 → 跳过抢占
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>wakeup_preempt_entity</span><span class=p>(</span><span class=n>se</span><span class=p>,</span> <span class=n>pse</span><span class=p>)</span> <span class=o>==</span> <span class=mi>1</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>preempt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>preempt</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=nf>resched_curr</span><span class=p>(</span><span class=n>rq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>wakeup_preempt_entity()</code> 比较两个调度实体的 vruntime，差值超过一个调度粒度则允许抢占。</p><h3 id=跨核唤醒>跨核唤醒</h3><p>如果被唤醒任务应该抢占远程 CPU 上的当前任务：</p><ol><li><code>resched_curr(rq)</code> 检测到 <code>cpu != smp_processor_id()</code></li><li>发送 reschedule IPI</li><li>远程 CPU 收到 IPI → 中断返回时检查 <code>need_resched</code> → <code>preempt_schedule_irq()</code></li></ol><hr><h2 id=七典型场景时序分析>七、典型场景时序分析</h2><svg viewBox="0 0 700 300" style="max-width:700px;font-family:system-ui,sans-serif;font-size:10px"><rect width="700" height="300" fill="#fafbfc" rx="8"/><text x="200" y="22" font-weight="bold" fill="#333" font-size="13">多核唤醒抢占时序图（场景4 可视化）</text><text x="15" y="60" font-weight="bold" fill="#1565c0" font-size="12">CPU 0</text><rect x="70" y="45" width="200" height="28" fill="#bbdefb" rx="4" stroke="#1976d2"/><text x="120" y="64" fill="#0d47a1" font-size="11">低优先级进程 A 运行</text><rect x="320" y="45" width="60" height="28" fill="#ffcdd2" rx="4" stroke="#e53935"/><text x="326" y="64" fill="#b71c1c" font-size="10">IPI 中断</text><rect x="385" y="45" width="105" height="28" fill="#fff3e0" rx="4" stroke="#ff9800"/><text x="390" y="64" fill="#e65100" font-size="10">IRQ返回检查</text><rect x="495" y="45" width="55" height="28" fill="#c8e6c9" rx="4" stroke="#388e3c" stroke-width="2"/><text x="498" y="64" fill="#1b5e20" font-size="10">schedule</text><rect x="555" y="45" width="130" height="28" fill="#e8f5e9" rx="4" stroke="#4caf50" stroke-width="2"/><text x="570" y="64" fill="#2e7d32" font-weight="bold" font-size="11">高优先级 B 运行</text><p><text x="15" y="130" font-weight="bold" fill="#6a1b9a" font-size="12">CPU 1</text><rect x="70" y="115" width="130" height="28" fill="#e1bee7" rx="4" stroke="#8e24aa"/><text x="90" y="134" fill="#4a148c" font-size="11">某进程运行中</text></p><rect x="205" y="115" width="130" height="28" fill="#f3e5f5" rx="4" stroke="#9c27b0" stroke-width="2"/><text x="212" y="134" fill="#6a1b9a" font-size="10">wake_up(B)</text><rect x="340" y="115" width="150" height="28" fill="#e1bee7" rx="4" stroke="#8e24aa"/><text x="355" y="134" fill="#4a148c" font-size="11">继续运行</text><defs><marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 10 5 0 10z" fill="#e53935"/></marker></defs><path d="M310 115c20-20 20-30 35-42" stroke="#e53935" stroke-width="2" fill="none" marker-end="url(#arrowRed)"/><text x="305" y="95" fill="#e53935" font-weight="bold" font-size="10">smp_send_reschedule</text><rect x="70" y="170" width="310" height="115" fill="#f5f5f5" rx="6" stroke="#e0e0e0"/><text x="85" y="190" font-weight="bold" fill="#333" font-size="11">CPU1 唤醒流程：</text><text x="85" y="208" fill="#555" font-size="10">① try_to_wake_up(B) — 选 CPU0 为目标</text><text x="85" y="224" fill="#555" font-size="10">② enqueue_task(CPU0_rq, B)</text><text x="85" y="240" fill="#555" font-size="10">③ check_preempt_wakeup(): B.vruntime 更小</text><text x="85" y="256" fill="#555" font-size="10">④ resched_curr(CPU0_rq)</text><text x="85" y="272" fill="#555" font-size="10">⑤ smp_send_reschedule(CPU0) → 发 IPI</text><rect x="400" y="170" width="280" height="115" fill="#f5f5f5" rx="6" stroke="#e0e0e0"/><text x="415" y="190" font-weight="bold" fill="#333" font-size="11">CPU0 响应流程：</text><text x="415" y="208" fill="#555" font-size="10">① 收到 reschedule IPI</text><text x="415" y="224" fill="#555" font-size="10">② IRQ handler 执行（空）</text><text x="415" y="240" fill="#555" font-size="10">③ irqentry_exit_cond_resched()</text><text x="415" y="256" fill="#555" font-size="10">④ need_resched() == true → preempt_schedule_irq</text><text x="415" y="272" fill="#555" font-size="10">⑤ __schedule(SM_PREEMPT) → pick B → 切换</text></svg><h3 id=场景1时间片到期preempt-内核>场景1：时间片到期（PREEMPT 内核）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时间线 ──────────────────────────────────────────────────→
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>用户态运行 ──→ 时钟中断 ──→ IRQ返回内核态 ──→ IRQ返回用户态
+</span></span><span class=line><span class=cl>                  │                │
+</span></span><span class=line><span class=cl>                  ▼                ▼
+</span></span><span class=line><span class=cl>          scheduler_tick()   irqentry_exit_cond_resched()
+</span></span><span class=line><span class=cl>          check_preempt_tick()   preempt_schedule_irq()
+</span></span><span class=line><span class=cl>          resched_curr() 设标志     __schedule(SM_PREEMPT)
+</span></span><span class=line><span class=cl>                                      context_switch()
+</span></span></code></pre></td></tr></table></div></div><h3 id=场景2时间片到期非-preempt-内核>场景2：时间片到期（非 PREEMPT 内核）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时间线 ──────────────────────────────────────────────────→
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>用户态运行 ──→ 时钟中断 ──→ 返回用户态前检查
+</span></span><span class=line><span class=cl>                  │                │
+</span></span><span class=line><span class=cl>                  ▼                ▼
+</span></span><span class=line><span class=cl>          scheduler_tick()   exit_to_user_mode_loop()
+</span></span><span class=line><span class=cl>          resched_curr() 设标志   if (_TIF_NEED_RESCHED)
+</span></span><span class=line><span class=cl>                                      schedule()
+</span></span></code></pre></td></tr></table></div></div><h3 id=场景3mutex-阻塞>场景3：mutex 阻塞</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时间线 ──────────────────────────────────────────────────→
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>内核态执行 ──→ mutex_lock() 失败
+</span></span><span class=line><span class=cl>                  │
+</span></span><span class=line><span class=cl>                  ▼
+</span></span><span class=line><span class=cl>          set_current_state(TASK_UNINTERRUPTIBLE)
+</span></span><span class=line><span class=cl>          schedule()
+</span></span><span class=line><span class=cl>            __schedule(SM_NONE)
+</span></span><span class=line><span class=cl>              deactivate_task()    // 从运行队列移除
+</span></span><span class=line><span class=cl>              pick_next_task()
+</span></span><span class=line><span class=cl>              context_switch()     // 切到其他进程
+</span></span></code></pre></td></tr></table></div></div><h3 id=场景4高优先级任务被唤醒>场景4：高优先级任务被唤醒</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时间线 ──────────────────────────────────────────────────→
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>CPU0: 低优先级运行  ←─── 收到 reschedule IPI
+</span></span><span class=line><span class=cl>                              │
+</span></span><span class=line><span class=cl>CPU1: wake_up_process(高优先级任务)
+</span></span><span class=line><span class=cl>        try_to_wake_up()
+</span></span><span class=line><span class=cl>          选择CPU0（目标rq）
+</span></span><span class=line><span class=cl>          enqueue_task()
+</span></span><span class=line><span class=cl>          check_preempt_wakeup()
+</span></span><span class=line><span class=cl>          resched_curr(rq) → smp_send_reschedule(CPU0)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>CPU0: IRQ handler 返回
+</span></span><span class=line><span class=cl>        irqentry_exit_cond_resched()
+</span></span><span class=line><span class=cl>          preempt_schedule_irq()
+</span></span><span class=line><span class=cl>            __schedule(SM_PREEMPT)
+</span></span><span class=line><span class=cl>              pick_next_task() → 选择高优先级任务
+</span></span><span class=line><span class=cl>              context_switch()
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=八设计思考>八、设计思考</h2><h3 id=1-为什么-scheduler_tick-不直接-schedule>1. 为什么 scheduler_tick 不直接 schedule()？</h3><ul><li><strong>scheduler_tick 在中断上下文中执行</strong>，此时当前任务可能持有各种锁</li><li>直接 schedule 会导致持锁进程被切走 → 死锁</li><li>标记-延迟模型保证切换只发生在安全点</li></ul><h3 id=2-为什么-x86-要折叠-need_resched-到-preempt_count>2. 为什么 x86 要折叠 NEED_RESCHED 到 preempt_count？</h3><p>传统检查需要：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=n>preempt_count</span><span class=o>--</span><span class=p>;</span>          <span class=c1>// 指令1
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>preempt_count</span> <span class=o>==</span> <span class=mi>0</span><span class=p>)</span>   <span class=c1>// 指令2
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>need_resched</span><span class=p>())</span>   <span class=c1>// 指令3：读另一个变量
+</span></span></span></code></pre></td></tr></table></div></div><p>折叠后：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 单次递减+比较 = 一条 dec+jz 指令
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>--</span><span class=n>preempt_count</span> <span class=o>==</span> <span class=mi>0</span><span class=p>)</span>  <span class=c1>// 同时满足&#34;计数归零&#34;+&#34;需要调度&#34;
+</span></span></span></code></pre></td></tr></table></div></div><p>在抢占频繁的热路径（spin_unlock 等），节省的指令累积可观。</p><h3 id=3-idle-进程的特殊处理>3. idle 进程的特殊处理</h3><p>idle 进程在 <code>cpu_idle_loop()</code> 中 polling <code>need_resched</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/sched/idle.c:282
+</span></span></span><span class=line><span class=cl><span class=k>while</span> <span class=p>(</span><span class=o>!</span><span class=nf>need_resched</span><span class=p>())</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// cpuidle / halt / poll ...
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=nf>schedule_idle</span><span class=p>();</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>resched_curr()</code> 对 polling idle 不发 IPI（<code>set_nr_and_not_polling</code> 返回 false），因为 idle 自己会快速检测到标志变化，省去一次跨核中断。</p><h3 id=4-preempt_none-vs-preempt_voluntary-vs-preempt>4. PREEMPT_NONE vs PREEMPT_VOLUNTARY vs PREEMPT</h3><div class=table-wrapper><table><thead><tr><th>配置</th><th>调度延迟</th><th>吞吐量</th><th>切换点</th></tr></thead><tbody><tr><td><code>PREEMPT_NONE</code></td><td>高（ms 级）</td><td>最高</td><td>仅返回用户态</td></tr><tr><td><code>PREEMPT_VOLUNTARY</code></td><td>中等</td><td>较高</td><td>返回用户态 + cond_resched()</td></tr><tr><td><code>PREEMPT</code></td><td>低（μs 级）</td><td>较低</td><td>任何 preempt_count==0 的点</td></tr></tbody></table></div><p>服务器通常用 <code>PREEMPT_NONE</code>/<code>VOLUNTARY</code>（重吞吐），桌面/嵌入式用 <code>PREEMPT</code>（重延迟）。</p><hr><h2 id=九源码位置速查表>九、源码位置速查表</h2><div class=table-wrapper><table><thead><tr><th>功能</th><th>文件</th><th>行号</th></tr></thead><tbody><tr><td><code>schedule()</code></td><td><code>kernel/sched/core.c</code></td><td>6489</td></tr><tr><td><code>__schedule()</code></td><td><code>kernel/sched/core.c</code></td><td>6291</td></tr><tr><td><code>scheduler_tick()</code></td><td><code>kernel/sched/core.c</code></td><td>5320</td></tr><tr><td><code>resched_curr()</code></td><td><code>kernel/sched/core.c</code></td><td>962</td></tr><tr><td><code>preempt_schedule()</code></td><td><code>kernel/sched/core.c</code></td><td>6605</td></tr><tr><td><code>preempt_schedule_irq()</code></td><td><code>kernel/sched/core.c</code></td><td>6805</td></tr><tr><td><code>__cond_resched()</code></td><td><code>kernel/sched/core.c</code></td><td>8299</td></tr><tr><td><code>exit_to_user_mode_loop()</code></td><td><code>kernel/entry/common.c</code></td><td>151</td></tr><tr><td><code>irqentry_exit_cond_resched()</code></td><td><code>kernel/entry/common.c</code></td><td>383</td></tr><tr><td><code>need_resched()</code></td><td><code>include/linux/sched.h</code></td><td>2113</td></tr><tr><td><code>set_tsk_need_resched()</code></td><td><code>include/linux/sched.h</code></td><td>2001</td></tr><tr><td><code>preempt_enable()</code></td><td><code>include/linux/preempt.h</code></td><td>196</td></tr><tr><td>x86 preempt_count 折叠</td><td><code>arch/x86/include/asm/preempt.h</code></td><td>50</td></tr><tr><td>CFS <code>check_preempt_tick()</code></td><td><code>kernel/sched/fair.c</code></td><td>4452</td></tr><tr><td>CFS <code>check_preempt_wakeup()</code></td><td><code>kernel/sched/fair.c</code></td><td>7155</td></tr><tr><td><code>update_process_times()</code></td><td><code>kernel/time/timer.c</code></td><td>1779</td></tr></tbody></table></div><hr><h2 id=参考文件>参考文件</h2><div class=table-wrapper><table><thead><tr><th>文件路径</th><th>内容</th></tr></thead><tbody><tr><td><code>kernel/sched/core.c</code></td><td>调度器核心：schedule、__schedule、scheduler_tick、resched_curr</td></tr><tr><td><code>kernel/entry/common.c</code></td><td>系统调用/中断返回路径：用户态出口检查</td></tr><tr><td><code>kernel/sched/fair.c</code></td><td>CFS 调度类：时间片检查、唤醒抢占、entity_tick</td></tr><tr><td><code>include/linux/sched.h</code></td><td>need_resched、set_tsk_need_resched 等宏</td></tr><tr><td><code>include/linux/preempt.h</code></td><td>preempt_enable/disable 宏体系</td></tr><tr><td><code>arch/x86/include/asm/preempt.h</code></td><td>x86 preempt_count 与 NEED_RESCHED 折叠</td></tr><tr><td><code>kernel/sched/idle.c</code></td><td>idle 进程：polling need_resched 循环</td></tr><tr><td><code>kernel/time/timer.c</code></td><td>时钟中断 → scheduler_tick 调用链</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/%E8%B0%83%E5%BA%A6%E5%99%A8/>调度器</a>
+<a href=/tags/schedule/>Schedule</a>
+<a href=/tags/__schedule/>__Schedule</a>
+<a href=/tags/need_resched/>Need_resched</a>
+<a href=/tags/preempt/>Preempt</a>
+<a href=/tags/scheduler_tick/>Scheduler_tick</a>
+<a href=/tags/cfs/>CFS</a>
+<a href=/tags/%E6%8A%A2%E5%8D%A0/>抢占</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/linux-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 上下文切换实现原理深度分析</h2></div></a></article><article><a href=/p/%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8%E6%9C%BA%E5%88%B6/><div class=article-details><h2 class=article-title>系统调用机制</h2></div></a></article><article><a href=/p/%E8%BF%9B%E7%A8%8B%E5%86%85%E6%A0%B8%E7%BB%93%E6%9E%84%E5%85%B3%E7%B3%BB-task_struct-%E5%8F%8A%E5%85%B6%E5%85%B3%E8%81%94%E5%AD%90%E7%B3%BB%E7%BB%9F/><div class=article-details><h2 class=article-title>进程内核结构关系 — task_struct 及其关联子系统</h2></div></a></article><article><a href=/p/%E8%BF%9B%E7%A8%8B%E4%B8%8E%E7%BA%BF%E7%A8%8B%E7%9A%84%E6%9C%AC%E8%B4%A8%E5%8C%BA%E5%88%AB%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E7%9C%8B%E5%85%B1%E4%BA%AB%E4%B8%8E%E9%9A%94%E7%A6%BB/><div class=article-details><h2 class=article-title>进程与线程的本质区别——从内核源码看共享与隔离</h2></div></a></article><article><a href=/p/linux-%E8%BF%9B%E7%A8%8B/%E7%BA%BF%E7%A8%8B%E5%88%9B%E5%BB%BA%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 进程/线程创建源码分析</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

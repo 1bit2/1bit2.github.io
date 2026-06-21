@@ -1,0 +1,656 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="TCP RST（Reset）发送场景完整分析 概述 TCP RST（Reset）是TCP协议中用于立即终止连接或拒绝连接请求的机制。与正常的四次挥手不同，RST可以立即关闭连接，不需要等待确认。\nRST的基本特性 特性 说明 立即生效 收到RST后连接立即终止 无需确认 RST不需要对端ACK 单向通知 发送方通知接收方连接无效 释放资源 双方立即释放连接资源 核心原则 永远不要用RST回复RST（防止RST风暴） 校验和错误的包不发送RST（可能是网络传输错误） RFC5961增强安全性：RST序列号必须精确匹配 发送RST的场景分类 场景1：端口未监听/连接不存在（最常见） 代码位置: net/ipv4/tcp_ipv4.c → tcp_v4_rcv() → no_tcp_socket\n1 2 3 4 5 6 7 8 9 10 11 12 no_tcp_socket: drop_reason = SKB_DROP_REASON_NO_SOCKET; if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) goto discard_it; tcp_v4_fill_cb(skb, iph, th); if (tcp_checksum_complete(skb)) { // 校验和错误，不发送RST goto csum_error; } else { // ★ 发送RST tcp_v4_send_reset(NULL, skb); } 触发场景:\n客户端连接未监听的端口 → 返回 ECONNREFUSED 服务器重启后收到旧连接的数据包 NAT表项超时后对端继续发送 连接已正常关闭但对端还在发送 典型抓包示例:\n"><title>TCP RST（Reset）发送场景完整分析</title><link rel=canonical href=https://1bit2.github.io/p/tcp-rstreset%E5%8F%91%E9%80%81%E5%9C%BA%E6%99%AF%E5%AE%8C%E6%95%B4%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP RST（Reset）发送场景完整分析"><meta property='og:description' content="TCP RST（Reset）发送场景完整分析 概述 TCP RST（Reset）是TCP协议中用于立即终止连接或拒绝连接请求的机制。与正常的四次挥手不同，RST可以立即关闭连接，不需要等待确认。\nRST的基本特性 特性 说明 立即生效 收到RST后连接立即终止 无需确认 RST不需要对端ACK 单向通知 发送方通知接收方连接无效 释放资源 双方立即释放连接资源 核心原则 永远不要用RST回复RST（防止RST风暴） 校验和错误的包不发送RST（可能是网络传输错误） RFC5961增强安全性：RST序列号必须精确匹配 发送RST的场景分类 场景1：端口未监听/连接不存在（最常见） 代码位置: net/ipv4/tcp_ipv4.c → tcp_v4_rcv() → no_tcp_socket\n1 2 3 4 5 6 7 8 9 10 11 12 no_tcp_socket: drop_reason = SKB_DROP_REASON_NO_SOCKET; if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) goto discard_it; tcp_v4_fill_cb(skb, iph, th); if (tcp_checksum_complete(skb)) { // 校验和错误，不发送RST goto csum_error; } else { // ★ 发送RST tcp_v4_send_reset(NULL, skb); } 触发场景:\n客户端连接未监听的端口 → 返回 ECONNREFUSED 服务器重启后收到旧连接的数据包 NAT表项超时后对端继续发送 连接已正常关闭但对端还在发送 典型抓包示例:\n"><meta property='og:url' content='https://1bit2.github.io/p/tcp-rstreset%E5%8F%91%E9%80%81%E5%9C%BA%E6%99%AF%E5%AE%8C%E6%95%B4%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='RST'><meta property='article:tag' content='tcp_send_active_reset'><meta property='article:tag' content='RFC5961'><meta property='article:published_time' content='2026-04-16T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-16T00:00:00+00:00'><meta name=twitter:title content="TCP RST（Reset）发送场景完整分析"><meta name=twitter:description content="TCP RST（Reset）发送场景完整分析 概述 TCP RST（Reset）是TCP协议中用于立即终止连接或拒绝连接请求的机制。与正常的四次挥手不同，RST可以立即关闭连接，不需要等待确认。\nRST的基本特性 特性 说明 立即生效 收到RST后连接立即终止 无需确认 RST不需要对端ACK 单向通知 发送方通知接收方连接无效 释放资源 双方立即释放连接资源 核心原则 永远不要用RST回复RST（防止RST风暴） 校验和错误的包不发送RST（可能是网络传输错误） RFC5961增强安全性：RST序列号必须精确匹配 发送RST的场景分类 场景1：端口未监听/连接不存在（最常见） 代码位置: net/ipv4/tcp_ipv4.c → tcp_v4_rcv() → no_tcp_socket\n1 2 3 4 5 6 7 8 9 10 11 12 no_tcp_socket: drop_reason = SKB_DROP_REASON_NO_SOCKET; if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) goto discard_it; tcp_v4_fill_cb(skb, iph, th); if (tcp_checksum_complete(skb)) { // 校验和错误，不发送RST goto csum_error; } else { // ★ 发送RST tcp_v4_send_reset(NULL, skb); } 触发场景:\n客户端连接未监听的端口 → 返回 ECONNREFUSED 服务器重启后收到旧连接的数据包 NAT表项超时后对端继续发送 连接已正常关闭但对端还在发送 典型抓包示例:\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#概述>概述</a><ol><li><a href=#rst的基本特性>RST的基本特性</a></li><li><a href=#核心原则>核心原则</a></li></ol></li><li><a href=#发送rst的场景分类>发送RST的场景分类</a><ol><li><a href=#场景1端口未监听连接不存在最常见>场景1：端口未监听/连接不存在（最常见）</a></li><li><a href=#场景2listen状态收到带ack的包>场景2：LISTEN状态收到带ACK的包</a></li><li><a href=#场景3listen状态的conn_request失败>场景3：LISTEN状态的conn_request()失败</a></li><li><a href=#场景4syn_sent状态收到无效的syn-ack>场景4：SYN_SENT状态收到无效的SYN-ACK</a></li><li><a href=#场景5syn_recv状态的ack验证失败>场景5：SYN_RECV状态的ACK验证失败</a></li><li><a href=#场景6子socket处理失败>场景6：子socket处理失败</a></li><li><a href=#场景7fin_wait1状态的异常处理>场景7：FIN_WAIT1状态的异常处理</a></li><li><a href=#场景8time_wait状态的异常处理>场景8：TIME_WAIT状态的异常处理</a></li><li><a href=#场景9收到rst后被动重置>场景9：收到RST后被动重置</a></li></ol></li><li><a href=#tcp_v4_send_reset-核心实现>tcp_v4_send_reset() 核心实现</a><ol><li><a href=#场景nkeepalive-探测超时>场景N：Keepalive 探测超时</a></li></ol></li><li><a href=#rst场景总结表>RST场景总结表</a></li><li><a href=#调试与监控>调试与监控</a><ol><li><a href=#1-查看rst统计>1. 查看RST统计</a></li><li><a href=#2-抓包分析>2. 抓包分析</a></li><li><a href=#3-使用ebpf跟踪>3. 使用eBPF跟踪</a></li><li><a href=#4-内核跟踪点>4. 内核跟踪点</a></li></ol></li><li><a href=#常见问题排查>常见问题排查</a><ol><li><a href=#问题1-大量connection-refused>问题1: 大量Connection Refused</a></li><li><a href=#问题2-连接频繁被rst>问题2: 连接频繁被RST</a></li><li><a href=#问题3-time_wait过多导致新连接rst>问题3: TIME_WAIT过多导致新连接RST</a></li><li><a href=#问题4-keepalive-正常但突然收到-rst--从源码理解纯-r-的生成机制>问题4: Keepalive 正常但突然收到 RST —— 从源码理解纯 <code>[R]</code> 的生成机制</a><ol><li><a href=#内核中-rst-的两条路径与标志位差异>内核中 RST 的两条路径与标志位差异</a></li><li><a href=#纯-r-vs-r-总结>纯 <code>[R]</code> vs <code>[R.]</code> 总结</a></li><li><a href=#实际-pcap-案例用绝对序列号证明-rst-来源>实际 pcap 案例：用绝对序列号证明 RST 来源</a></li><li><a href=#完整时间线>完整时间线</a></li><li><a href=#vrf-导致-ic801-自身生成纯-r--完整源码追踪>VRF 导致 IC801 自身生成纯 <code>[R]</code> —— 完整源码追踪</a></li><li><a href=#namespace-vs-vrf-对比>Namespace vs VRF 对比</a></li><li><a href=#完整闭合的因果链>完整闭合的因果链</a></li></ol></li></ol></li><li><a href=#参考资料>参考资料</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-rstreset%E5%8F%91%E9%80%81%E5%9C%BA%E6%99%AF%E5%AE%8C%E6%95%B4%E5%88%86%E6%9E%90/>TCP RST（Reset）发送场景完整分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 16, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>12 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp-rstreset发送场景完整分析>TCP RST（Reset）发送场景完整分析</h1><h2 id=概述>概述</h2><p>TCP RST（Reset）是TCP协议中用于立即终止连接或拒绝连接请求的机制。与正常的四次挥手不同，RST可以立即关闭连接，不需要等待确认。</p><h3 id=rst的基本特性>RST的基本特性</h3><div class=table-wrapper><table><thead><tr><th>特性</th><th>说明</th></tr></thead><tbody><tr><td>立即生效</td><td>收到RST后连接立即终止</td></tr><tr><td>无需确认</td><td>RST不需要对端ACK</td></tr><tr><td>单向通知</td><td>发送方通知接收方连接无效</td></tr><tr><td>释放资源</td><td>双方立即释放连接资源</td></tr></tbody></table></div><h3 id=核心原则>核心原则</h3><ol><li><strong>永远不要用RST回复RST</strong>（防止RST风暴）</li><li><strong>校验和错误的包不发送RST</strong>（可能是网络传输错误）</li><li><strong>RFC5961增强安全性</strong>：RST序列号必须精确匹配</li></ol><hr><h2 id=发送rst的场景分类>发送RST的场景分类</h2><h3 id=场景1端口未监听连接不存在最常见>场景1：端口未监听/连接不存在（最常见）</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_ipv4.c</code> → <code>tcp_v4_rcv()</code> → <code>no_tcp_socket</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=nl>no_tcp_socket</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=n>drop_reason</span> <span class=o>=</span> <span class=n>SKB_DROP_REASON_NO_SOCKET</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>xfrm4_policy_check</span><span class=p>(</span><span class=nb>NULL</span><span class=p>,</span> <span class=n>XFRM_POLICY_IN</span><span class=p>,</span> <span class=n>skb</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>discard_it</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_v4_fill_cb</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>iph</span><span class=p>,</span> <span class=n>th</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_checksum_complete</span><span class=p>(</span><span class=n>skb</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 校验和错误，不发送RST
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>csum_error</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ★ 发送RST
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_v4_send_reset</span><span class=p>(</span><span class=nb>NULL</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>触发场景</strong>:</p><ul><li>客户端连接未监听的端口 → 返回 <code>ECONNREFUSED</code></li><li>服务器重启后收到旧连接的数据包</li><li>NAT表项超时后对端继续发送</li><li>连接已正常关闭但对端还在发送</li></ul><p><strong>典型抓包示例</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>Client -&gt; Server: SYN (dst port 8080)
+</span></span><span class=line><span class=cl>Server -&gt; Client: RST, ACK          # 端口8080未监听
+</span></span></code></pre></td></tr></table></div></div><hr><h3 id=场景2listen状态收到带ack的包>场景2：LISTEN状态收到带ACK的包</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_input.c</code> → <code>tcp_rcv_state_process()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>case</span> <span class=nl>TCP_LISTEN</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>ack</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>  <span class=c1>// ★ 触发RST
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>原因</strong>: 正常的SYN包不应该带ACK标志，这违反TCP协议规范（RFC793）</p><p><strong>触发场景</strong>:</p><ul><li>网络设备故障导致包损坏</li><li>恶意构造的异常包</li><li>协议栈实现错误</li></ul><hr><h3 id=场景3listen状态的conn_request失败>场景3：LISTEN状态的conn_request()失败</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_input.c</code> → <code>tcp_rcv_state_process()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>case</span> <span class=nl>TCP_LISTEN</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>syn</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>acceptable</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_af_ops</span><span class=o>-&gt;</span><span class=nf>conn_request</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>)</span> <span class=o>&gt;=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>acceptable</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>  <span class=c1>// ★ 触发RST
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>触发场景</strong>:</p><div class=table-wrapper><table><thead><tr><th>原因</th><th>说明</th></tr></thead><tbody><tr><td>半连接队列满</td><td><code>tcp_max_syn_backlog</code> 已达上限</td></tr><tr><td>内存不足</td><td>无法分配 <code>request_sock</code></td></tr><tr><td>安全策略拒绝</td><td>SELinux/AppArmor拒绝连接</td></tr><tr><td>资源限制</td><td>文件描述符耗尽</td></tr></tbody></table></div><p><strong>相关内核参数</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 查看半连接队列大小</span>
+</span></span><span class=line><span class=cl>sysctl net.ipv4.tcp_max_syn_backlog
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看SYN Cookie状态（队列满时的备用方案）</span>
+</span></span><span class=line><span class=cl>sysctl net.ipv4.tcp_syncookies
+</span></span></code></pre></td></tr></table></div></div><hr><h3 id=场景4syn_sent状态收到无效的syn-ack>场景4：SYN_SENT状态收到无效的SYN-ACK</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_input.c</code> → <code>tcp_rcv_synsent_state_process()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 检查ACK序列号
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ack_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_una</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>    <span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ack_seq</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_nxt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>reset_and_undo</span><span class=p>;</span>  <span class=c1>// ★ return 1 触发RST
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// PAWS时间戳检查
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>saw_tstamp</span> <span class=o>&amp;&amp;</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=o>!</span><span class=nf>between</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>rcv_tsecr</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>retrans_stamp</span><span class=p>,</span> <span class=nf>tcp_time_stamp</span><span class=p>(</span><span class=n>tp</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>reset_and_undo</span><span class=p>;</span>  <span class=c1>// ★ return 1 触发RST
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>触发场景</strong>:</p><div class=table-wrapper><table><thead><tr><th>条件</th><th>说明</th></tr></thead><tbody><tr><td>ACK ≤ ISS</td><td>ACK序列号小于等于初始序列号</td></tr><tr><td>ACK > SND.NXT</td><td>ACK序列号超过发送的最大序列号</td></tr><tr><td>PAWS失败</td><td>时间戳不在合理范围内</td></tr></tbody></table></div><p><strong>调用链</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>tcp_v4_do_rcv()
+</span></span><span class=line><span class=cl>  → tcp_rcv_state_process()
+</span></span><span class=line><span class=cl>    → tcp_rcv_synsent_state_process()
+</span></span><span class=line><span class=cl>      → reset_and_undo: return 1
+</span></span><span class=line><span class=cl>  → goto reset
+</span></span><span class=line><span class=cl>    → tcp_v4_send_reset()
+</span></span></code></pre></td></tr></table></div></div><hr><h3 id=场景5syn_recv状态的ack验证失败>场景5：SYN_RECV状态的ACK验证失败</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_input.c</code> → <code>tcp_rcv_state_process()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// step 5: check the ACK field
+</span></span></span><span class=line><span class=cl><span class=n>acceptable</span> <span class=o>=</span> <span class=nf>tcp_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>FLAG_SLOWPATH</span> <span class=o>|</span> <span class=p>...)</span> <span class=o>&gt;</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>acceptable</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_SYN_RECV</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>  <span class=c1>// ★ 触发RST
+</span></span></span><span class=line><span class=cl>    <span class=nf>tcp_send_challenge_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>discard</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>触发场景</strong>: 三次握手最后一步收到的ACK序列号不匹配</p><p><strong>典型抓包示例</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>Client -&gt; Server: SYN
+</span></span><span class=line><span class=cl>Server -&gt; Client: SYN-ACK
+</span></span><span class=line><span class=cl>Client -&gt; Server: ACK (ack_seq错误)
+</span></span><span class=line><span class=cl>Server -&gt; Client: RST
+</span></span></code></pre></td></tr></table></div></div><hr><h3 id=场景6子socket处理失败>场景6：子socket处理失败</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_ipv4.c</code> → <code>tcp_v4_do_rcv()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_LISTEN</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>nsk</span> <span class=o>=</span> <span class=nf>tcp_v4_cookie_check</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>nsk</span> <span class=o>!=</span> <span class=n>sk</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_child_process</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>nsk</span><span class=p>,</span> <span class=n>skb</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>rsk</span> <span class=o>=</span> <span class=n>nsk</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>reset</span><span class=p>;</span>  <span class=c1>// ★ tcp_v4_send_reset(nsk, skb)
+</span></span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>触发场景</strong>:</p><ul><li>SYN Cookie创建的子socket处理失败</li><li>子socket状态转换错误</li><li>内存不足导致处理失败</li></ul><hr><h3 id=场景7fin_wait1状态的异常处理>场景7：FIN_WAIT1状态的异常处理</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_input.c</code> → <code>tcp_rcv_state_process()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>case</span> <span class=nl>TCP_FIN_WAIT1</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 场景7.1: SO_LINGER设置为0
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>linger2</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_done</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>  <span class=c1>// ★ 触发RST
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 场景7.2: close()后收到乱序数据
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>end_seq</span> <span class=o>-</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>fin</span><span class=p>,</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_done</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>  <span class=c1>// ★ 触发RST
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>场景7.1: SO_LINGER=0</strong></p><p>应用程序设置：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>linger</span> <span class=n>sl</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=n>sl</span><span class=p>.</span><span class=n>l_onoff</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=n>sl</span><span class=p>.</span><span class=n>l_linger</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>sockfd</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_LINGER</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>sl</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>sl</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=nf>close</span><span class=p>(</span><span class=n>sockfd</span><span class=p>);</span>  <span class=c1>// 立即发送RST，不进行四次挥手
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>场景7.2: close()后收到数据</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>应用程序调用 close()
+</span></span><span class=line><span class=cl>  ↓
+</span></span><span class=line><span class=cl>内核发送 FIN，进入 FIN_WAIT1
+</span></span><span class=line><span class=cl>  ↓
+</span></span><span class=line><span class=cl>收到对端的数据（不是FIN）
+</span></span><span class=line><span class=cl>  ↓
+</span></span><span class=line><span class=cl>发送 RST 终止连接
+</span></span></code></pre></td></tr></table></div></div><hr><h3 id=场景8time_wait状态的异常处理>场景8：TIME_WAIT状态的异常处理</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_minisocks.c</code> → <code>tcp_timewait_state_process()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// TIME_WAIT状态收到SYN
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>syn</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>rst</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>ack</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>paws_reject</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 检查新连接的ISN是否有效
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>after</span><span class=p>(</span><span class=nf>TCP_SKB_CB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>,</span> <span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_rcv_nxt</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>TCP_TW_SYN</span><span class=p>;</span>  <span class=c1>// 允许新连接
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// 其他情况
+</span></span></span><span class=line><span class=cl><span class=k>return</span> <span class=n>TCP_TW_RST</span><span class=p>;</span>  <span class=c1>// ★ 发送RST
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>触发场景</strong>:</p><ul><li>TIME_WAIT期间收到非法包</li><li>收到的SYN序列号不合法（可能是旧连接的重传）</li><li>收到非SYN的异常包</li></ul><p><strong>TIME_WAIT存在的意义</strong>:</p><ol><li>确保最后的ACK被对端收到</li><li>防止旧连接的包干扰新连接</li></ol><hr><h3 id=场景9收到rst后被动重置>场景9：收到RST后被动重置</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_input.c</code> → <code>tcp_reset()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_reset</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>switch</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>case</span> <span class=nl>TCP_SYN_SENT</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>        <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_err</span> <span class=o>=</span> <span class=n>ECONNREFUSED</span><span class=p>;</span>  <span class=c1>// 连接被拒绝
+</span></span></span><span class=line><span class=cl>        <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>case</span> <span class=nl>TCP_CLOSE_WAIT</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>        <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_err</span> <span class=o>=</span> <span class=n>EPIPE</span><span class=p>;</span>         <span class=c1>// 管道破裂
+</span></span></span><span class=line><span class=cl>        <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>case</span> <span class=nl>TCP_CLOSE</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>                      <span class=c1>// 已关闭，忽略
+</span></span></span><span class=line><span class=cl>    <span class=k>default</span><span class=o>:</span>
+</span></span><span class=line><span class=cl>        <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_err</span> <span class=o>=</span> <span class=n>ECONNRESET</span><span class=p>;</span>    <span class=c1>// 连接重置
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>tcp_done</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>注意</strong>: 这是收到RST的处理，不是发送RST。</p><hr><h2 id=tcp_v4_send_reset-核心实现>tcp_v4_send_reset() 核心实现</h2><p><strong>代码位置</strong>: <code>net/ipv4/tcp_ipv4.c</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_v4_send_reset</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>tcphdr</span> <span class=o>*</span><span class=n>th</span> <span class=o>=</span> <span class=nf>tcp_hdr</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 1. 永远不要用RST回复RST
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>rst</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 2. 非本地目的地址不回复
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>sk</span> <span class=o>&amp;&amp;</span> <span class=nf>skb_rtable</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>rt_type</span> <span class=o>!=</span> <span class=n>RTN_LOCAL</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 3. 构建RST包
+</span></span></span><span class=line><span class=cl>    <span class=nf>memset</span><span class=p>(</span><span class=o>&amp;</span><span class=n>rep</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>rep</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>    <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>dest</span>   <span class=o>=</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>source</span><span class=p>;</span>   <span class=c1>// 交换源和目的
+</span></span></span><span class=line><span class=cl>    <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>source</span> <span class=o>=</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>dest</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>rst</span>    <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>            <span class=c1>// 设置RST标志
+</span></span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 4. 设置序列号
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>ack</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>seq</span> <span class=o>=</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>ack_seq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>ack</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>ack_seq</span> <span class=o>=</span> <span class=nf>htonl</span><span class=p>(</span><span class=nf>ntohl</span><span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>)</span> <span class=o>+</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>syn</span> <span class=o>+</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>fin</span> <span class=o>+</span>
+</span></span><span class=line><span class=cl>                               <span class=n>skb</span><span class=o>-&gt;</span><span class=n>len</span> <span class=o>-</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>doff</span> <span class=o>&lt;&lt;</span> <span class=mi>2</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 5. 发送RST
+</span></span></span><span class=line><span class=cl>    <span class=nf>ip_send_unicast_reply</span><span class=p>(...);</span>
+</span></span><span class=line><span class=cl>    
+</span></span><span class=line><span class=cl>    <span class=c1>// 6. 统计
+</span></span></span><span class=line><span class=cl>    <span class=nf>__TCP_INC_STATS</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>TCP_MIB_OUTRSTS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h3 id=场景nkeepalive-探测超时>场景N：Keepalive 探测超时</h3><p><strong>代码位置</strong>: <code>net/ipv4/tcp_timer.c</code> → <code>tcp_keepalive_timer()</code></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:723-734
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>elapsed</span> <span class=o>&gt;=</span> <span class=nf>keepalive_time_when</span><span class=p>(</span><span class=n>tp</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>((</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span> <span class=o>!=</span> <span class=mi>0</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>elapsed</span> <span class=o>&gt;=</span> <span class=nf>msecs_to_jiffies</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span> <span class=o>&gt;</span> <span class=mi>0</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span> <span class=o>==</span> <span class=mi>0</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span> <span class=o>&gt;=</span> <span class=nf>keepalive_probes</span><span class=p>(</span><span class=n>tp</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>tcp_send_active_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>GFP_ATOMIC</span><span class=p>);</span>   <span class=c1>// ★ 发送 RST
+</span></span></span><span class=line><span class=cl>        <span class=nf>tcp_write_err</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>                         <span class=c1>// 设置 ETIMEDOUT
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>tcp_write_wakeup</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>LINUX_MIB_TCPKEEPALIVE</span><span class=p>)</span> <span class=o>&lt;=</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>elapsed</span> <span class=o>=</span> <span class=nf>keepalive_intvl_when</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>触发条件</strong>: <code>icsk_probes_out >= keepalive_probes</code>（默认 9 次探测均无 ACK 响应）</p><p><strong>执行顺序</strong>（关键）:</p><ol><li>定时器触发 → <strong>先检查</strong> <code>probes_out >= 9</code> → 未超限 → 发送 keepalive 探测 → <code>probes_out++</code></li><li>75 秒后定时器再次触发 → <strong>先检查</strong> <code>probes_out >= 9</code> → <strong>已超限</strong> → <strong>发 RST</strong> → 连接终止</li></ol><p>这意味着<strong>RST 和最后一次 keepalive 探测之间隔了一个 <code>keepalive_intvl</code>（默认 75s）</strong>，在抓包中看起来是"先 keepalive 后 RST"。</p><p><strong>默认参数</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h:155-157
+</span></span></span><span class=line><span class=cl><span class=cp>#define TCP_KEEPALIVE_TIME    (120*60*HZ)    </span><span class=c1>// 空闲 2 小时后开始探测
+</span></span></span><span class=line><span class=cl><span class=cp>#define TCP_KEEPALIVE_PROBES  9              </span><span class=c1>// 最多探测 9 次
+</span></span></span><span class=line><span class=cl><span class=cp>#define TCP_KEEPALIVE_INTVL   (75*HZ)        </span><span class=c1>// 每次间隔 75 秒
+</span></span></span></code></pre></td></tr></table></div></div><p>从首次探测失败到 RST 的总时间：9 × 75 = 675 秒 ≈ 11 分钟。</p><p><strong>典型场景</strong>: 网络路径中断（如 ARP 学到错误 MAC 导致回程包丢失），对端实际存活但 ACK 无法送达，keepalive 探测次数耗尽后发 RST。</p><hr><h2 id=rst场景总结表>RST场景总结表</h2><div class=table-wrapper><table><thead><tr><th>场景</th><th>状态</th><th>触发条件</th><th>错误码</th></tr></thead><tbody><tr><td>端口未监听</td><td>-</td><td>找不到socket</td><td>ECONNREFUSED</td></tr><tr><td>LISTEN收到ACK</td><td>LISTEN</td><td>th->ack为真</td><td>-</td></tr><tr><td>conn_request失败</td><td>LISTEN</td><td>队列满/内存不足</td><td>-</td></tr><tr><td>无效SYN-ACK</td><td>SYN_SENT</td><td>ACK序列号错误</td><td>-</td></tr><tr><td>无效ACK</td><td>SYN_RECV</td><td>ACK验证失败</td><td>-</td></tr><tr><td>子socket失败</td><td>LISTEN</td><td>tcp_child_process返回非0</td><td>-</td></tr><tr><td>SO_LINGER=0</td><td>FIN_WAIT1</td><td>linger2 &lt; 0</td><td>-</td></tr><tr><td>close后收数据</td><td>FIN_WAIT1</td><td>收到乱序数据</td><td>-</td></tr><tr><td>TIME_WAIT异常</td><td>TIME_WAIT</td><td>非法SYN或其他包</td><td>-</td></tr><tr><td><strong>Keepalive 超时</strong></td><td><strong>ESTABLISHED</strong></td><td><strong>probes_out >= keepalive_probes</strong></td><td><strong>ETIMEDOUT</strong></td></tr></tbody></table></div><hr><h2 id=调试与监控>调试与监控</h2><h3 id=1-查看rst统计>1. 查看RST统计</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 查看发送的RST数量</span>
+</span></span><span class=line><span class=cl>netstat -s <span class=p>|</span> grep -i reset
+</span></span><span class=line><span class=cl><span class=c1># 或</span>
+</span></span><span class=line><span class=cl>cat /proc/net/snmp <span class=p>|</span> grep Tcp
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键指标</strong>:</p><ul><li><code>OutRsts</code>: 发送的RST数量</li><li><code>AttemptFails</code>: 连接尝试失败数</li><li><code>EstabResets</code>: 已建立连接被重置数</li></ul><h3 id=2-抓包分析>2. 抓包分析</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 抓取所有RST包</span>
+</span></span><span class=line><span class=cl>tcpdump -i any <span class=s1>&#39;tcp[tcpflags] &amp; tcp-rst != 0&#39;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 抓取特定端口的RST</span>
+</span></span><span class=line><span class=cl>tcpdump -i any <span class=s1>&#39;port 8080 and tcp[tcpflags] &amp; tcp-rst != 0&#39;</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=3-使用ebpf跟踪>3. 使用eBPF跟踪</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 使用bpftrace跟踪RST发送</span>
+</span></span><span class=line><span class=cl>bpftrace -e <span class=s1>&#39;kprobe:tcp_v4_send_reset { 
+</span></span></span><span class=line><span class=cl><span class=s1>    printf(&#34;RST sent from %s\n&#34;, comm); 
+</span></span></span><span class=line><span class=cl><span class=s1>}&#39;</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=4-内核跟踪点>4. 内核跟踪点</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 启用tcp_send_reset跟踪点</span>
+</span></span><span class=line><span class=cl><span class=nb>echo</span> <span class=m>1</span> &gt; /sys/kernel/debug/tracing/events/tcp/tcp_send_reset/enable
+</span></span><span class=line><span class=cl>cat /sys/kernel/debug/tracing/trace_pipe
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=常见问题排查>常见问题排查</h2><h3 id=问题1-大量connection-refused>问题1: 大量Connection Refused</h3><p><strong>可能原因</strong>:</p><ol><li>服务未启动</li><li>服务监听地址/端口错误</li><li>防火墙规则拒绝</li></ol><p><strong>排查步骤</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 检查服务是否监听</span>
+</span></span><span class=line><span class=cl>ss -tlnp <span class=p>|</span> grep &lt;port&gt;
+</span></span><span class=line><span class=cl>netstat -tlnp <span class=p>|</span> grep &lt;port&gt;
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 检查防火墙</span>
+</span></span><span class=line><span class=cl>iptables -L -n
+</span></span></code></pre></td></tr></table></div></div><h3 id=问题2-连接频繁被rst>问题2: 连接频繁被RST</h3><p><strong>可能原因</strong>:</p><ol><li>应用程序bug导致异常关闭</li><li>中间设备（NAT/防火墙）超时</li><li>网络不稳定导致重传</li></ol><p><strong>排查步骤</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 查看连接状态</span>
+</span></span><span class=line><span class=cl>ss -tn state established <span class=p>|</span> head
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看超时设置</span>
+</span></span><span class=line><span class=cl>sysctl net.ipv4.tcp_keepalive_time
+</span></span><span class=line><span class=cl>sysctl net.ipv4.tcp_keepalive_intvl
+</span></span><span class=line><span class=cl>sysctl net.ipv4.tcp_keepalive_probes
+</span></span></code></pre></td></tr></table></div></div><h3 id=问题3-time_wait过多导致新连接rst>问题3: TIME_WAIT过多导致新连接RST</h3><p><strong>解决方案</strong>:</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 允许TIME_WAIT socket重用</span>
+</span></span><span class=line><span class=cl>sysctl -w net.ipv4.tcp_tw_reuse<span class=o>=</span><span class=m>1</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 减少TIME_WAIT时间（不推荐）</span>
+</span></span><span class=line><span class=cl><span class=c1># 注意：tcp_tw_recycle已在Linux 4.12移除</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=问题4-keepalive-正常但突然收到-rst--从源码理解纯-r-的生成机制>问题4: Keepalive 正常但突然收到 RST —— 从源码理解纯 <code>[R]</code> 的生成机制</h3><p><strong>场景</strong>：抓包中看到 keepalive 探测和 ACK 一直正常交互，突然出现纯 <code>[R]</code>（不带 ACK）的 RST。</p><h4 id=内核中-rst-的两条路径与标志位差异>内核中 RST 的两条路径与标志位差异</h4><p>Linux 内核发送 RST 有两条完全不同的代码路径，产生不同的标志位：</p><p><strong>路径一：<code>tcp_send_active_reset()</code> —— 主动关闭时发 RST</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:4450-4451
+</span></span></span><span class=line><span class=cl><span class=nf>tcp_init_nondata_skb</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=nf>tcp_acceptable_seq</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>                     <span class=n>TCPHDR_ACK</span> <span class=o>|</span> <span class=n>TCPHDR_RST</span><span class=p>);</span>  <span class=c1>// 硬编码 [R.] = RST + ACK
+</span></span></span></code></pre></td></tr></table></div></div><p>调用场景：keepalive 超时、应用 <code>close()</code> 时缓冲区有未读数据、<code>SO_LINGER=0</code>。<strong>固定产生 <code>[R.]</code></strong>。</p><p><strong>路径二：<code>tcp_v4_send_reset()</code> —— 被动回复无 socket 匹配的包</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:1052-1058
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>ack</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>seq</span> <span class=o>=</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>ack_seq</span><span class=p>;</span>     <span class=c1>// 仅设 RST → 纯 [R]
+</span></span></span><span class=line><span class=cl><span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>ack</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>               <span class=c1>// 设 RST + ACK → [R.]
+</span></span></span><span class=line><span class=cl>    <span class=n>rep</span><span class=p>.</span><span class=n>th</span><span class=p>.</span><span class=n>ack_seq</span> <span class=o>=</span> <span class=nf>htonl</span><span class=p>(</span><span class=nf>ntohl</span><span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>seq</span><span class=p>)</span> <span class=o>+</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>syn</span> <span class=o>+</span> <span class=n>th</span><span class=o>-&gt;</span><span class=n>fin</span> <span class=o>+</span>
+</span></span><span class=line><span class=cl>                           <span class=n>skb</span><span class=o>-&gt;</span><span class=n>len</span> <span class=o>-</span> <span class=p>(</span><span class=n>th</span><span class=o>-&gt;</span><span class=n>doff</span> <span class=o>&lt;&lt;</span> <span class=mi>2</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>标志位<strong>取决于收到的包</strong>：收到带 ACK 的包（如 keepalive <code>[.]</code>）→ 回复纯 <code>[R]</code>；收到不带 ACK 的包（如 SYN）→ 回复 <code>[R.]</code>。</p><p><strong>关键约束 —— <code>RTN_LOCAL</code> 检查</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:1039
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>sk</span> <span class=o>&amp;&amp;</span> <span class=nf>skb_rtable</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>rt_type</span> <span class=o>!=</span> <span class=n>RTN_LOCAL</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span><span class=p>;</span>  <span class=c1>// 包的目标 IP 不是本机地址 → 不发 RST
+</span></span></span></code></pre></td></tr></table></div></div><p>这意味着：<strong>只有当包的目标 IP 是本机某个接口地址时，才会在无 socket 情况下发 RST</strong>。普通交换机/路由器如果不持有该 IP，不会通过此路径发 RST。</p><h4 id=纯-r-vs-r-总结>纯 <code>[R]</code> vs <code>[R.]</code> 总结</h4><div class=table-wrapper><table><thead><tr><th>生成函数</th><th>触发条件</th><th>标志位</th><th>是否需要 socket</th></tr></thead><tbody><tr><td><code>tcp_send_active_reset()</code></td><td>主动关闭（keepalive超时/close/abort）</td><td><strong><code>[R.]</code></strong> 固定</td><td><strong>是</strong>（操作已有 socket）</td></tr><tr><td><code>tcp_v4_send_reset()</code> + 收到 ACK 包</td><td>收到包但无匹配 socket</td><td><strong><code>[R]</code></strong> 纯 RST</td><td><strong>否</strong>（走 <code>no_tcp_socket</code> 路径）</td></tr><tr><td><code>tcp_v4_send_reset()</code> + 收到非 ACK 包</td><td>收到包但无匹配 socket</td><td><strong><code>[R.]</code></strong></td><td><strong>否</strong></td></tr></tbody></table></div><h4 id=实际-pcap-案例用绝对序列号证明-rst-来源>实际 pcap 案例：用绝对序列号证明 RST 来源</h4><p>双网卡设备 IC801（eth0=192.168.100.82/24, eth1=192.168.20.79/24）因 <code>arp_ignore=0</code> 导致 ARP 响应竞争，L0 学到错误 MAC，IC204（192.168.100.123）的回程包走错路径。</p><p><strong>连接建立（绝对序列号）</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>IC801 SYN:      82.36057→123.57421 [S]  seq=830744071          ← IC801 ISN
+</span></span><span class=line><span class=cl>IC204 SYN-ACK:  123.57421→82.36057 [S.] seq=8631213 ack=830744072  ← IC204 ISN
+</span></span></code></pre></td></tr></table></div></div><p>数据交换后进入 keepalive：</p><ul><li>IC801 snd_nxt = <strong>830748623</strong>（ISN 830744071 + 4552）</li><li>IC204 snd_nxt = <strong>8633276</strong>（ISN 8631213 + 2063）</li></ul><p><strong>证明一：keepalive RST 的 seq 来自 IC204 的 ack 回复</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>19:17:06  82→123 [.] ack 8633276             IC204 回复 → 123→82 [.] ack 830748623  ✓
+</span></span><span class=line><span class=cl>19:17:16  82→123 [.] ack 8633276             IC204 回复 → 123→82 [.] ack 830748623  ✓
+</span></span><span class=line><span class=cl>          ─── ARP 表翻转，IC204 的回复开始走错路径 ───
+</span></span><span class=line><span class=cl>19:17:26.266  82→123 [.] ack 8633276         IC204 回复 → 走错路径 → 到达无 socket 设备
+</span></span><span class=line><span class=cl>19:17:26.267  82→123 [R] seq=830748623 win=0 ← ★ seq 恰好 = IC204 ack 中的 830748623
+</span></span></code></pre></td></tr></table></div></div><p>数学关系：<strong>RST.seq = IC204回复.ack_seq = IC801.ISN + 4552 = 830744071 + 4552 = 830748623</strong></p><p>这正是 <code>tcp_v4_send_reset()</code> 第 1052 行 <code>rep.th.seq = th->ack_seq</code> 的结果：某设备收到 IC204 的 ACK（<code>ack 830748623</code>），没有匹配 socket，取其 ack_seq 作为 RST 的 seq。</p><p><strong>证明二：SYN 重连的 RST 遵循同一机制</strong></p><p>连接断开后 IC801 尝试重连，每个 SYN 都被 RST：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>19:17:32.784  82.34139→123.57421 [S]  seq=1108198297
+</span></span><span class=line><span class=cl>19:17:32.785  82.34139→123.57421 [R]  seq=1108198298 win=0  ← seq = SYN_seq + 1
+</span></span><span class=line><span class=cl>19:17:33.786  82.34139→123.57421 [S]  seq=1108198297        ← SYN 重试（1s 退避）
+</span></span><span class=line><span class=cl>19:17:33.787  82.34139→123.57421 [R]  seq=1108198298 win=0
+</span></span><span class=line><span class=cl>19:17:35.866  82.34139→123.57421 [S]  seq=1108198297        ← SYN 重试（2s 退避）
+</span></span><span class=line><span class=cl>19:17:35.867  82.34139→123.57421 [R]  seq=1108198298 win=0
+</span></span><span class=line><span class=cl>19:17:39.919  82.34139→123.57421 [S]  seq=1108198297        ← SYN 重试（4s 退避）
+</span></span><span class=line><span class=cl>19:17:39.921  82.34139→123.57421 [R]  seq=1108198298 win=0
+</span></span></code></pre></td></tr></table></div></div><p>IC204 收到 SYN 后发 SYN-ACK（<code>ack = SYN_seq + 1 = 1108198298</code>），SYN-ACK 带 ACK 标志，走错路径后被 <code>tcp_v4_send_reset()</code> 处理：<code>rep.th.seq = th->ack_seq = 1108198298</code>。</p><p><strong>证明三：<code>win</code> 字段区分两条代码路径</strong></p><div class=table-wrapper><table><thead><tr><th>字段</th><th>纯 <code>[R]</code>（19:17:26.267）</th><th><code>[R.]</code>（19:17:32.666）</th></tr></thead><tbody><tr><td>seq</td><td>830748623</td><td>830748623</td></tr><tr><td>ack</td><td>无</td><td>8633276</td></tr><tr><td><strong>win</strong></td><td><strong>0</strong></td><td><strong>65535</strong></td></tr><tr><td>来源</td><td><code>tcp_v4_send_reset()</code></td><td><code>tcp_send_active_reset()</code></td></tr></tbody></table></div><ul><li><code>tcp_v4_send_reset()</code> 用 <code>memset(&amp;rep, 0, sizeof(rep))</code> 初始化 → <strong>win 固定为 0</strong></li><li><code>tcp_send_active_reset()</code> 使用已有 socket，经 <code>tcp_transmit_skb()</code> 设置 <code>th->window = min(tp->rcv_wnd, 65535)</code> → <strong>win = 65535</strong>（IC801 的接收窗口）</li></ul><p>整个 pcap 中所有 RST 完美符合此规律：</p><div class=table-wrapper><table><thead><tr><th>类型</th><th>win</th><th>来源确认</th></tr></thead><tbody><tr><td>30 个纯 <code>[R]</code>（82→123）</td><td>全部 = 0</td><td><code>tcp_v4_send_reset()</code>（无 socket）</td></tr><tr><td>3 个 <code>[R.]</code>（82→123, win=65535）</td><td>65535</td><td>IC801 <code>tcp_send_active_reset()</code>（keepalive 超时）</td></tr><tr><td>6 个 <code>[R.]</code>（123→82, win=28694）</td><td>28694</td><td>IC204 端的 RST</td></tr></tbody></table></div><h4 id=完整时间线>完整时间线</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>19:17:06  keepalive 正常，IC204 ACK 回程路径正确
+</span></span><span class=line><span class=cl>19:17:16  keepalive 正常，IC204 ACK 回程路径正确
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>          ──── ARP 表翻转，IC204 回复开始走错路径 ────
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>19:17:26.266  IC801 发 keepalive
+</span></span><span class=line><span class=cl>              IC204 回复 ACK → 走错路径 → 到达无 socket 设备
+</span></span><span class=line><span class=cl>19:17:26.267  无 socket 设备 tcp_v4_send_reset() → 纯 [R] seq=830748623 win=0
+</span></span><span class=line><span class=cl>              IC204 收到 [R] → 关闭连接
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>19:17:28.403  IC801 keepalive（不知 IC204 已关闭，probes_out++）
+</span></span><span class=line><span class=cl>19:17:30.533  IC801 keepalive（probes_out++，interval ≈ 2s）
+</span></span><span class=line><span class=cl>19:17:32.666  IC801 probes_out 达到上限 → tcp_send_active_reset() → [R.] win=65535
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>19:17:32.784  IC801 应用层重连 SYN seq=1108198297
+</span></span><span class=line><span class=cl>              IC204 SYN-ACK → 走错路径 → 被 RST（seq=1108198298）
+</span></span><span class=line><span class=cl>19:17:33~39   SYN 重试 3 次（1s→2s→4s 退避），每次都被 RST
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>19:17:48.897  IC801 换端口重连 SYN seq=1220203279
+</span></span><span class=line><span class=cl>              同样被 RST（seq=1220203280），重试 4 次
+</span></span></code></pre></td></tr></table></div></div><p>1.5 小时的 pcap 中共出现 <strong>4 次 RST 风暴</strong>（17:49, 18:22, 18:34, 19:17），间隔不规则（33min, 12min, 43min），符合 ARP 邻居状态机（<code>REACHABLE → STALE → DELAY → REACHABLE/FAILED</code>）的间歇性翻转特征。</p><h4 id=vrf-导致-ic801-自身生成纯-r--完整源码追踪>VRF 导致 IC801 自身生成纯 <code>[R]</code> —— 完整源码追踪</h4><p>生成纯 <code>[R]</code> 的设备就是 <strong>IC801 自身</strong>。IC801 收到了包、82 是本机地址，但因为 VRF 隔离导致 socket lookup 失败。</p><p>IC801 的网络配置（VRF 隔离）：</p><ul><li>eth0（192.168.100.82）→ enslaved to <strong>vrf-data</strong></li><li>eth1（192.168.20.79）→ enslaved to <strong>vrf-mgmt</strong>（或主路由表）</li><li>TCP socket 在 vrf-data 上下文中创建 → <code>sk->sk_bound_dev_if = vrf-data_ifindex</code></li></ul><p><strong><code>tcp_v4_rcv()</code> 处理 eth1 上收到的包</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:2661-2714
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>tcp_v4_rcv</span><span class=p>(</span><span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>sdif</span> <span class=o>=</span> <span class=nf>inet_sdif</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>  <span class=c1>// eth1 在 vrf-mgmt → sdif = vrf-mgmt_ifindex
+</span></span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>dif</span> <span class=o>=</span> <span class=nf>inet_iif</span><span class=p>(</span><span class=n>skb</span><span class=p>);</span>    <span class=c1>// dif = eth1_ifindex
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 路由查找：local table(255) 有 192.168.100.82 → RTN_LOCAL ✓
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 包被交给 TCP 处理
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>sk</span> <span class=o>=</span> <span class=nf>__inet_lookup_skb</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tcp_hashinfo</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=p>...,</span> <span class=n>sdif</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>refcounted</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// → 内部调用 INET_MATCH → inet_sk_bound_dev_eq()
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>no_tcp_socket</span><span class=p>;</span>  <span class=c1>// ← VRF 不匹配走这里
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong><code>INET_MATCH</code> 中四元组匹配但 VRF 检查失败</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/inet_hashtables.h:525-553
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>INET_MATCH</span><span class=p>(...,</span> <span class=kt>int</span> <span class=n>dif</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sdif</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>net_eq</span><span class=p>(...)</span> <span class=o>||</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_portpair</span> <span class=o>!=</span> <span class=n>ports</span> <span class=o>||</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_addrpair</span> <span class=o>!=</span> <span class=n>cookie</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>false</span><span class=p>;</span>   <span class=c1>// 四元组匹配 ✓
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>inet_sk_bound_dev_eq</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>,</span> <span class=n>dif</span><span class=p>,</span> <span class=n>sdif</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>//                               ^^^^^^^^^^^^^^^^      ^^^  ^^^^
+</span></span></span><span class=line><span class=cl>    <span class=c1>//                               vrf-data_ifindex   eth1  vrf-mgmt
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>VRF 匹配的核心判定</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/inet_sock.h:144-150
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>inet_bound_dev_eq</span><span class=p>(</span><span class=kt>bool</span> <span class=n>l3mdev_accept</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                     <span class=kt>int</span> <span class=n>bound_dev_if</span><span class=p>,</span> <span class=kt>int</span> <span class=n>dif</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sdif</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>bound_dev_if</span><span class=p>)</span>                     <span class=c1>// socket 未绑定 VRF
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>!</span><span class=n>sdif</span> <span class=o>||</span> <span class=n>l3mdev_accept</span><span class=p>;</span>     <span class=c1>// VRF 包且 l3mdev_accept=0 → false
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>bound_dev_if</span> <span class=o>==</span> <span class=n>dif</span> <span class=o>||</span> <span class=n>bound_dev_if</span> <span class=o>==</span> <span class=n>sdif</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=c1>//     vrf-data ≠ eth1   &amp;&amp;   vrf-data ≠ vrf-mgmt → false!
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>两种场景都失败：</p><div class=table-wrapper><table><thead><tr><th>socket 状态</th><th><code>bound_dev_if</code></th><th>判断</th><th>结果</th></tr></thead><tbody><tr><td>绑定 vrf-data</td><td>vrf-data_idx</td><td><code>vrf-data ≠ eth1 && vrf-data ≠ vrf-mgmt</code></td><td><strong>false</strong></td></tr><tr><td>未绑定（通用 socket）</td><td>0</td><td><code>sdif(≠0) && l3mdev_accept(=0)</code></td><td><strong>false</strong></td></tr></tbody></table></div><p>注：<code>sysctl_tcp_l3mdev_accept</code> 默认为 0，不允许跨 VRF 匹配 socket。</p><p><strong>关键：RTN_LOCAL 通过但 socket 查找失败</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>eth1 收到 dst=192.168.100.82 的包
+</span></span><span class=line><span class=cl>    → ip_rcv → local table (255, 共享) 有 82 → RTN_LOCAL ✓ → 交给 TCP
+</span></span><span class=line><span class=cl>    → tcp_v4_rcv → socket lookup → VRF 不匹配 → no_tcp_socket
+</span></span><span class=line><span class=cl>    → tcp_v4_send_reset(NULL, skb) → 纯 [R]
+</span></span></code></pre></td></tr></table></div></div><p>local table 是所有 VRF 共享的，所以 RTN_LOCAL 检查通过；但 socket 表的查找带了 VRF 过滤，所以找不到 socket。两者的不一致正是产生纯 <code>[R]</code> 的原因。</p><h4 id=namespace-vs-vrf-对比>Namespace vs VRF 对比</h4><div class=table-wrapper><table><thead><tr><th>特性</th><th>Network Namespace</th><th>VRF</th></tr></thead><tbody><tr><td>内核结构</td><td><code>struct net</code>（独立网络栈）</td><td><code>struct net_device</code>（L3 master 设备）</td></tr><tr><td>socket 表</td><td><strong>完全隔离</strong>（<code>net_eq()</code> 拦截）</td><td><strong>共享</strong>（通过 <code>sdif</code> 参数过滤）</td></tr><tr><td>路由表</td><td>完全隔离</td><td>分离（每个 VRF 一个 table，local table 共享）</td></tr><tr><td>ARP 表</td><td>完全隔离</td><td>共享</td></tr><tr><td>本案例的差异</td><td>namespace 隔离下包到 eth1 不会进入 TCP → 不发 RST</td><td>VRF 下包到 eth1 进入 TCP 但找不到 socket → <strong>发 RST</strong></td></tr></tbody></table></div><h4 id=完整闭合的因果链>完整闭合的因果链</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>1. IC801: eth0(vrf-data, 82), eth1(vrf-mgmt, 79), arp_ignore=0
+</span></span><span class=line><span class=cl>   同一交换机连接 IC801 两个网口和 IC204
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>2. IC204 ARP &#34;who has 82?&#34; → 交换机广播
+</span></span><span class=line><span class=cl>   → eth0 响应 MAC=1c:54:e6:31:c8:27 ✓
+</span></span><span class=line><span class=cl>   → eth1 也响应 MAC=12:26:ec:68:72:b6 ✗（arp_ignore=0）
+</span></span><span class=line><span class=cl>   → 交换机 MAC 表可能记录 eth1 的 MAC
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>3. IC204 发 TCP 包给 82 → 交换机查 MAC 表 → 转发到 eth1 端口
+</span></span><span class=line><span class=cl>   → IC801 eth1(vrf-mgmt) 收包
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>4. IC801 内核：
+</span></span><span class=line><span class=cl>   ip_rcv → local table 有 82 → RTN_LOCAL → 交给 tcp_v4_rcv
+</span></span><span class=line><span class=cl>   sdif = vrf-mgmt_ifindex
+</span></span><span class=line><span class=cl>   socket lookup: 四元组匹配 ✓，VRF 匹配 ✗ → no_tcp_socket
+</span></span><span class=line><span class=cl>   → tcp_v4_send_reset(NULL, skb)
+</span></span><span class=line><span class=cl>   → th-&gt;ack → rep.th.seq = th-&gt;ack_seq → 纯 [R] win=0
+</span></span><span class=line><span class=cl>   → ip_send_unicast_reply(sk=NULL) → 路由查找无 VRF 绑定
+</span></span><span class=line><span class=cl>   → 主路由表: 192.168.100.123 via eth0 → RST 从 eth0 发出
+</span></span><span class=line><span class=cl>   （pcap 证据: RST src MAC = 1c:54:e6:31:c8:27 即 eth0 MAC）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>5. IC204 收到 [R] → 关闭连接
+</span></span><span class=line><span class=cl>   IC801 vrf-data 上的 socket 完全不知情 → keepalive 继续
+</span></span><span class=line><span class=cl>   → 最终 keepalive 超时 → tcp_send_active_reset → [R.] win=65535
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>注: eth0-only 的 tcpdump 看到&#34;keepalive → 无回复 → 突然 RST&#34;：
+</span></span><span class=line><span class=cl>   - keepalive 从 eth0 出 → 可见
+</span></span><span class=line><span class=cl>   - IC204 ACK 到达 eth1（交换机单播只发到目标 MAC 端口）→ eth0 不可见
+</span></span><span class=line><span class=cl>   - RST 路由走主表从 eth0 出 → 可见
+</span></span><span class=line><span class=cl>   使用 tcpdump -i any 可同时看到 eth1 上的 IC204 ACK
+</span></span></code></pre></td></tr></table></div></div><p><strong>根本解决</strong>：设置 <code>arp_ignore=1</code>，eth1 不再响应 82 的 ARP → 交换机只学 eth0 MAC → 回程包走 eth0 → VRF 匹配 → socket 找到 → 正常处理：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=nb>echo</span> <span class=m>1</span> &gt; /proc/sys/net/ipv4/conf/all/arp_ignore
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=参考资料>参考资料</h2><ol><li>RFC 793 - Transmission Control Protocol</li><li>RFC 5961 - Improving TCP&rsquo;s Robustness to Blind In-Window Attacks</li><li>Linux内核源码: <code>net/ipv4/tcp_*.c</code></li><li>Stevens, W. Richard. &ldquo;TCP/IP Illustrated, Volume 1&rdquo;</li></ol></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/rst/>RST</a>
+<a href=/tags/tcp_send_active_reset/>Tcp_send_active_reset</a>
+<a href=/tags/rfc5961/>RFC5961</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

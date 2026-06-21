@@ -1,0 +1,1401 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="Linux 内核 TCP 协议实现架构分析 基于 Linux 5.15.78 内核源码\n目录 1. 设计理念 2. 整体架构 3. 源码文件组织 4. 核心数据结构 5. 连接生命周期管理 6. 数据发送路径 7. 数据接收路径 8. 拥塞控制框架 9. 定时器体系 10. 关键设计模式 附录：关键文件索引 1. 设计理念 Linux 内核的 TCP 实现遵循以下核心设计理念：\n1.1 分层解耦 1 2 3 4 5 6 7 8 9 用户空间 socket()/connect()/send()/recv()/close() ───────────────────────────────────────────────────────────────────── BSD Socket 层 struct socket + proto_ops (inet_stream_ops) ───────────────────────────────────────────────────────────────────── 传输层 (TCP) struct sock/tcp_sock + struct proto (tcp_prot) ───────────────────────────────────────────────────────────────────── 网络层 (IP) ip_queue_xmit / ip_local_deliver ───────────────────────────────────────────────────────────────────── 链路层 dev_queue_xmit / netif_receive_skb BSD Socket 层（net/socket.c）：提供 POSIX 兼容的系统调用接口 INET 层（net/ipv4/af_inet.c）：IPv4 协议族的 socket 适配，通过 proto_ops 衔接上层 TCP 协议层：核心状态机、拥塞控制、可靠传输等纯 TCP 逻辑 IP 层：路由、分片、Netfilter 等网络层功能 1.2 面向对象的 C 语言设计 通过 结构体嵌套首成员 实现类似继承的效果：\n"><title>Linux 内核 TCP 协议实现架构分析</title><link rel=canonical href=https://1bit2.github.io/p/linux-%E5%86%85%E6%A0%B8-tcp-%E5%8D%8F%E8%AE%AE%E5%AE%9E%E7%8E%B0%E6%9E%B6%E6%9E%84%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Linux 内核 TCP 协议实现架构分析"><meta property='og:description' content="Linux 内核 TCP 协议实现架构分析 基于 Linux 5.15.78 内核源码\n目录 1. 设计理念 2. 整体架构 3. 源码文件组织 4. 核心数据结构 5. 连接生命周期管理 6. 数据发送路径 7. 数据接收路径 8. 拥塞控制框架 9. 定时器体系 10. 关键设计模式 附录：关键文件索引 1. 设计理念 Linux 内核的 TCP 实现遵循以下核心设计理念：\n1.1 分层解耦 1 2 3 4 5 6 7 8 9 用户空间 socket()/connect()/send()/recv()/close() ───────────────────────────────────────────────────────────────────── BSD Socket 层 struct socket + proto_ops (inet_stream_ops) ───────────────────────────────────────────────────────────────────── 传输层 (TCP) struct sock/tcp_sock + struct proto (tcp_prot) ───────────────────────────────────────────────────────────────────── 网络层 (IP) ip_queue_xmit / ip_local_deliver ───────────────────────────────────────────────────────────────────── 链路层 dev_queue_xmit / netif_receive_skb BSD Socket 层（net/socket.c）：提供 POSIX 兼容的系统调用接口 INET 层（net/ipv4/af_inet.c）：IPv4 协议族的 socket 适配，通过 proto_ops 衔接上层 TCP 协议层：核心状态机、拥塞控制、可靠传输等纯 TCP 逻辑 IP 层：路由、分片、Netfilter 等网络层功能 1.2 面向对象的 C 语言设计 通过 结构体嵌套首成员 实现类似继承的效果：\n"><meta property='og:url' content='https://1bit2.github.io/p/linux-%E5%86%85%E6%A0%B8-tcp-%E5%8D%8F%E8%AE%AE%E5%AE%9E%E7%8E%B0%E6%9E%B6%E6%9E%84%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='架构'><meta property='article:tag' content='tcp_input'><meta property='article:tag' content='tcp_output'><meta property='article:tag' content='tcp_sock'><meta property='article:published_time' content='2026-04-16T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-16T00:00:00+00:00'><meta name=twitter:title content="Linux 内核 TCP 协议实现架构分析"><meta name=twitter:description content="Linux 内核 TCP 协议实现架构分析 基于 Linux 5.15.78 内核源码\n目录 1. 设计理念 2. 整体架构 3. 源码文件组织 4. 核心数据结构 5. 连接生命周期管理 6. 数据发送路径 7. 数据接收路径 8. 拥塞控制框架 9. 定时器体系 10. 关键设计模式 附录：关键文件索引 1. 设计理念 Linux 内核的 TCP 实现遵循以下核心设计理念：\n1.1 分层解耦 1 2 3 4 5 6 7 8 9 用户空间 socket()/connect()/send()/recv()/close() ───────────────────────────────────────────────────────────────────── BSD Socket 层 struct socket + proto_ops (inet_stream_ops) ───────────────────────────────────────────────────────────────────── 传输层 (TCP) struct sock/tcp_sock + struct proto (tcp_prot) ───────────────────────────────────────────────────────────────────── 网络层 (IP) ip_queue_xmit / ip_local_deliver ───────────────────────────────────────────────────────────────────── 链路层 dev_queue_xmit / netif_receive_skb BSD Socket 层（net/socket.c）：提供 POSIX 兼容的系统调用接口 INET 层（net/ipv4/af_inet.c）：IPv4 协议族的 socket 适配，通过 proto_ops 衔接上层 TCP 协议层：核心状态机、拥塞控制、可靠传输等纯 TCP 逻辑 IP 层：路由、分片、Netfilter 等网络层功能 1.2 面向对象的 C 语言设计 通过 结构体嵌套首成员 实现类似继承的效果：\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#目录>目录</a></li><li><a href=#1-设计理念>1. 设计理念</a><ol><li><a href=#11-分层解耦>1.1 分层解耦</a></li><li><a href=#12-面向对象的-c-语言设计>1.2 面向对象的 C 语言设计</a></li><li><a href=#13-可插拔的拥塞控制>1.3 可插拔的拥塞控制</a></li><li><a href=#14-快路径慢路径分离>1.4 快路径/慢路径分离</a></li><li><a href=#15-零拷贝与延迟优化>1.5 零拷贝与延迟优化</a></li></ol></li><li><a href=#2-整体架构>2. 整体架构</a><ol><li><a href=#21-tcp-子系统架构全景>2.1 TCP 子系统架构全景</a></li><li><a href=#22-socket-结构体继承层次>2.2 Socket 结构体继承层次</a></li></ol></li><li><a href=#3-源码文件组织>3. 源码文件组织</a><ol><li><a href=#31-核心实现文件>3.1 核心实现文件</a></li><li><a href=#32-子系统文件>3.2 子系统文件</a></li><li><a href=#33-拥塞控制算法>3.3 拥塞控制算法</a></li><li><a href=#34-头文件三层结构>3.4 头文件三层结构</a></li><li><a href=#35-inet-基础设施文件>3.5 INET 基础设施文件</a></li></ol></li><li><a href=#4-核心数据结构>4. 核心数据结构</a><ol><li><a href=#41-struct-tcp_congestion_ops拥塞控制回调表>4.1 <code>struct tcp_congestion_ops</code>（拥塞控制回调表）</a></li><li><a href=#42-struct-proto-tcp_prot协议操作表>4.2 <code>struct proto tcp_prot</code>（协议操作表）</a></li></ol></li><li><a href=#5-连接生命周期管理>5. 连接生命周期管理</a><ol><li><a href=#51-三次握手客户端主动连接>5.1 三次握手（客户端主动连接）</a></li><li><a href=#52-三次握手服务端被动监听>5.2 三次握手（服务端被动监听）</a></li><li><a href=#53-连接关闭与-time_wait>5.3 连接关闭与 TIME_WAIT</a></li><li><a href=#54-tcp-状态机全景>5.4 TCP 状态机全景</a></li></ol></li><li><a href=#6-数据发送路径>6. 数据发送路径</a><ol><li><a href=#61-发送路径调用链>6.1 发送路径调用链</a></li><li><a href=#62-发送路径关键决策>6.2 发送路径关键决策</a></li></ol></li><li><a href=#7-数据接收路径>7. 数据接收路径</a><ol><li><a href=#71-接收路径调用链>7.1 接收路径调用链</a></li><li><a href=#72-established-状态收包>7.2 ESTABLISHED 状态收包</a></li><li><a href=#73-ack-处理与拥塞控制调用>7.3 ACK 处理与拥塞控制调用</a></li><li><a href=#74-用户空间读取>7.4 用户空间读取</a></li></ol></li><li><a href=#8-拥塞控制框架>8. 拥塞控制框架</a><ol><li><a href=#81-框架架构>8.1 框架架构</a></li><li><a href=#82-拥塞状态机>8.2 拥塞状态机</a></li><li><a href=#83-cubic-vs-bbr-对比>8.3 CUBIC vs BBR 对比</a></li><li><a href=#84-速率估计-tcp_ratec>8.4 速率估计 (<code>tcp_rate.c</code>)</a></li><li><a href=#85-rack-丢包检测-tcp_recoveryc>8.5 RACK 丢包检测 (<code>tcp_recovery.c</code>)</a></li></ol></li><li><a href=#9-定时器体系>9. 定时器体系</a><ol><li><a href=#91-tcp-定时器全景>9.1 TCP 定时器全景</a></li></ol></li><li><a href=#10-关键设计模式>10. 关键设计模式</a><ol><li><a href=#101-协议注册机制>10.1 协议注册机制</a></li><li><a href=#102-backlog-机制>10.2 Backlog 机制</a></li><li><a href=#103-内存管理>10.3 内存管理</a></li><li><a href=#104-锁机制>10.4 锁机制</a></li></ol></li><li><a href=#附录关键文件索引>附录：关键文件索引</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/linux-%E5%86%85%E6%A0%B8-tcp-%E5%8D%8F%E8%AE%AE%E5%AE%9E%E7%8E%B0%E6%9E%B6%E6%9E%84%E5%88%86%E6%9E%90/>Linux 内核 TCP 协议实现架构分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 16, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>19 minute read</time></div></footer></div></header><section class=article-content><h1 id=linux-内核-tcp-协议实现架构分析>Linux 内核 TCP 协议实现架构分析</h1><blockquote><p>基于 Linux 5.15.78 内核源码</p></blockquote><h2 id=目录>目录</h2><ul><li><a class=link href=#1-%e8%ae%be%e8%ae%a1%e7%90%86%e5%bf%b5>1. 设计理念</a></li><li><a class=link href=#2-%e6%95%b4%e4%bd%93%e6%9e%b6%e6%9e%84>2. 整体架构</a></li><li><a class=link href=#3-%e6%ba%90%e7%a0%81%e6%96%87%e4%bb%b6%e7%bb%84%e7%bb%87>3. 源码文件组织</a></li><li><a class=link href=#4-%e6%a0%b8%e5%bf%83%e6%95%b0%e6%8d%ae%e7%bb%93%e6%9e%84>4. 核心数据结构</a></li><li><a class=link href=#5-%e8%bf%9e%e6%8e%a5%e7%94%9f%e5%91%bd%e5%91%a8%e6%9c%9f%e7%ae%a1%e7%90%86>5. 连接生命周期管理</a></li><li><a class=link href=#6-%e6%95%b0%e6%8d%ae%e5%8f%91%e9%80%81%e8%b7%af%e5%be%84>6. 数据发送路径</a></li><li><a class=link href=#7-%e6%95%b0%e6%8d%ae%e6%8e%a5%e6%94%b6%e8%b7%af%e5%be%84>7. 数据接收路径</a></li><li><a class=link href=#8-%e6%8b%a5%e5%a1%9e%e6%8e%a7%e5%88%b6%e6%a1%86%e6%9e%b6>8. 拥塞控制框架</a></li><li><a class=link href=#9-%e5%ae%9a%e6%97%b6%e5%99%a8%e4%bd%93%e7%b3%bb>9. 定时器体系</a></li><li><a class=link href=#10-%e5%85%b3%e9%94%ae%e8%ae%be%e8%ae%a1%e6%a8%a1%e5%bc%8f>10. 关键设计模式</a></li><li><a class=link href=#%e9%99%84%e5%bd%95%e5%85%b3%e9%94%ae%e6%96%87%e4%bb%b6%e7%b4%a2%e5%bc%95>附录：关键文件索引</a></li></ul><hr><h2 id=1-设计理念>1. 设计理念</h2><p>Linux 内核的 TCP 实现遵循以下核心设计理念：</p><h3 id=11-分层解耦>1.1 分层解耦</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间                    socket()/connect()/send()/recv()/close()
+</span></span><span class=line><span class=cl>─────────────────────────────────────────────────────────────────────
+</span></span><span class=line><span class=cl>BSD Socket 层               struct socket + proto_ops (inet_stream_ops)
+</span></span><span class=line><span class=cl>─────────────────────────────────────────────────────────────────────
+</span></span><span class=line><span class=cl>传输层 (TCP)                struct sock/tcp_sock + struct proto (tcp_prot)
+</span></span><span class=line><span class=cl>─────────────────────────────────────────────────────────────────────
+</span></span><span class=line><span class=cl>网络层 (IP)                 ip_queue_xmit / ip_local_deliver
+</span></span><span class=line><span class=cl>─────────────────────────────────────────────────────────────────────
+</span></span><span class=line><span class=cl>链路层                      dev_queue_xmit / netif_receive_skb
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong>BSD Socket 层</strong>（<code>net/socket.c</code>）：提供 POSIX 兼容的系统调用接口</li><li><strong>INET 层</strong>（<code>net/ipv4/af_inet.c</code>）：IPv4 协议族的 socket 适配，通过 <code>proto_ops</code> 衔接上层</li><li><strong>TCP 协议层</strong>：核心状态机、拥塞控制、可靠传输等纯 TCP 逻辑</li><li><strong>IP 层</strong>：路由、分片、Netfilter 等网络层功能</li></ul><h3 id=12-面向对象的-c-语言设计>1.2 面向对象的 C 语言设计</h3><p>通过 <strong>结构体嵌套首成员</strong> 实现类似继承的效果：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>struct sock → struct inet_sock → struct inet_connection_sock → struct tcp_sock
+</span></span></code></pre></td></tr></table></div></div><p>同一块内存可安全地在不同层之间强制类型转换（<code>(struct tcp_sock *)sk</code>），每一层只关心自己的字段。</p><h3 id=13-可插拔的拥塞控制>1.3 可插拔的拥塞控制</h3><p>通过 <code>struct tcp_congestion_ops</code> 函数指针表实现策略模式，支持运行时动态切换拥塞算法（CUBIC、BBR、Reno 等），甚至通过 BPF 注入自定义算法。</p><h3 id=14-快路径慢路径分离>1.4 快路径/慢路径分离</h3><p>收包路径针对最常见场景（按序到达、无特殊选项）设计了 <strong>快路径</strong>（<code>tcp_rcv_established</code> 中的 <code>pred_flags</code> 匹配），避免不必要的分支和锁开销。</p><h3 id=15-零拷贝与延迟优化>1.5 零拷贝与延迟优化</h3><ul><li>发送侧：<code>MSG_ZEROCOPY</code>、<code>sendfile</code>/<code>splice</code> 支持</li><li>接收侧：page fragment 机制、GRO/LRO 合并</li><li>TSO/GSO 卸载减少 CPU 开销</li></ul><hr><h2 id=2-整体架构>2. 整体架构</h2><h3 id=21-tcp-子系统架构全景>2.1 TCP 子系统架构全景</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                           用户空间 (User Space)                              │
+</span></span><span class=line><span class=cl>│         socket()   connect()   send()   recv()   close()   setsockopt()     │
+</span></span><span class=line><span class=cl>└─────────────────────────┬───────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                          │ 系统调用 (syscall)
+</span></span><span class=line><span class=cl>┌─────────────────────────▼───────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                      BSD Socket 层 (net/socket.c)                           │
+</span></span><span class=line><span class=cl>│                     struct socket + struct proto_ops                         │
+</span></span><span class=line><span class=cl>│                        inet_stream_ops (TCP)                                │
+</span></span><span class=line><span class=cl>└─────────────────────────┬───────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                          │
+</span></span><span class=line><span class=cl>┌─────────────────────────▼───────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                    INET 层 (net/ipv4/af_inet.c)                             │
+</span></span><span class=line><span class=cl>│              inet_create / inet_stream_connect / inet_release               │
+</span></span><span class=line><span class=cl>│             ┌───────────────────────────────────────────────┐               │
+</span></span><span class=line><span class=cl>│             │   struct proto: tcp_prot (tcp_ipv4.c)        │               │
+</span></span><span class=line><span class=cl>│             │   .connect = tcp_v4_connect                   │               │
+</span></span><span class=line><span class=cl>│             │   .close   = tcp_close                        │               │
+</span></span><span class=line><span class=cl>│             │   .sendmsg = tcp_sendmsg                      │               │
+</span></span><span class=line><span class=cl>│             │   .recvmsg = tcp_recvmsg                      │               │
+</span></span><span class=line><span class=cl>│             │   .backlog_rcv = tcp_v4_do_rcv                │               │
+</span></span><span class=line><span class=cl>│             └───────────────────────────────────────────────┘               │
+</span></span><span class=line><span class=cl>└─────────────────────────┬───────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                          │
+</span></span><span class=line><span class=cl>┌─────────────────────────▼───────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                         TCP 协议核心                                        │
+</span></span><span class=line><span class=cl>│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  │
+</span></span><span class=line><span class=cl>│  │  连接管理     │  │  数据发送     │  │  数据接收     │  │   定时器       │  │
+</span></span><span class=line><span class=cl>│  │ tcp_ipv4.c   │  │ tcp_output.c │  │ tcp_input.c  │  │  tcp_timer.c  │  │
+</span></span><span class=line><span class=cl>│  │ tcp.c        │  │              │  │              │  │               │  │
+</span></span><span class=line><span class=cl>│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └───────┬───────┘  │
+</span></span><span class=line><span class=cl>│         │                 │                 │                   │          │
+</span></span><span class=line><span class=cl>│  ┌──────▼─────────────────▼─────────────────▼───────────────────▼───────┐  │
+</span></span><span class=line><span class=cl>│  │                    拥塞控制框架 (tcp_cong.c)                          │  │
+</span></span><span class=line><span class=cl>│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────────┐  │  │
+</span></span><span class=line><span class=cl>│  │  │  CUBIC  │ │   BBR   │ │  Reno   │ │  DCTCP  │ │ BPF (自定义) │  │  │
+</span></span><span class=line><span class=cl>│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────────┘  │  │
+</span></span><span class=line><span class=cl>│  └────────────────────────────────────────────────────────────────────┘  │
+</span></span><span class=line><span class=cl>│  ┌────────────────────────┐  ┌────────────────────────────────────────┐  │
+</span></span><span class=line><span class=cl>│  │  丢包恢复               │  │  速率估计                              │  │
+</span></span><span class=line><span class=cl>│  │  tcp_recovery.c (RACK) │  │  tcp_rate.c (send/ack rate)           │  │
+</span></span><span class=line><span class=cl>│  └────────────────────────┘  └────────────────────────────────────────┘  │
+</span></span><span class=line><span class=cl>│  ┌────────────────────────┐  ┌────────────────────────────────────────┐  │
+</span></span><span class=line><span class=cl>│  │  轻量状态               │  │  TCP Fast Open                        │  │
+</span></span><span class=line><span class=cl>│  │  tcp_minisocks.c       │  │  tcp_fastopen.c                       │  │
+</span></span><span class=line><span class=cl>│  │  TIME_WAIT/SYN_RECV    │  │                                       │  │
+</span></span><span class=line><span class=cl>│  └────────────────────────┘  └────────────────────────────────────────┘  │
+</span></span><span class=line><span class=cl>│  ┌────────────────────────┐  ┌────────────────────────────────────────┐  │
+</span></span><span class=line><span class=cl>│  │  哈希表 &amp; 查找          │  │  SYN Cookie 防护                       │  │
+</span></span><span class=line><span class=cl>│  │  inet_hashtables.c     │  │  syncookies.c                         │  │
+</span></span><span class=line><span class=cl>│  │  inet_connection_sock.c│  │                                       │  │
+</span></span><span class=line><span class=cl>│  └────────────────────────┘  └────────────────────────────────────────┘  │
+</span></span><span class=line><span class=cl>└─────────────────────────┬───────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>                          │
+</span></span><span class=line><span class=cl>┌─────────────────────────▼───────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                       IP 层 (net/ipv4/ip_output.c 等)                       │
+</span></span><span class=line><span class=cl>│               ip_queue_xmit (发送) / ip_local_deliver (接收)                │
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=22-socket-结构体继承层次>2.2 Socket 结构体继承层次</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=err>┌─────────────────────────────────────────────────────────────┐</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>struct</span> <span class=n>socket</span> <span class=p>(</span><span class=n>BSD层</span><span class=p>,</span> <span class=n>include</span><span class=o>/</span><span class=n>linux</span><span class=o>/</span><span class=n>net</span><span class=o>.</span><span class=n>h</span><span class=p>)</span>                  <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>state</span><span class=p>:</span> <span class=n>socket_state</span> <span class=p>(</span><span class=n>SS_UNCONNECTED</span><span class=o>/</span><span class=n>CONNECTED</span><span class=o>...</span><span class=p>)</span>       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>type</span><span class=p>:</span> <span class=n>SOCK_STREAM</span>                                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>file</span><span class=p>:</span> <span class=err>关联的文件描述符</span>                                    <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>ops</span><span class=p>:</span> <span class=o>&amp;</span><span class=n>inet_stream_ops</span> <span class=p>(</span><span class=n>proto_ops</span><span class=p>)</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>└─</span> <span class=n>sk</span> <span class=err>──────────────┐</span>  <span class=p>(</span><span class=err>指针指向传输层控制块</span><span class=p>)</span>                <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>└──────────────────────┼──────────────────────────────────────┘</span>
+</span></span><span class=line><span class=cl>                       <span class=err>▼</span>
+</span></span><span class=line><span class=cl><span class=err>┌──────────────────────────────────────────────────────────────┐</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>struct</span> <span class=n>sock</span> <span class=p>(</span><span class=err>传输层基座</span><span class=p>,</span> <span class=n>include</span><span class=o>/</span><span class=n>net</span><span class=o>/</span><span class=n>sock</span><span class=o>.</span><span class=n>h</span><span class=p>)</span>                 <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>__sk_common</span><span class=p>:</span> <span class=n>sock_common</span>                                <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span>   <span class=err>├─</span> <span class=n>skc_daddr</span><span class=o>/</span><span class=n>skc_rcv_saddr</span><span class=p>:</span> <span class=err>目标</span><span class=o>/</span><span class=err>本地</span><span class=ne>IP</span>                <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span>   <span class=err>├─</span> <span class=n>skc_dport</span><span class=o>/</span><span class=n>skc_num</span><span class=p>:</span> <span class=err>目标</span><span class=o>/</span><span class=err>本地端口</span>                     <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span>   <span class=err>├─</span> <span class=n>skc_state</span><span class=p>:</span> <span class=n>TCP状态</span> <span class=p>(</span><span class=n>TCP_ESTABLISHED等</span><span class=p>)</span>              <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span>   <span class=err>└─</span> <span class=n>skc_prot</span><span class=p>:</span> <span class=o>&amp;</span><span class=n>tcp_prot</span>                                 <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>sk_receive_queue</span><span class=p>:</span> <span class=err>接收队列</span>                               <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>sk_write_queue</span><span class=p>:</span> <span class=err>发送队列</span>                                 <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>tcp_rtx_queue</span><span class=p>:</span> <span class=err>重传队列</span>                                  <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>sk_sndbuf</span><span class=o>/</span><span class=n>sk_rcvbuf</span><span class=p>:</span> <span class=err>缓冲区大小</span>                          <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>sk_data_ready</span><span class=p>():</span> <span class=err>数据就绪回调</span>                             <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>└─</span> <span class=n>sk_socket</span><span class=p>:</span> <span class=err>回指</span><span class=n>BSD</span> <span class=n>socket</span>                                <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>├──────────────────────────────────────────────────────────────┤</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>struct</span> <span class=n>inet_sock</span> <span class=p>(</span><span class=n>INET层</span><span class=p>,</span> <span class=n>include</span><span class=o>/</span><span class=n>net</span><span class=o>/</span><span class=n>inet_sock</span><span class=o>.</span><span class=n>h</span><span class=p>)</span>          <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=p>[</span><span class=err>包含</span> <span class=n>struct</span> <span class=n>sock</span> <span class=n>sk</span><span class=p>]</span>                                    <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>inet_saddr</span><span class=o>/</span><span class=n>inet_sport</span><span class=p>:</span> <span class=err>源</span><span class=ne>IP</span><span class=o>/</span><span class=err>端口</span>                         <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>inet_opt</span><span class=p>:</span> <span class=n>IP选项</span>                                         <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>tos</span><span class=p>:</span> <span class=err>服务类型</span>                                            <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>└─</span> <span class=n>cork</span><span class=p>:</span> <span class=err>累积发送控制</span>                                        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>├──────────────────────────────────────────────────────────────┤</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>struct</span> <span class=n>inet_connection_sock</span> <span class=p>(</span><span class=err>连接层</span><span class=p>,</span> <span class=n>inet_connection_sock</span><span class=o>.</span><span class=n>h</span><span class=p>)</span><span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=p>[</span><span class=err>包含</span> <span class=n>struct</span> <span class=n>inet_sock</span> <span class=n>icsk_inet</span><span class=p>]</span>                        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>icsk_accept_queue</span><span class=p>:</span> <span class=n>accept队列</span><span class=p>(</span><span class=err>全连接</span><span class=p>)</span>                    <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>icsk_retransmit_timer</span><span class=p>:</span> <span class=err>重传定时器</span>                        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>icsk_delack_timer</span><span class=p>:</span> <span class=err>延迟</span><span class=n>ACK定时器</span>                         <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>icsk_rto</span><span class=p>:</span> <span class=err>当前</span><span class=n>RTO值</span>                                     <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>icsk_ca_ops</span><span class=p>:</span> <span class=err>拥塞控制算法指针</span>                             <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>icsk_ca_state</span><span class=p>:</span> <span class=err>拥塞状态</span><span class=p>(</span><span class=n>Open</span><span class=o>/</span><span class=n>Disorder</span><span class=o>/</span><span class=n>CWR</span><span class=o>/</span><span class=n>Recovery</span><span class=o>/</span><span class=n>Loss</span><span class=p>)</span><span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>└─</span> <span class=n>icsk_ca_priv</span><span class=p>[]:</span> <span class=err>拥塞算法私有数据</span>                          <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>├──────────────────────────────────────────────────────────────┤</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=n>struct</span> <span class=n>tcp_sock</span> <span class=p>(</span><span class=n>TCP层</span><span class=p>,</span> <span class=n>include</span><span class=o>/</span><span class=n>linux</span><span class=o>/</span><span class=n>tcp</span><span class=o>.</span><span class=n>h</span><span class=p>)</span>                <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=p>[</span><span class=err>包含</span> <span class=n>struct</span> <span class=n>inet_connection_sock</span> <span class=n>inet_conn</span><span class=p>]</span>             <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=err>序列号</span><span class=p>:</span> <span class=n>rcv_nxt</span><span class=p>,</span> <span class=n>snd_nxt</span><span class=p>,</span> <span class=n>snd_una</span><span class=p>,</span> <span class=n>write_seq</span>            <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=err>窗口</span><span class=p>:</span> <span class=n>snd_wnd</span><span class=p>,</span> <span class=n>rcv_wnd</span><span class=p>,</span> <span class=n>window_clamp</span><span class=p>,</span> <span class=n>mss_cache</span>         <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>RTT</span><span class=p>:</span> <span class=n>srtt_us</span><span class=p>,</span> <span class=n>mdev_us</span><span class=p>,</span> <span class=n>rttvar_us</span>                        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=err>拥塞</span><span class=p>:</span> <span class=n>snd_cwnd</span><span class=p>,</span> <span class=n>snd_ssthresh</span><span class=p>,</span> <span class=n>packets_out</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=err>丢失</span><span class=p>:</span> <span class=n>lost_out</span><span class=p>,</span> <span class=n>sacked_out</span><span class=p>,</span> <span class=n>retrans_out</span>                 <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=err>速率</span><span class=p>:</span> <span class=n>delivered</span><span class=p>,</span> <span class=n>rate_delivered</span><span class=p>,</span> <span class=n>rate_interval_us</span>        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=err>乱序</span><span class=p>:</span> <span class=n>out_of_order_queue</span> <span class=p>(</span><span class=err>红黑树</span><span class=p>)</span>                        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=n>SACK</span><span class=p>:</span> <span class=n>selective_acks</span><span class=p>[],</span> <span class=n>rack</span>                             <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├─</span> <span class=err>定时器</span><span class=p>:</span> <span class=n>pacing_timer</span><span class=p>,</span> <span class=n>compressed_ack_timer</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>└─</span> <span class=err>快路径</span><span class=p>:</span> <span class=n>pred_flags</span>                                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>└──────────────────────────────────────────────────────────────┘</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=3-源码文件组织>3. 源码文件组织</h2><h3 id=31-核心实现文件>3.1 核心实现文件</h3><div class=table-wrapper><table><thead><tr><th>文件</th><th>行数(约)</th><th>职责</th></tr></thead><tbody><tr><td><code>net/ipv4/tcp.c</code></td><td>4882</td><td>TCP 通用逻辑：<code>tcp_sendmsg</code>/<code>tcp_recvmsg</code>/<code>tcp_close</code>、内存管理、poll</td></tr><tr><td><code>net/ipv4/tcp_input.c</code></td><td>8528</td><td><strong>最大文件</strong>：接收路径、ACK 处理、拥塞状态机、快速重传、SACK</td></tr><tr><td><code>net/ipv4/tcp_output.c</code></td><td>5185</td><td>发送引擎：<code>tcp_write_xmit</code>/<code>tcp_transmit_skb</code>、TSO/GSO、Nagle</td></tr><tr><td><code>net/ipv4/tcp_ipv4.c</code></td><td>4094</td><td>IPv4 专用：<code>tcp_v4_connect</code>/<code>tcp_v4_rcv</code>、<code>tcp_prot</code> 定义</td></tr><tr><td><code>net/ipv4/tcp_timer.c</code></td><td>803</td><td>定时器：RTO 重传、延迟 ACK、keepalive、零窗口探测</td></tr><tr><td><code>net/ipv4/tcp_minisocks.c</code></td><td>968</td><td>轻量状态：TIME_WAIT minisocket、<code>tcp_check_req</code></td></tr></tbody></table></div><h3 id=32-子系统文件>3.2 子系统文件</h3><div class=table-wrapper><table><thead><tr><th>文件</th><th>行数(约)</th><th>职责</th></tr></thead><tbody><tr><td><code>net/ipv4/tcp_cong.c</code></td><td>479</td><td>可插拔拥塞控制框架 + Reno 兜底</td></tr><tr><td><code>net/ipv4/tcp_recovery.c</code></td><td>243</td><td>RACK 丢包检测</td></tr><tr><td><code>net/ipv4/tcp_rate.c</code></td><td>214</td><td>投递速率估计（BBR 等使用）</td></tr><tr><td><code>net/ipv4/tcp_fastopen.c</code></td><td>599</td><td>TCP Fast Open</td></tr><tr><td><code>net/ipv4/tcp_metrics.c</code></td><td>1038</td><td>TCP 度量缓存</td></tr><tr><td><code>net/ipv4/tcp_offload.c</code></td><td>696</td><td>GRO/GSO 卸载路径</td></tr><tr><td><code>net/ipv4/tcp_ulp.c</code></td><td>162</td><td>上层协议框架（TLS 等）</td></tr><tr><td><code>net/ipv4/tcp_diag.c</code></td><td>239</td><td>诊断接口（ss 命令等）</td></tr></tbody></table></div><h3 id=33-拥塞控制算法>3.3 拥塞控制算法</h3><div class=table-wrapper><table><thead><tr><th>文件</th><th>算法</th><th>特点</th></tr></thead><tbody><tr><td><code>tcp_cubic.c</code></td><td><strong>CUBIC</strong></td><td>Linux 默认，三次函数窗口增长</td></tr><tr><td><code>tcp_bbr.c</code></td><td><strong>BBR</strong></td><td>基于带宽模型，非丢包驱动</td></tr><tr><td><code>tcp_dctcp.c</code></td><td>DCTCP</td><td>数据中心专用，ECN 驱动</td></tr><tr><td><code>tcp_westwood.c</code></td><td>Westwood+</td><td>带宽估计，无线友好</td></tr><tr><td><code>tcp_vegas.c</code></td><td>Vegas</td><td>基于延迟</td></tr><tr><td><code>tcp_htcp.c</code></td><td>H-TCP</td><td>高速长距网络</td></tr><tr><td><code>tcp_hybla.c</code></td><td>Hybla</td><td>卫星链路</td></tr><tr><td><code>tcp_illinois.c</code></td><td>Illinois</td><td>延迟+丢包混合</td></tr><tr><td><code>tcp_nv.c</code></td><td>NV (New Vegas)</td><td>低延迟数据中心</td></tr><tr><td><code>tcp_cdg.c</code></td><td>CDG</td><td>CAIA Delay-Gradient</td></tr><tr><td><code>tcp_bic.c</code></td><td>BIC</td><td>CUBIC 前身</td></tr><tr><td><code>tcp_veno.c</code></td><td>Veno</td><td>Vegas + Reno 混合</td></tr><tr><td><code>tcp_yeah.c</code></td><td>YeAH</td><td>Yet Another Highspeed</td></tr><tr><td><code>tcp_scalable.c</code></td><td>Scalable</td><td>简单高速</td></tr><tr><td><code>tcp_highspeed.c</code></td><td>HighSpeed</td><td>Sally Floyd 提出</td></tr><tr><td><code>tcp_lp.c</code></td><td>LP</td><td>低优先级</td></tr><tr><td><code>bpf_tcp_ca.c</code></td><td>BPF</td><td>eBPF 自定义拥塞控制</td></tr></tbody></table></div><h3 id=34-头文件三层结构>3.4 头文件三层结构</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>include/uapi/linux/tcp.h    ← 用户空间 ABI：tcphdr、socket 选项常量
+</span></span><span class=line><span class=cl>        ▲
+</span></span><span class=line><span class=cl>include/linux/tcp.h         ← 内核数据结构：tcp_sock、tcp_options_received
+</span></span><span class=line><span class=cl>        ▲
+</span></span><span class=line><span class=cl>include/net/tcp.h           ← TCP 子系统完整视图：函数声明、tcp_congestion_ops、常量
+</span></span></code></pre></td></tr></table></div></div><h3 id=35-inet-基础设施文件>3.5 INET 基础设施文件</h3><div class=table-wrapper><table><thead><tr><th>文件</th><th>职责</th></tr></thead><tbody><tr><td><code>net/ipv4/af_inet.c</code></td><td>PF_INET 协议族注册、<code>inet_create</code>、<code>inet_stream_ops</code></td></tr><tr><td><code>net/ipv4/inet_connection_sock.c</code></td><td>面向连接 socket 通用逻辑、accept 队列、端口绑定</td></tr><tr><td><code>net/ipv4/inet_hashtables.c</code></td><td>已连接/监听 socket 哈希查找</td></tr><tr><td><code>net/ipv4/inet_timewait_sock.c</code></td><td>TIME_WAIT socket 管理</td></tr><tr><td><code>net/ipv4/syncookies.c</code></td><td>SYN Cookie 抗洪泛攻击</td></tr></tbody></table></div><hr><h2 id=4-核心数据结构>4. 核心数据结构</h2><h3 id=41-struct-tcp_congestion_ops拥塞控制回调表>4.1 <code>struct tcp_congestion_ops</code>（拥塞控制回调表）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>tcp_congestion_ops</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* === 快路径回调（热缓存行） === */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>u32</span> <span class=p>(</span><span class=o>*</span><span class=n>ssthresh</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>                          <span class=cm>/* 必须：慢启动阈值 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>cong_avoid</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u32</span> <span class=n>ack</span><span class=p>,</span> <span class=n>u32</span> <span class=n>acked</span><span class=p>);</span>   <span class=cm>/* 窗口增长（与cong_control二选一） */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>set_state</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u8</span> <span class=n>new_state</span><span class=p>);</span>          <span class=cm>/* 拥塞状态变化通知 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>cwnd_event</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>enum</span> <span class=n>tcp_ca_event</span> <span class=n>ev</span><span class=p>);</span> <span class=cm>/* 窗口事件通知 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>in_ack_event</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u32</span> <span class=n>flags</span><span class=p>);</span>          <span class=cm>/* ACK 事件通知 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>pkts_acked</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>const</span> <span class=k>struct</span> <span class=n>ack_sample</span> <span class=o>*</span><span class=n>sample</span><span class=p>);</span> <span class=cm>/* RTT 采样 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>u32</span> <span class=p>(</span><span class=o>*</span><span class=n>min_tso_segs</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>                      <span class=cm>/* TSO 最小分段 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>cong_control</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>const</span> <span class=k>struct</span> <span class=n>rate_sample</span> <span class=o>*</span><span class=n>rs</span><span class=p>);</span> <span class=cm>/* 新式全权控制 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* === 慢路径回调 === */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>u32</span>  <span class=p>(</span><span class=o>*</span><span class=n>undo_cwnd</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>                        <span class=cm>/* 必须：撤销窗口减小 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>u32</span> <span class=p>(</span><span class=o>*</span><span class=n>sndbuf_expand</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>                     <span class=cm>/* 发送缓冲扩展因子 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>size_t</span> <span class=p>(</span><span class=o>*</span><span class=n>get_info</span><span class=p>)(...);</span>                                   <span class=cm>/* 诊断信息导出 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* === 元数据 === */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>char</span> <span class=n>name</span><span class=p>[</span><span class=n>TCP_CA_NAME_MAX</span><span class=p>];</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>module</span> <span class=o>*</span><span class=n>owner</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span> <span class=n>list</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>key</span><span class=p>,</span> <span class=n>flags</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=cm>/* === 生命周期 === */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>init</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>                             <span class=cm>/* 初始化私有数据 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>release</span><span class=p>)(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>);</span>                          <span class=cm>/* 清理私有数据 */</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>两种窗口控制模式</strong>：</p><ul><li><strong>传统模式</strong>（<code>cong_avoid</code>）：CUBIC、Reno 等，内核用 PRR 管理恢复阶段窗口</li><li><strong>新式模式</strong>（<code>cong_control</code>）：BBR 等，算法全权控制 cwnd 和 pacing rate</li></ul><h3 id=42-struct-proto-tcp_prot协议操作表>4.2 <code>struct proto tcp_prot</code>（协议操作表）</h3><p>定义在 <code>net/ipv4/tcp_ipv4.c</code>，将 TCP 操作挂接到 socket 层：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>proto</span> <span class=n>tcp_prot</span> <span class=o>=</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>name</span>       <span class=o>=</span> <span class=s>&#34;TCP&#34;</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>close</span>      <span class=o>=</span> <span class=n>tcp_close</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>connect</span>    <span class=o>=</span> <span class=n>tcp_v4_connect</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>accept</span>     <span class=o>=</span> <span class=n>inet_csk_accept</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>sendmsg</span>    <span class=o>=</span> <span class=n>tcp_sendmsg</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>recvmsg</span>    <span class=o>=</span> <span class=n>tcp_recvmsg</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>backlog_rcv</span> <span class=o>=</span> <span class=n>tcp_v4_do_rcv</span><span class=p>,</span>    <span class=cm>/* backlog 处理 */</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>init</span>       <span class=o>=</span> <span class=n>tcp_v4_init_sock</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>destroy</span>    <span class=o>=</span> <span class=n>tcp_v4_destroy_sock</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>setsockopt</span> <span class=o>=</span> <span class=n>tcp_setsockopt</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>getsockopt</span> <span class=o>=</span> <span class=n>tcp_getsockopt</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* ... */</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=5-连接生命周期管理>5. 连接生命周期管理</h2><blockquote><p>三次握手/四次挥手的详细源码分析参见 <a class=link href=TCP%e4%b8%89%e6%ac%a1%e6%8f%a1%e6%89%8b%e6%ba%90%e7%a0%81%e5%88%86%e6%9e%90.md>TCP 三次握手源码分析</a>、<a class=link href=TCP-listen%e6%93%8d%e4%bd%9c.md>TCP-listen 操作</a>、<a class=link href=TCP%e5%9b%9b%e6%ac%a1%e6%8c%a5%e6%89%8b%e4%b8%8eclose.md>TCP 四次挥手与 close</a>。</p></blockquote><h3 id=51-三次握手客户端主动连接>5.1 三次握手（客户端主动连接）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户调用 connect()
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/socket.c: __sys_connect()
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/af_inet.c: inet_stream_connect()
+</span></span><span class=line><span class=cl>     │ sock-&gt;ops-&gt;connect → sk-&gt;sk_prot-&gt;connect
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_ipv4.c: tcp_v4_connect()
+</span></span><span class=line><span class=cl>     │ 1. 路由查找
+</span></span><span class=line><span class=cl>     │ 2. 选择源端口 (inet_hash_connect)
+</span></span><span class=line><span class=cl>     │ 3. TCP_CLOSE → TCP_SYN_SENT
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_output.c: tcp_connect()
+</span></span><span class=line><span class=cl>     │ 1. tcp_connect_init()：初始化窗口/MSS
+</span></span><span class=line><span class=cl>     │ 2. tcp_init_nondata_skb(skb, TCPHDR_SYN)
+</span></span><span class=line><span class=cl>     │ 3. tcp_transmit_skb()：构造并发送 SYN
+</span></span><span class=line><span class=cl>     │ 4. inet_csk_reset_xmit_timer()：启动重传定时器
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>[等待 SYN-ACK]
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼ 收到 SYN-ACK
+</span></span><span class=line><span class=cl>net/ipv4/tcp_input.c: tcp_rcv_synsent_state_process()
+</span></span><span class=line><span class=cl>     │ tcp_finish_connect()
+</span></span><span class=line><span class=cl>     │ TCP_SYN_SENT → TCP_ESTABLISHED
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>connect() 返回成功
+</span></span></code></pre></td></tr></table></div></div><h3 id=52-三次握手服务端被动监听>5.2 三次握手（服务端被动监听）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>[IP 层收包]
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_ipv4.c: tcp_v4_rcv()
+</span></span><span class=line><span class=cl>     │ __inet_lookup_skb() 查找监听 socket
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_ipv4.c: tcp_v4_do_rcv() [TCP_LISTEN]
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_input.c: tcp_rcv_state_process() [TCP_LISTEN]
+</span></span><span class=line><span class=cl>     │ icsk-&gt;icsk_af_ops-&gt;conn_request
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_ipv4.c: tcp_v4_conn_request()
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_input.c: tcp_conn_request()
+</span></span><span class=line><span class=cl>     │ 1. 创建 request_sock（半连接）
+</span></span><span class=line><span class=cl>     │ 2. af_ops-&gt;send_synack() → 发送 SYN-ACK
+</span></span><span class=line><span class=cl>     │ 3. 半连接以 TCP_NEW_SYN_RECV 加入 ehash
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>[等待第三次 ACK]
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼ 收到 ACK
+</span></span><span class=line><span class=cl>net/ipv4/tcp_ipv4.c: tcp_v4_rcv() [TCP_NEW_SYN_RECV]
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_minisocks.c: tcp_check_req()
+</span></span><span class=line><span class=cl>     │ 1. 校验 ACK 合法性
+</span></span><span class=line><span class=cl>     │ 2. syn_recv_sock() → tcp_v4_syn_recv_sock()：创建子 socket
+</span></span><span class=line><span class=cl>     │ 3. inet_csk_complete_hashdance()：加入全连接队列
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>net/ipv4/tcp_minisocks.c: tcp_child_process()
+</span></span><span class=line><span class=cl>     │ tcp_rcv_state_process() → TCP_SYN_RECV → TCP_ESTABLISHED
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>accept() 返回子 socket
+</span></span></code></pre></td></tr></table></div></div><h3 id=53-连接关闭与-time_wait>5.3 连接关闭与 TIME_WAIT</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                主动关闭方                              被动关闭方
+</span></span><span class=line><span class=cl>                ─────────                              ─────────
+</span></span><span class=line><span class=cl>用户调用 close()
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>af_inet.c: inet_release()
+</span></span><span class=line><span class=cl>     │ sk-&gt;sk_prot-&gt;close
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>tcp.c: tcp_close() → __tcp_close()
+</span></span><span class=line><span class=cl>     │ tcp_close_state():
+</span></span><span class=line><span class=cl>     │ ESTABLISHED → FIN_WAIT1
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>tcp_output.c: tcp_send_fin()                    收到 FIN
+</span></span><span class=line><span class=cl>     │ 构造 FIN 包并发送                              │
+</span></span><span class=line><span class=cl>     │                                          tcp_input.c: tcp_fin()
+</span></span><span class=line><span class=cl>     │                                              │ ESTABLISHED → CLOSE_WAIT
+</span></span><span class=line><span class=cl>     │                                              │ 发送 ACK
+</span></span><span class=line><span class=cl>     ▼                                              ▼
+</span></span><span class=line><span class=cl>收到 ACK                                      用户调用 close()
+</span></span><span class=line><span class=cl>     │ FIN_WAIT1 → FIN_WAIT2                        │ CLOSE_WAIT → LAST_ACK
+</span></span><span class=line><span class=cl>     │                                              │ 发送 FIN
+</span></span><span class=line><span class=cl>     ▼                                              ▼
+</span></span><span class=line><span class=cl>收到 FIN                                      收到 ACK
+</span></span><span class=line><span class=cl>     │ tcp_fin():                                   │ LAST_ACK → CLOSE
+</span></span><span class=line><span class=cl>     │ FIN_WAIT2 → TIME_WAIT                        │ tcp_done()
+</span></span><span class=line><span class=cl>     │ 发送 ACK                                      ▼
+</span></span><span class=line><span class=cl>     ▼                                          socket 释放
+</span></span><span class=line><span class=cl>tcp_minisocks.c: tcp_time_wait()
+</span></span><span class=line><span class=cl>     │ 1. 分配 inet_timewait_sock（轻量级）
+</span></span><span class=line><span class=cl>     │ 2. 设置 TCP_TIMEWAIT_LEN (60s) 超时
+</span></span><span class=line><span class=cl>     │ 3. inet_twsk_hashdance()：替换原 sock
+</span></span><span class=line><span class=cl>     │ 4. tcp_done(sk)：释放原 sock
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>[等待 2MSL]
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>超时后释放 timewait sock
+</span></span></code></pre></td></tr></table></div></div><h3 id=54-tcp-状态机全景>5.4 TCP 状态机全景</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                              ┌────────────┐
+</span></span><span class=line><span class=cl>                    ┌────────&gt;│   CLOSED    │&lt;────────┐
+</span></span><span class=line><span class=cl>                    │         └─────┬──────┘         │
+</span></span><span class=line><span class=cl>                    │               │                │
+</span></span><span class=line><span class=cl>              tcp_done()     socket()/bind()     超时/RST
+</span></span><span class=line><span class=cl>                    │               │                │
+</span></span><span class=line><span class=cl>                    │         ┌─────▼──────┐         │
+</span></span><span class=line><span class=cl>                    │    ┌───&gt;│   LISTEN    │         │
+</span></span><span class=line><span class=cl>                    │    │    └─────┬──────┘         │
+</span></span><span class=line><span class=cl>                    │    │    收到SYN│                │
+</span></span><span class=line><span class=cl>                    │    │         │                 │
+</span></span><span class=line><span class=cl>          ┌────────┴────┴──┐  ┌───▼──────────┐     │
+</span></span><span class=line><span class=cl>    ┌────&gt;│   LAST_ACK     │  │ SYN_RECEIVED │     │
+</span></span><span class=line><span class=cl>    │     └────────────────┘  └───┬──────────┘     │
+</span></span><span class=line><span class=cl>    │          ▲                  │收到ACK         │
+</span></span><span class=line><span class=cl>    │     发FIN│            ┌─────▼──────┐         │
+</span></span><span class=line><span class=cl>    │          │    ┌──────&gt;│ESTABLISHED │&lt;────┐    │
+</span></span><span class=line><span class=cl>    │     ┌────┴────┴──┐    └─────┬──────┘     │    │
+</span></span><span class=line><span class=cl>    │     │CLOSE_WAIT  │&lt;────────┘│            │    │
+</span></span><span class=line><span class=cl>    │     └────────────┘  收到FIN  │发FIN       │    │
+</span></span><span class=line><span class=cl>    │                             │            │    │
+</span></span><span class=line><span class=cl>    │                       ┌─────▼──────┐     │    │
+</span></span><span class=line><span class=cl>    │              connect()│ SYN_SENT   │─────┘    │
+</span></span><span class=line><span class=cl>    │                       └─────┬──────┘ 收到     │
+</span></span><span class=line><span class=cl>    │                             │      SYN+ACK    │
+</span></span><span class=line><span class=cl>    │                       ┌─────▼──────┐          │
+</span></span><span class=line><span class=cl>    │                       │ FIN_WAIT1  │          │
+</span></span><span class=line><span class=cl>    │                       └─────┬──────┘          │
+</span></span><span class=line><span class=cl>    │                        收到ACK│                │
+</span></span><span class=line><span class=cl>    │                       ┌─────▼──────┐          │
+</span></span><span class=line><span class=cl>    │                       │ FIN_WAIT2  │          │
+</span></span><span class=line><span class=cl>    │                       └─────┬──────┘          │
+</span></span><span class=line><span class=cl>    │                        收到FIN│                │
+</span></span><span class=line><span class=cl>    │                       ┌─────▼──────┐          │
+</span></span><span class=line><span class=cl>    └───────────────────────│ TIME_WAIT  │──────────┘
+</span></span><span class=line><span class=cl>                            └────────────┘
+</span></span><span class=line><span class=cl>                              等待 2MSL
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=6-数据发送路径>6. 数据发送路径</h2><blockquote><p>发送路径的完整源码分析（18 章）参见 <a class=link href=TCP%e5%8f%91%e9%80%81%e5%85%a8%e8%b7%af%e5%be%84.md>TCP 发送全路径</a>。</p></blockquote><h3 id=61-发送路径调用链>6.1 发送路径调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>tcp_sendmsg()                          ← 系统调用入口
+</span></span><span class=line><span class=cl>  └─ tcp_sendmsg_locked()
+</span></span><span class=line><span class=cl>       │
+</span></span><span class=line><span class=cl>       ├─ [循环] while (msg_data_left(msg))
+</span></span><span class=line><span class=cl>       │    ├─ sk_stream_alloc_skb()    ← 分配 skb
+</span></span><span class=line><span class=cl>       │    ├─ tcp_skb_entail()         ← 挂到发送队列
+</span></span><span class=line><span class=cl>       │    ├─ skb_add_data_nocache()   ← 线性区拷贝
+</span></span><span class=line><span class=cl>       │    │  或 skb_copy_to_page_nocache() + skb_fill_page_desc()  ← 分页拷贝
+</span></span><span class=line><span class=cl>       │    └─ [条件] forced_push → __tcp_push_pending_frames()
+</span></span><span class=line><span class=cl>       │
+</span></span><span class=line><span class=cl>       └─ tcp_push()                   ← 触发实际发送
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>            ├─ [检查] tcp_should_autocork()  ← 自动 cork 优化
+</span></span><span class=line><span class=cl>            └─ __tcp_push_pending_frames()
+</span></span><span class=line><span class=cl>                 │
+</span></span><span class=line><span class=cl>                 └─ tcp_write_xmit()         ← 核心发送循环
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      ├─ [循环] while (skb = tcp_send_head(sk))
+</span></span><span class=line><span class=cl>                      │    ├─ tcp_pacing_check()     ← pacing 限速
+</span></span><span class=line><span class=cl>                      │    ├─ tcp_cwnd_test()         ← 拥塞窗口检查
+</span></span><span class=line><span class=cl>                      │    ├─ tcp_snd_wnd_test()      ← 发送窗口检查
+</span></span><span class=line><span class=cl>                      │    ├─ tcp_nagle_test()         ← Nagle 算法
+</span></span><span class=line><span class=cl>                      │    ├─ tcp_tso_should_defer()   ← TSO 延迟
+</span></span><span class=line><span class=cl>                      │    ├─ tso_fragment()            ← TSO 分段
+</span></span><span class=line><span class=cl>                      │    ├─ tcp_small_queue_check()   ← 小队列限制
+</span></span><span class=line><span class=cl>                      │    └─ tcp_transmit_skb()        ← 构造并发送
+</span></span><span class=line><span class=cl>                      │
+</span></span><span class=line><span class=cl>                      └─ tcp_transmit_skb()
+</span></span><span class=line><span class=cl>                           │
+</span></span><span class=line><span class=cl>                           └─ __tcp_transmit_skb()
+</span></span><span class=line><span class=cl>                                ├─ 构造 TCP 头 (tcphdr)
+</span></span><span class=line><span class=cl>                                ├─ 添加 TCP 选项 (timestamp/SACK/etc)
+</span></span><span class=line><span class=cl>                                ├─ 计算校验和
+</span></span><span class=line><span class=cl>                                └─ icsk_af_ops-&gt;queue_xmit()
+</span></span><span class=line><span class=cl>                                     │
+</span></span><span class=line><span class=cl>                                     └─ ip_queue_xmit()  ← 进入 IP 层
+</span></span></code></pre></td></tr></table></div></div><h3 id=62-发送路径关键决策>6.2 发送路径关键决策</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                    ┌──────────────┐
+</span></span><span class=line><span class=cl>                    │ tcp_push()   │
+</span></span><span class=line><span class=cl>                    └──────┬───────┘
+</span></span><span class=line><span class=cl>                           │
+</span></span><span class=line><span class=cl>                    ┌──────▼───────┐    是
+</span></span><span class=line><span class=cl>                    │ autocork?    ├──────→ 延迟发送（等更多数据）
+</span></span><span class=line><span class=cl>                    └──────┬───────┘
+</span></span><span class=line><span class=cl>                           │ 否
+</span></span><span class=line><span class=cl>                    ┌──────▼───────────────┐
+</span></span><span class=line><span class=cl>                    │ tcp_write_xmit 循环   │
+</span></span><span class=line><span class=cl>                    └──────┬───────────────┘
+</span></span><span class=line><span class=cl>                           │
+</span></span><span class=line><span class=cl>              ┌────────────▼────────────┐
+</span></span><span class=line><span class=cl>              │ 1. pacing 检查           │── 超速 → break (hrtimer 回调后重试)
+</span></span><span class=line><span class=cl>              │ 2. cwnd 检查             │── 窗口满 → break
+</span></span><span class=line><span class=cl>              │ 3. rwnd 检查             │── 对端窗口满 → break
+</span></span><span class=line><span class=cl>              │ 4. Nagle 检查            │── 数据不够 → break
+</span></span><span class=line><span class=cl>              │ 5. TSO defer 检查        │── 值得等待 → break
+</span></span><span class=line><span class=cl>              │ 6. small queue 检查      │── 队列过长 → break
+</span></span><span class=line><span class=cl>              └────────────┬────────────┘
+</span></span><span class=line><span class=cl>                           │ 全部通过
+</span></span><span class=line><span class=cl>              ┌────────────▼────────────┐
+</span></span><span class=line><span class=cl>              │  tcp_transmit_skb()     │
+</span></span><span class=line><span class=cl>              │  构造 TCP 头 + 发送      │
+</span></span><span class=line><span class=cl>              └─────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=7-数据接收路径>7. 数据接收路径</h2><blockquote><p>接收路径的完整源码分析参见 <a class=link href=TCP%e6%8e%a5%e6%94%b6%e8%b7%af%e5%be%84%e6%b7%b1%e5%ba%a6%e5%88%86%e6%9e%90.md>TCP 接收路径深度分析</a>。</p></blockquote><h3 id=71-接收路径调用链>7.1 接收路径调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>[网卡中断 → NAPI → GRO]
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>ip_local_deliver()
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>tcp_v4_rcv()                               ← IP 层分发入口
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ├─ __inet_lookup_skb()                ← 四元组哈希查找 socket
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ├─ [TCP_TIME_WAIT] → tcp_timewait_state_process()
+</span></span><span class=line><span class=cl>     ├─ [TCP_NEW_SYN_RECV] → tcp_check_req()
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     └─ [普通 socket]
+</span></span><span class=line><span class=cl>          ├─ bh_lock_sock()
+</span></span><span class=line><span class=cl>          ├─ [socket 未被用户锁定]
+</span></span><span class=line><span class=cl>          │    └─ tcp_v4_do_rcv()
+</span></span><span class=line><span class=cl>          └─ [socket 被用户锁定]
+</span></span><span class=line><span class=cl>               └─ tcp_add_backlog()         ← release_sock 时再处理
+</span></span></code></pre></td></tr></table></div></div><h3 id=72-established-状态收包>7.2 ESTABLISHED 状态收包</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>tcp_v4_do_rcv()
+</span></span><span class=line><span class=cl>     │ sk_state == TCP_ESTABLISHED
+</span></span><span class=line><span class=cl>     ▼
+</span></span><span class=line><span class=cl>tcp_rcv_established()                      ← 核心收包处理
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ├─ [快路径条件满足] pred_flags 匹配 + 按序到达
+</span></span><span class=line><span class=cl>     │    │
+</span></span><span class=line><span class=cl>     │    ├─ [纯 ACK (len == header_len)]
+</span></span><span class=line><span class=cl>     │    │    ├─ tcp_ack()                ← ACK 处理
+</span></span><span class=line><span class=cl>     │    │    └─ tcp_data_snd_check()     ← 可能触发新发送
+</span></span><span class=line><span class=cl>     │    │
+</span></span><span class=line><span class=cl>     │    └─ [带数据]
+</span></span><span class=line><span class=cl>     │         ├─ 校验和验证
+</span></span><span class=line><span class=cl>     │         ├─ tcp_queue_rcv()          ← 按序入队
+</span></span><span class=line><span class=cl>     │         ├─ tcp_ack()
+</span></span><span class=line><span class=cl>     │         ├─ __tcp_ack_snd_check()   ← 决定是否发 ACK
+</span></span><span class=line><span class=cl>     │         └─ tcp_data_ready()         ← 唤醒用户进程
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     └─ [慢路径]
+</span></span><span class=line><span class=cl>          ├─ tcp_validate_incoming()       ← 合法性检查
+</span></span><span class=line><span class=cl>          ├─ tcp_ack()                     ← ACK 处理（含拥塞控制）
+</span></span><span class=line><span class=cl>          ├─ tcp_urg()                     ← 紧急数据
+</span></span><span class=line><span class=cl>          ├─ tcp_data_queue()              ← 数据排队
+</span></span><span class=line><span class=cl>          │    ├─ [按序] tcp_queue_rcv() → tcp_ofo_queue() → tcp_data_ready()
+</span></span><span class=line><span class=cl>          │    ├─ [重复] D-SACK → drop
+</span></span><span class=line><span class=cl>          │    ├─ [部分重叠] 裁剪 → 入队
+</span></span><span class=line><span class=cl>          │    └─ [乱序] tcp_data_queue_ofo()  ← 红黑树管理
+</span></span><span class=line><span class=cl>          ├─ tcp_data_snd_check()
+</span></span><span class=line><span class=cl>          └─ tcp_ack_snd_check()
+</span></span></code></pre></td></tr></table></div></div><h3 id=73-ack-处理与拥塞控制调用>7.3 ACK 处理与拥塞控制调用</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>tcp_ack()                                  ← ACK 核心处理
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ├─ 更新 snd_una（确认序列号推进）
+</span></span><span class=line><span class=cl>     ├─ tcp_clean_rtx_queue()              ← 清理重传队列中已确认的包
+</span></span><span class=line><span class=cl>     │    ├─ tcp_rate_skb_delivered()      ← 速率采样
+</span></span><span class=line><span class=cl>     │    └─ tcp_ack_update_rtt()          ← RTT 更新
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ├─ tcp_fastretrans_alert()            ← 拥塞状态机
+</span></span><span class=line><span class=cl>     │    ├─ [TCP_CA_Recovery] → 恢复中处理
+</span></span><span class=line><span class=cl>     │    ├─ [TCP_CA_Loss] → tcp_process_loss()
+</span></span><span class=line><span class=cl>     │    ├─ RACK 丢包检测 / Reno 丢包检测
+</span></span><span class=line><span class=cl>     │    └─ tcp_enter_recovery() / tcp_enter_loss()
+</span></span><span class=line><span class=cl>     │         └─ tcp_init_cwnd_reduction()
+</span></span><span class=line><span class=cl>     │              └─ icsk_ca_ops-&gt;ssthresh()
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ├─ tcp_rate_gen()                     ← 生成速率样本
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ├─ tcp_cong_control()                 ← 拥塞控制决策
+</span></span><span class=line><span class=cl>     │    ├─ [有 cong_control] → icsk_ca_ops-&gt;cong_control(sk, rs)  ← BBR
+</span></span><span class=line><span class=cl>     │    ├─ [cwnd reduction 中] → tcp_cwnd_reduction() (PRR)
+</span></span><span class=line><span class=cl>     │    └─ [正常增长] → tcp_cong_avoid()
+</span></span><span class=line><span class=cl>     │         └─ icsk_ca_ops-&gt;cong_avoid()                        ← CUBIC
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     └─ tcp_xmit_recovery()               ← 触发重传
+</span></span></code></pre></td></tr></table></div></div><h3 id=74-用户空间读取>7.4 用户空间读取</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>tcp_recvmsg()
+</span></span><span class=line><span class=cl>  └─ tcp_recvmsg_locked()
+</span></span><span class=line><span class=cl>       │
+</span></span><span class=line><span class=cl>       ├─ [循环] 按 copied_seq 在 sk_receive_queue 中查找
+</span></span><span class=line><span class=cl>       │    ├─ skb_copy_datagram_msg()    ← 拷贝到用户缓冲区
+</span></span><span class=line><span class=cl>       │    ├─ 推进 copied_seq
+</span></span><span class=line><span class=cl>       │    └─ sk_eat_skb()               ← 释放已读 skb
+</span></span><span class=line><span class=cl>       │
+</span></span><span class=line><span class=cl>       ├─ [无数据] sk_wait_data()         ← 阻塞等待
+</span></span><span class=line><span class=cl>       │
+</span></span><span class=line><span class=cl>       └─ tcp_cleanup_rbuf()              ← 窗口更新、可能发 ACK
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=8-拥塞控制框架>8. 拥塞控制框架</h2><h3 id=81-框架架构>8.1 框架架构</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                   拥塞控制框架 (tcp_cong.c)                      │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  tcp_cong_list ──→ [cubic] ──→ [bbr] ──→ [reno] ──→ ...       │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  tcp_register_congestion_control()   注册算法                    │
+</span></span><span class=line><span class=cl>│  tcp_set_congestion_control()        运行时切换                  │
+</span></span><span class=line><span class=cl>│  tcp_assign_congestion_control()     新连接分配默认算法           │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────────────────────────────────────┐   │
+</span></span><span class=line><span class=cl>│  │            net-&gt;ipv4.tcp_congestion_control             │   │
+</span></span><span class=line><span class=cl>│  │              （每个网络命名空间的默认算法指针）              │   │
+</span></span><span class=line><span class=cl>│  │              若模块加载失败 → 回退到 tcp_reno             │   │
+</span></span><span class=line><span class=cl>│  └─────────────────────────────────────────────────────────┘   │
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                    回调触发时机                                    │
+</span></span><span class=line><span class=cl>│                                                                  │
+</span></span><span class=line><span class=cl>│  ┌────────────┐                                                  │
+</span></span><span class=line><span class=cl>│  │  tcp_ack() │──→ in_ack_event() ──→ pkts_acked()              │
+</span></span><span class=line><span class=cl>│  │  (收到ACK) │──→ tcp_fastretrans_alert()                       │
+</span></span><span class=line><span class=cl>│  │            │     ├─ tcp_enter_recovery() → ssthresh()         │
+</span></span><span class=line><span class=cl>│  │            │     └─ tcp_enter_loss() → ssthresh() + set_state()│
+</span></span><span class=line><span class=cl>│  │            │──→ tcp_rate_gen()                                 │
+</span></span><span class=line><span class=cl>│  │            │──→ tcp_cong_control()                             │
+</span></span><span class=line><span class=cl>│  │            │     ├─ cong_control(rs)   [BBR 路径]              │
+</span></span><span class=line><span class=cl>│  │            │     ├─ tcp_cwnd_reduction() [PRR, Recovery 中]    │
+</span></span><span class=line><span class=cl>│  │            │     └─ cong_avoid()       [CUBIC 路径]            │
+</span></span><span class=line><span class=cl>│  └────────────┘                                                  │
+</span></span><span class=line><span class=cl>│                                                                  │
+</span></span><span class=line><span class=cl>│  ┌──────────────────┐                                            │
+</span></span><span class=line><span class=cl>│  │ 状态变化          │──→ set_state()                             │
+</span></span><span class=line><span class=cl>│  │ 窗口事件          │──→ cwnd_event() (CA_EVENT_*)              │
+</span></span><span class=line><span class=cl>│  │ 连接建立/初始化    │──→ init()                                 │
+</span></span><span class=line><span class=cl>│  │ 连接关闭          │──→ release()                               │
+</span></span><span class=line><span class=cl>│  │ 发送恢复后        │──→ cwnd_event(CA_EVENT_TX_START)           │
+</span></span><span class=line><span class=cl>│  └──────────────────┘                                            │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=82-拥塞状态机>8.2 拥塞状态机</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                   ┌──────────────────┐
+</span></span><span class=line><span class=cl>                   │  TCP_CA_Open      │ ← 正常传输
+</span></span><span class=line><span class=cl>                   │  正常增长 cwnd    │
+</span></span><span class=line><span class=cl>                   └────────┬─────────┘
+</span></span><span class=line><span class=cl>                            │ DupACK / SACK / ECE
+</span></span><span class=line><span class=cl>                   ┌────────▼─────────┐
+</span></span><span class=line><span class=cl>                   │ TCP_CA_Disorder   │ ← 检测到异常
+</span></span><span class=line><span class=cl>                   │ 可能乱序或丢包    │
+</span></span><span class=line><span class=cl>                   └────────┬─────────┘
+</span></span><span class=line><span class=cl>                       ┌────┴────┐
+</span></span><span class=line><span class=cl>                  ECE确认│        │ 确认丢包
+</span></span><span class=line><span class=cl>                   ┌────▼────┐  ┌▼───────────┐
+</span></span><span class=line><span class=cl>                   │TCP_CA_CWR│  │TCP_CA_Recovery│ ← 快速恢复
+</span></span><span class=line><span class=cl>                   │ECN 窗口  │  │PRR 恢复中      │
+</span></span><span class=line><span class=cl>                   │减小      │  │重传丢失包       │
+</span></span><span class=line><span class=cl>                   └────┬────┘  └──┬──────────┘
+</span></span><span class=line><span class=cl>                        │         │
+</span></span><span class=line><span class=cl>                        │    RTO超时│
+</span></span><span class=line><span class=cl>                        │    ┌────▼─────────┐
+</span></span><span class=line><span class=cl>                        │    │ TCP_CA_Loss    │ ← RTO 超时
+</span></span><span class=line><span class=cl>                        │    │ cwnd=1, 慢启动 │
+</span></span><span class=line><span class=cl>                        │    └────┬──────────┘
+</span></span><span class=line><span class=cl>                        │         │
+</span></span><span class=line><span class=cl>                   ┌────▼─────────▼──┐
+</span></span><span class=line><span class=cl>                   │  恢复完成         │
+</span></span><span class=line><span class=cl>                   │  CA_EVENT_COMPLETE│
+</span></span><span class=line><span class=cl>                   │  _CWR            │
+</span></span><span class=line><span class=cl>                   └────────┬─────────┘
+</span></span><span class=line><span class=cl>                            │
+</span></span><span class=line><span class=cl>                   ┌────────▼─────────┐
+</span></span><span class=line><span class=cl>                   │   TCP_CA_Open     │
+</span></span><span class=line><span class=cl>                   └──────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=83-cubic-vs-bbr-对比>8.3 CUBIC vs BBR 对比</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                    CUBIC (传统模式)                                │
+</span></span><span class=line><span class=cl>│                                                                  │
+</span></span><span class=line><span class=cl>│  注册方式: tcp_register_congestion_control(&amp;cubictcp)             │
+</span></span><span class=line><span class=cl>│  控制路径: cong_avoid → cubictcp_cong_avoid()                    │
+</span></span><span class=line><span class=cl>│  窗口增长: W(t) = C*(t-K)³ + W_max  (三次函数)                   │
+</span></span><span class=line><span class=cl>│  丢包响应: ssthresh → cubictcp_recalc_ssthresh() → β*cwnd       │
+</span></span><span class=line><span class=cl>│  恢复方式: 由内核 PRR (tcp_cwnd_reduction) 管理                   │
+</span></span><span class=line><span class=cl>│                                                                  │
+</span></span><span class=line><span class=cl>│  调用链: tcp_cong_control()                                      │
+</span></span><span class=line><span class=cl>│          └─ tcp_cong_avoid()                                     │
+</span></span><span class=line><span class=cl>│               └─ cubictcp_cong_avoid()                           │
+</span></span><span class=line><span class=cl>│                    ├─ tcp_slow_start()     (cwnd &lt; ssthresh)     │
+</span></span><span class=line><span class=cl>│                    └─ bictcp_update()      (拥塞避免)             │
+</span></span><span class=line><span class=cl>│                         └─ tcp_cong_avoid_ai()                   │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                    BBR (新式模式)                                  │
+</span></span><span class=line><span class=cl>│                                                                  │
+</span></span><span class=line><span class=cl>│  注册方式: tcp_register_congestion_control(&amp;tcp_bbr_cong_ops)     │
+</span></span><span class=line><span class=cl>│  控制路径: cong_control → bbr_main()                             │
+</span></span><span class=line><span class=cl>│  带宽模型: BtlBw = max(delivery_rate) over sliding window       │
+</span></span><span class=line><span class=cl>│  延迟模型: RTprop = min(RTT) over sliding window                 │
+</span></span><span class=line><span class=cl>│  pacing:  pacing_rate = pacing_gain * BtlBw                     │
+</span></span><span class=line><span class=cl>│  cwnd:    cwnd = cwnd_gain * BDP                                 │
+</span></span><span class=line><span class=cl>│  恢复方式: BBR 自主管理，不依赖内核 PRR                            │
+</span></span><span class=line><span class=cl>│                                                                  │
+</span></span><span class=line><span class=cl>│  调用链: tcp_cong_control()                                      │
+</span></span><span class=line><span class=cl>│          └─ bbr_main(sk, rs)                                     │
+</span></span><span class=line><span class=cl>│               ├─ bbr_update_model()                              │
+</span></span><span class=line><span class=cl>│               │    ├─ bbr_update_bw()                            │
+</span></span><span class=line><span class=cl>│               │    ├─ bbr_update_cycle_phase()                   │
+</span></span><span class=line><span class=cl>│               │    ├─ bbr_check_full_bw_reached()                │
+</span></span><span class=line><span class=cl>│               │    ├─ bbr_check_drain()                          │
+</span></span><span class=line><span class=cl>│               │    └─ bbr_update_min_rtt()                       │
+</span></span><span class=line><span class=cl>│               └─ bbr_update_control_parameters()                 │
+</span></span><span class=line><span class=cl>│                    ├─ bbr_set_pacing_rate()                       │
+</span></span><span class=line><span class=cl>│                    ├─ bbr_set_tso_segs_goal()                    │
+</span></span><span class=line><span class=cl>│                    └─ bbr_set_cwnd()                              │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=84-速率估计-tcp_ratec>8.4 速率估计 (<code>tcp_rate.c</code>)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                   速率估计流程                                    │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  发送时:                                                         │
+</span></span><span class=line><span class=cl>│  tcp_transmit_skb() → tcp_rate_skb_sent()                       │
+</span></span><span class=line><span class=cl>│     └─ 记录到 skb: first_tx_mstamp, delivered_mstamp,           │
+</span></span><span class=line><span class=cl>│                     delivered, app_limited                       │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  确认时:                                                         │
+</span></span><span class=line><span class=cl>│  tcp_clean_rtx_queue() → tcp_rate_skb_delivered()               │
+</span></span><span class=line><span class=cl>│     └─ 从 skb 恢复发送时快照，合并到 rate_sample                  │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  ACK 处理末尾:                                                   │
+</span></span><span class=line><span class=cl>│  tcp_rate_gen()                                                  │
+</span></span><span class=line><span class=cl>│     ├─ delivered = tp-&gt;delivered - rs-&gt;prior_delivered           │
+</span></span><span class=line><span class=cl>│     ├─ interval = max(snd_interval, ack_interval)               │
+</span></span><span class=line><span class=cl>│     │            ← 缓解 ACK 压缩                                │
+</span></span><span class=line><span class=cl>│     ├─ bw ≈ delivered / interval                                │
+</span></span><span class=line><span class=cl>│     └─ 标记 app_limited 样本                                    │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  拥塞控制使用:                                                    │
+</span></span><span class=line><span class=cl>│  tcp_cong_control(sk, rs) → bbr_main(sk, rs)                   │
+</span></span><span class=line><span class=cl>│     └─ rs-&gt;delivered, rs-&gt;interval_us, rs-&gt;rtt_us 等            │
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=85-rack-丢包检测-tcp_recoveryc>8.5 RACK 丢包检测 (<code>tcp_recovery.c</code>)</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>传统方式 (DupACK 计数):
+</span></span><span class=line><span class=cl>  3 个重复 ACK → 判定丢包 → 快速重传
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>RACK (Recent ACKnowledgment):
+</span></span><span class=line><span class=cl>  ┌─────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>  │  核心思想: 基于时间而非计数                                    │
+</span></span><span class=line><span class=cl>  │                                                             │
+</span></span><span class=line><span class=cl>  │  如果一个更晚发送的包被确认了，                                │
+</span></span><span class=line><span class=cl>  │  那么更早发送但仍未确认的包可能已丢失                          │
+</span></span><span class=line><span class=cl>  │                                                             │
+</span></span><span class=line><span class=cl>  │  判定条件:                                                    │
+</span></span><span class=line><span class=cl>  │  当前时间 - skb-&gt;发送时间 &gt; rack.rtt_us + 重排序窗口          │
+</span></span><span class=line><span class=cl>  │                                                             │
+</span></span><span class=line><span class=cl>  │  优点: 对尾丢失、重传丢失更敏感                               │
+</span></span><span class=line><span class=cl>  └─────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  调用路径:
+</span></span><span class=line><span class=cl>  tcp_ack() → tcp_fastretrans_alert()
+</span></span><span class=line><span class=cl>       └─ tcp_identify_packet_loss()
+</span></span><span class=line><span class=cl>            ├─ [RACK] tcp_rack_mark_lost()
+</span></span><span class=line><span class=cl>            │    └─ tcp_rack_detect_loss()
+</span></span><span class=line><span class=cl>            │         └─ 扫描 tsorted_sent_queue，按时间标记丢失
+</span></span><span class=line><span class=cl>            └─ [Reno] tcp_newreno_mark_lost()
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=9-定时器体系>9. 定时器体系</h2><h3 id=91-tcp-定时器全景>9.1 TCP 定时器全景</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌─────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                   TCP 定时器体系 (tcp_timer.c)                    │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────┐  ┌────────────────────────────┐   │
+</span></span><span class=line><span class=cl>│  │  重传定时器 (RTO)         │  │  延迟 ACK 定时器            │   │
+</span></span><span class=line><span class=cl>│  │  icsk_retransmit_timer  │  │  icsk_delack_timer         │   │
+</span></span><span class=line><span class=cl>│  │                         │  │                            │   │
+</span></span><span class=line><span class=cl>│  │  超时后:                 │  │  最多延迟 200ms 后发送 ACK  │   │
+</span></span><span class=line><span class=cl>│  │  tcp_retransmit_timer() │  │  tcp_delack_timer()        │   │
+</span></span><span class=line><span class=cl>│  │  → tcp_enter_loss()     │  │  → tcp_send_ack()          │   │
+</span></span><span class=line><span class=cl>│  │  → tcp_retransmit_skb() │  │                            │   │
+</span></span><span class=line><span class=cl>│  │  → 指数退避 RTO         │  │                            │   │
+</span></span><span class=line><span class=cl>│  └─────────────────────────┘  └────────────────────────────┘   │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────┐  ┌────────────────────────────┐   │
+</span></span><span class=line><span class=cl>│  │  Keepalive 定时器        │  │  零窗口探测定时器            │   │
+</span></span><span class=line><span class=cl>│  │  tcp_keepalive_timer()  │  │  tcp_probe_timer()         │   │
+</span></span><span class=line><span class=cl>│  │                         │  │                            │   │
+</span></span><span class=line><span class=cl>│  │  空闲连接探活            │  │  对端窗口为 0 时周期性探测   │   │
+</span></span><span class=line><span class=cl>│  │  默认 2 小时             │  │  发送 1 字节数据            │   │
+</span></span><span class=line><span class=cl>│  └─────────────────────────┘  └────────────────────────────┘   │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────┐  ┌────────────────────────────┐   │
+</span></span><span class=line><span class=cl>│  │  Pacing 定时器 (hrtimer) │  │  SYNACK 重传定时器          │   │
+</span></span><span class=line><span class=cl>│  │  tcp_pace_kick()        │  │  tcp_fastopen_synack_timer()│   │
+</span></span><span class=line><span class=cl>│  │                         │  │                            │   │
+</span></span><span class=line><span class=cl>│  │  控制发包速率(BBR等)     │  │  SYN-ACK 超时重传           │   │
+</span></span><span class=line><span class=cl>│  │  高精度定时器            │  │                            │   │
+</span></span><span class=line><span class=cl>│  └─────────────────────────┘  └────────────────────────────┘   │
+</span></span><span class=line><span class=cl>│                                                                 │
+</span></span><span class=line><span class=cl>│  ┌─────────────────────────┐  ┌────────────────────────────┐   │
+</span></span><span class=line><span class=cl>│  │  TLP 定时器              │  │  TIME_WAIT 定时器           │   │
+</span></span><span class=line><span class=cl>│  │  (Tail Loss Probe)      │  │  inet_twsk_schedule()      │   │
+</span></span><span class=line><span class=cl>│  │  tcp_send_loss_probe()  │  │                            │   │
+</span></span><span class=line><span class=cl>│  │                         │  │  60 秒后释放 tw_sock        │   │
+</span></span><span class=line><span class=cl>│  │  尾部丢包探测            │  │  (TCP_TIMEWAIT_LEN)        │   │
+</span></span><span class=line><span class=cl>│  └─────────────────────────┘  └────────────────────────────┘   │
+</span></span><span class=line><span class=cl>└─────────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=10-关键设计模式>10. 关键设计模式</h2><h3 id=101-协议注册机制>10.1 协议注册机制</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>inet_init() (af_inet.c)
+</span></span><span class=line><span class=cl>     │
+</span></span><span class=line><span class=cl>     ├─ proto_register(&amp;tcp_prot)          ← 注册 struct proto（传输层 slab）
+</span></span><span class=line><span class=cl>     ├─ sock_register(&amp;inet_family_ops)    ← 注册 PF_INET 族（create = inet_create）
+</span></span><span class=line><span class=cl>     ├─ inet_add_protocol(&amp;tcp_protocol)   ← IP 层 protocol=6 → tcp_v4_rcv
+</span></span><span class=line><span class=cl>     └─ inet_register_protosw()            ← SOCK_STREAM → tcp_prot + inet_stream_ops
+</span></span></code></pre></td></tr></table></div></div><h3 id=102-backlog-机制>10.2 Backlog 机制</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                ┌───────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>                │        socket 被用户进程持锁时              │
+</span></span><span class=line><span class=cl>                │                                           │
+</span></span><span class=line><span class=cl>  tcp_v4_rcv()  │   bh_lock_sock()                          │
+</span></span><span class=line><span class=cl>       │        │        │                                  │
+</span></span><span class=line><span class=cl>       ▼        │        ▼                                  │
+</span></span><span class=line><span class=cl>  sock_owned    │   sock_owned_by_user(sk) == true          │
+</span></span><span class=line><span class=cl>  _by_user?─────│──→ tcp_add_backlog(sk, skb)               │
+</span></span><span class=line><span class=cl>       │        │        │ skb 进入 sk_backlog 队列          │
+</span></span><span class=line><span class=cl>       │ false  │        └─────────────────┐                │
+</span></span><span class=line><span class=cl>       ▼        │                          │                │
+</span></span><span class=line><span class=cl>  tcp_v4_do_rcv │                          ▼                │
+</span></span><span class=line><span class=cl>  (直接处理)     │                    release_sock()         │
+</span></span><span class=line><span class=cl>                │                    __release_sock()       │
+</span></span><span class=line><span class=cl>                │                    └─ tcp_v4_do_rcv()     │
+</span></span><span class=line><span class=cl>                │                       (延迟处理 backlog)   │
+</span></span><span class=line><span class=cl>                └───────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=103-内存管理>10.3 内存管理</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>TCP 内存管理三级架构:
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>1. 全局级: sysctl_tcp_mem[3] (low/pressure/high)
+</span></span><span class=line><span class=cl>   └─ tcp_memory_pressure 标志控制全局限流
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>2. Socket 级: sk_sndbuf / sk_rcvbuf
+</span></span><span class=line><span class=cl>   └─ sk_wmem_queued / sk_rmem_alloc 追踪实际使用量
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>3. 应用级: SO_SNDBUF / SO_RCVBUF 用户可调
+</span></span><span class=line><span class=cl>   └─ tcp_sndbuf_expand() / tcp_grow_window() 自动调整
+</span></span></code></pre></td></tr></table></div></div><h3 id=104-锁机制>10.4 锁机制</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>TCP socket 的两把锁:
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>1. sock_lock (sk_lock.slock)
+</span></span><span class=line><span class=cl>   └─ 自旋锁，保护底半部（软中断）访问
+</span></span><span class=line><span class=cl>   └─ bh_lock_sock() / bh_unlock_sock()
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>2. socket_lock (sk_lock.owned)
+</span></span><span class=line><span class=cl>   └─ 睡眠锁，保护用户上下文访问
+</span></span><span class=line><span class=cl>   └─ lock_sock() / release_sock()
+</span></span><span class=line><span class=cl>   └─ owned=1 时底半部走 backlog
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>配合机制:
+</span></span><span class=line><span class=cl>   用户持锁 → 底半部进 backlog → release_sock 时处理 backlog
+</span></span><span class=line><span class=cl>   避免了用户上下文和软中断的竞争
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=附录关键文件索引>附录：关键文件索引</h2><div class=table-wrapper><table><thead><tr><th>文件路径</th><th>行数</th><th>核心函数</th></tr></thead><tbody><tr><td><code>net/ipv4/tcp.c</code></td><td>~4882</td><td><code>tcp_sendmsg</code>, <code>tcp_recvmsg</code>, <code>tcp_close</code>, <code>tcp_init_sock</code></td></tr><tr><td><code>net/ipv4/tcp_input.c</code></td><td>~8528</td><td><code>tcp_rcv_established</code>, <code>tcp_rcv_state_process</code>, <code>tcp_ack</code>, <code>tcp_data_queue</code>, <code>tcp_fastretrans_alert</code></td></tr><tr><td><code>net/ipv4/tcp_output.c</code></td><td>~5185</td><td><code>tcp_write_xmit</code>, <code>tcp_transmit_skb</code>, <code>tcp_connect</code>, <code>tcp_send_fin</code>, <code>tcp_retransmit_skb</code></td></tr><tr><td><code>net/ipv4/tcp_ipv4.c</code></td><td>~4094</td><td><code>tcp_v4_rcv</code>, <code>tcp_v4_connect</code>, <code>tcp_v4_do_rcv</code>, <code>tcp_prot</code></td></tr><tr><td><code>net/ipv4/tcp_timer.c</code></td><td>~803</td><td><code>tcp_retransmit_timer</code>, <code>tcp_delack_timer</code>, <code>tcp_keepalive_timer</code></td></tr><tr><td><code>net/ipv4/tcp_minisocks.c</code></td><td>~968</td><td><code>tcp_time_wait</code>, <code>tcp_check_req</code>, <code>tcp_child_process</code></td></tr><tr><td><code>net/ipv4/tcp_cong.c</code></td><td>~479</td><td><code>tcp_register_congestion_control</code>, <code>tcp_set_congestion_control</code></td></tr><tr><td><code>net/ipv4/tcp_recovery.c</code></td><td>~243</td><td><code>tcp_rack_mark_lost</code>, <code>tcp_rack_detect_loss</code></td></tr><tr><td><code>net/ipv4/tcp_rate.c</code></td><td>~214</td><td><code>tcp_rate_skb_sent</code>, <code>tcp_rate_gen</code></td></tr><tr><td><code>net/ipv4/tcp_bbr.c</code></td><td>~2285</td><td><code>bbr_main</code>, <code>bbr_update_model</code>, <code>bbr_set_cwnd</code></td></tr><tr><td><code>net/ipv4/tcp_cubic.c</code></td><td>~533</td><td><code>cubictcp_cong_avoid</code>, <code>bictcp_update</code></td></tr><tr><td><code>net/ipv4/tcp_fastopen.c</code></td><td>~599</td><td><code>tcp_fastopen_create_child</code>, <code>tcp_fastopen_cookie_check</code></td></tr><tr><td><code>net/ipv4/af_inet.c</code></td><td>~2305</td><td><code>inet_create</code>, <code>inet_stream_connect</code>, <code>inet_init</code></td></tr><tr><td><code>net/ipv4/inet_connection_sock.c</code></td><td>~1411</td><td><code>inet_csk_accept</code>, <code>inet_csk_complete_hashdance</code></td></tr><tr><td><code>net/ipv4/inet_hashtables.c</code></td><td>~900</td><td><code>__inet_lookup_established</code>, <code>inet_hash_connect</code></td></tr><tr><td><code>include/net/tcp.h</code></td><td>~2492</td><td><code>tcp_congestion_ops</code>, 函数声明, 内联辅助</td></tr><tr><td><code>include/linux/tcp.h</code></td><td>~531</td><td><code>struct tcp_sock</code></td></tr><tr><td><code>include/uapi/linux/tcp.h</code></td><td>~407</td><td><code>struct tcphdr</code>, socket 选项常量</td></tr></tbody></table></div><hr><blockquote><p><strong>拥塞控制四大机制的完整源码分析</strong>（慢启动、拥塞避免、丢包检测、PRR 快速恢复）已独立为 <strong><a class=link href=TCP%e6%8b%a5%e5%a1%9e%e6%8e%a7%e5%88%b6%e5%9b%9b%e5%a4%a7%e6%9c%ba%e5%88%b6.md>TCP 拥塞控制四大机制</a></strong>。</p></blockquote></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/%E6%9E%B6%E6%9E%84/>架构</a>
+<a href=/tags/tcp_input/>Tcp_input</a>
+<a href=/tags/tcp_output/>Tcp_output</a>
+<a href=/tags/tcp_sock/>Tcp_sock</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

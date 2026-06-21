@@ -1,0 +1,401 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='Netfilter 框架与钩子机制 基于 Linux 5.15.78 源码。从"为什么在 IP 层设钩子"出发，分析 5 个钩子点的精确位置、触发时序、优先级链、NF_HOOK 宏的工作机制，以及 conntrack/NAT 如何挂载到钩子上。\n一、Netfilter 解决什么问题 内核需要在数据包经过网络协议栈的过程中插入检查点，让防火墙规则（iptables/nftables）、NAT、连接跟踪等模块能够检查、修改或丢弃数据包，而不需要修改协议栈本身的代码。\nNetfilter 的方案：在 IP 层的关键路径上埋入 5 个钩子点（hook point），任何内核模块都可以向这些钩子注册回调函数。数据包经过钩子时，依次调用所有注册的回调。\n二、为什么钩子在 IP 层 2.1 IP 层是唯一的流量汇聚点 1 2 3 4 5 6 7 8 9 TCP UDP ICMP SCTP ... ← 传输层（种类繁多） \\ | / / ▼ ▼ ▼ ▼ ┌──────────────────┐ │ IP 层 │ ← 所有包的必经之路 └──────────────────┘ / | \\ ▼ ▼ ▼ eth0 wlan0 ppp0 ... ← 链路层（种类繁多） 传输层种类太多（TCP/UDP/ICMP/SCTP&mldr;），逐个加钩子不现实且无法统一管理。链路层只看 MAC 地址，无法基于 IP 地址/端口做过滤。IP 层是唯一能同时看到网络地址信息、覆盖所有协议流量的位置。\n'><title>Netfilter 框架与钩子机制</title><link rel=canonical href=https://1bit2.github.io/p/netfilter-%E6%A1%86%E6%9E%B6%E4%B8%8E%E9%92%A9%E5%AD%90%E6%9C%BA%E5%88%B6/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Netfilter 框架与钩子机制"><meta property='og:description' content='Netfilter 框架与钩子机制 基于 Linux 5.15.78 源码。从"为什么在 IP 层设钩子"出发，分析 5 个钩子点的精确位置、触发时序、优先级链、NF_HOOK 宏的工作机制，以及 conntrack/NAT 如何挂载到钩子上。\n一、Netfilter 解决什么问题 内核需要在数据包经过网络协议栈的过程中插入检查点，让防火墙规则（iptables/nftables）、NAT、连接跟踪等模块能够检查、修改或丢弃数据包，而不需要修改协议栈本身的代码。\nNetfilter 的方案：在 IP 层的关键路径上埋入 5 个钩子点（hook point），任何内核模块都可以向这些钩子注册回调函数。数据包经过钩子时，依次调用所有注册的回调。\n二、为什么钩子在 IP 层 2.1 IP 层是唯一的流量汇聚点 1 2 3 4 5 6 7 8 9 TCP UDP ICMP SCTP ... ← 传输层（种类繁多） \\ | / / ▼ ▼ ▼ ▼ ┌──────────────────┐ │ IP 层 │ ← 所有包的必经之路 └──────────────────┘ / | \\ ▼ ▼ ▼ eth0 wlan0 ppp0 ... ← 链路层（种类繁多） 传输层种类太多（TCP/UDP/ICMP/SCTP&mldr;），逐个加钩子不现实且无法统一管理。链路层只看 MAC 地址，无法基于 IP 地址/端口做过滤。IP 层是唯一能同时看到网络地址信息、覆盖所有协议流量的位置。\n'><meta property='og:url' content='https://1bit2.github.io/p/netfilter-%E6%A1%86%E6%9E%B6%E4%B8%8E%E9%92%A9%E5%AD%90%E6%9C%BA%E5%88%B6/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='netfilter'><meta property='article:tag' content='iptables'><meta property='article:tag' content='nftables'><meta property='article:tag' content='NF_HOOK'><meta property='article:tag' content='PRE_ROUTING'><meta property='article:tag' content='POST_ROUTING'><meta property='article:tag' content='FORWARD'><meta property='article:tag' content='INPUT'><meta property='article:tag' content='OUTPUT'><meta property='article:tag' content='conntrack'><meta property='article:tag' content='NAT'><meta property='article:tag' content='DNAT'><meta property='article:tag' content='SNAT'><meta property='article:published_time' content='2026-05-07T00:00:00+00:00'><meta property='article:modified_time' content='2026-05-07T00:00:00+00:00'><meta name=twitter:title content="Netfilter 框架与钩子机制"><meta name=twitter:description content='Netfilter 框架与钩子机制 基于 Linux 5.15.78 源码。从"为什么在 IP 层设钩子"出发，分析 5 个钩子点的精确位置、触发时序、优先级链、NF_HOOK 宏的工作机制，以及 conntrack/NAT 如何挂载到钩子上。\n一、Netfilter 解决什么问题 内核需要在数据包经过网络协议栈的过程中插入检查点，让防火墙规则（iptables/nftables）、NAT、连接跟踪等模块能够检查、修改或丢弃数据包，而不需要修改协议栈本身的代码。\nNetfilter 的方案：在 IP 层的关键路径上埋入 5 个钩子点（hook point），任何内核模块都可以向这些钩子注册回调函数。数据包经过钩子时，依次调用所有注册的回调。\n二、为什么钩子在 IP 层 2.1 IP 层是唯一的流量汇聚点 1 2 3 4 5 6 7 8 9 TCP UDP ICMP SCTP ... ← 传输层（种类繁多） \\ | / / ▼ ▼ ▼ ▼ ┌──────────────────┐ │ IP 层 │ ← 所有包的必经之路 └──────────────────┘ / | \\ ▼ ▼ ▼ eth0 wlan0 ppp0 ... ← 链路层（种类繁多） 传输层种类太多（TCP/UDP/ICMP/SCTP&mldr;），逐个加钩子不现实且无法统一管理。链路层只看 MAC 地址，无法基于 IP 地址/端口做过滤。IP 层是唯一能同时看到网络地址信息、覆盖所有协议流量的位置。\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一netfilter-解决什么问题>一、Netfilter 解决什么问题</a></li><li><a href=#二为什么钩子在-ip-层>二、为什么钩子在 IP 层</a><ol><li><a href=#21-ip-层是唯一的流量汇聚点>2.1 IP 层是唯一的流量汇聚点</a></li><li><a href=#22-ip-层有路由决策>2.2 IP 层有路由决策</a></li><li><a href=#23-nat-必须配合路由>2.3 NAT 必须配合路由</a></li></ol></li><li><a href=#三5-个钩子点的定义>三、5 个钩子点的定义</a></li><li><a href=#四5-个钩子的精确位置与流量路径>四、5 个钩子的精确位置与流量路径</a><ol><li><a href=#41-全景图>4.1 全景图</a></li><li><a href=#42-每个钩子的源码位置>4.2 每个钩子的源码位置</a></li><li><a href=#43-三种流量经过的钩子>4.3 三种流量经过的钩子</a></li><li><a href=#44-源码验证pre_routing>4.4 源码验证：PRE_ROUTING</a></li><li><a href=#45-源码验证local_out-vs-post_routing>4.5 源码验证：LOCAL_OUT vs POST_ROUTING</a></li></ol></li><li><a href=#五nf_hook-宏的工作机制>五、NF_HOOK 宏的工作机制</a><ol><li><a href=#51-宏定义>5.1 宏定义</a></li><li><a href=#52-钩子函数的返回值>5.2 钩子函数的返回值</a></li><li><a href=#53-执行流程>5.3 执行流程</a></li></ol></li><li><a href=#六钩子优先级--同一钩子上的执行顺序>六、钩子优先级 — 同一钩子上的执行顺序</a><ol><li><a href=#61-以-pre_routing-为例>6.1 以 PRE_ROUTING 为例</a></li></ol></li><li><a href=#七钩子注册机制>七、钩子注册机制</a><ol><li><a href=#71-注册结构体>7.1 注册结构体</a></li><li><a href=#72-注册示例conntrack>7.2 注册示例（conntrack）</a></li></ol></li><li><a href=#八iptables-四表五链与钩子的映射>八、iptables 四表五链与钩子的映射</a></li><li><a href=#九网络调试工具速查>九、网络调试工具速查</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/netfilter-%E6%A1%86%E6%9E%B6%E4%B8%8E%E9%92%A9%E5%AD%90%E6%9C%BA%E5%88%B6/>Netfilter 框架与钩子机制</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>May 07, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>7 minute read</time></div></footer></div></header><section class=article-content><h1 id=netfilter-框架与钩子机制>Netfilter 框架与钩子机制</h1><blockquote><p>基于 Linux 5.15.78 源码。从"为什么在 IP 层设钩子"出发，分析 5 个钩子点的精确位置、触发时序、优先级链、NF_HOOK 宏的工作机制，以及 conntrack/NAT 如何挂载到钩子上。</p></blockquote><h2 id=一netfilter-解决什么问题>一、Netfilter 解决什么问题</h2><p>内核需要在数据包经过网络协议栈的过程中<strong>插入检查点</strong>，让防火墙规则（iptables/nftables）、NAT、连接跟踪等模块能够检查、修改或丢弃数据包，而不需要修改协议栈本身的代码。</p><p>Netfilter 的方案：在 IP 层的关键路径上埋入 <strong>5 个钩子点（hook point）</strong>，任何内核模块都可以向这些钩子注册回调函数。数据包经过钩子时，依次调用所有注册的回调。</p><h2 id=二为什么钩子在-ip-层>二、为什么钩子在 IP 层</h2><h3 id=21-ip-层是唯一的流量汇聚点>2.1 IP 层是唯一的流量汇聚点</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>      TCP   UDP   ICMP   SCTP   ...       ← 传输层（种类繁多）
+</span></span><span class=line><span class=cl>        \    |    /     /
+</span></span><span class=line><span class=cl>         ▼   ▼  ▼    ▼
+</span></span><span class=line><span class=cl>      ┌──────────────────┐
+</span></span><span class=line><span class=cl>      │      IP 层        │  ← 所有包的必经之路
+</span></span><span class=line><span class=cl>      └──────────────────┘
+</span></span><span class=line><span class=cl>         /    |     \
+</span></span><span class=line><span class=cl>        ▼    ▼      ▼
+</span></span><span class=line><span class=cl>      eth0  wlan0  ppp0  ...              ← 链路层（种类繁多）
+</span></span></code></pre></td></tr></table></div></div><p>传输层种类太多（TCP/UDP/ICMP/SCTP&mldr;），逐个加钩子不现实且无法统一管理。链路层只看 MAC 地址，无法基于 IP 地址/端口做过滤。<strong>IP 层是唯一能同时看到网络地址信息、覆盖所有协议流量的位置。</strong></p><h3 id=22-ip-层有路由决策>2.2 IP 层有路由决策</h3><p>防火墙需要区分三种流量：进入本机的、本机发出的、经过本机转发的。这个三岔路口的判断发生在 <strong>IP 层的路由查找</strong> — 只有 IP 层有路由表，只有路由查找后才能确定包是"给本机"还是"要转发"。</p><h3 id=23-nat-必须配合路由>2.3 NAT 必须配合路由</h3><ul><li>DNAT（改目的地址）必须在路由之前做 — 改了目的地址，路由结果才会变</li><li>SNAT（改源地址）必须在路由之后做 — 需要知道从哪个网卡出去才能决定伪装成什么地址</li></ul><p>这种与路由的紧密配合只有在 IP 层才能实现。</p><h2 id=三5-个钩子点的定义>三、5 个钩子点的定义</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/uapi/linux/netfilter.h:42
+</span></span></span><span class=line><span class=cl><span class=k>enum</span> <span class=n>nf_inet_hooks</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>NF_INET_PRE_ROUTING</span><span class=p>,</span>   <span class=c1>// 0 — 收到包，路由之前
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_INET_LOCAL_IN</span><span class=p>,</span>      <span class=c1>// 1 — 路由判定&#34;给本机&#34;之后
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_INET_FORWARD</span><span class=p>,</span>       <span class=c1>// 2 — 路由判定&#34;要转发&#34;之后
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_INET_LOCAL_OUT</span><span class=p>,</span>     <span class=c1>// 3 — 本机发出包，路由之前
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_INET_POST_ROUTING</span><span class=p>,</span>  <span class=c1>// 4 — 路由之后，发往网卡之前
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_INET_NUMHOOKS</span><span class=p>,</span>      <span class=c1>// 5 — 计数
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h2 id=四5-个钩子的精确位置与流量路径>四、5 个钩子的精确位置与流量路径</h2><h3 id=41-全景图>4.1 全景图</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                              网卡收到数据包
+</span></span><span class=line><span class=cl>                                    │
+</span></span><span class=line><span class=cl>                                    ▼
+</span></span><span class=line><span class=cl>                              ┌───────────┐
+</span></span><span class=line><span class=cl>                              │  ip_rcv() │  校验 IP 头
+</span></span><span class=line><span class=cl>                              └─────┬─────┘
+</span></span><span class=line><span class=cl>                                    │
+</span></span><span class=line><span class=cl>                  ① NF_INET_PRE_ROUTING ──── DNAT 在这里做（改目的地址）
+</span></span><span class=line><span class=cl>                                    │          conntrack 开始跟踪
+</span></span><span class=line><span class=cl>                                    ▼
+</span></span><span class=line><span class=cl>                            ┌───────────────┐
+</span></span><span class=line><span class=cl>                            │   路由决策     │  查路由表
+</span></span><span class=line><span class=cl>                            └───┬───────┬───┘
+</span></span><span class=line><span class=cl>                  目的是本机 │           │ 目的是其他机器
+</span></span><span class=line><span class=cl>                              │           │
+</span></span><span class=line><span class=cl>              ② NF_INET_LOCAL_IN    ③ NF_INET_FORWARD
+</span></span><span class=line><span class=cl>                (iptables INPUT)      (iptables FORWARD)
+</span></span><span class=line><span class=cl>                              │           │
+</span></span><span class=line><span class=cl>                              ▼           │
+</span></span><span class=line><span class=cl>                       ┌──────────┐       │
+</span></span><span class=line><span class=cl>                       │  传输层   │       │
+</span></span><span class=line><span class=cl>                       │ TCP/UDP  │       │
+</span></span><span class=line><span class=cl>                       └────┬─────┘       │
+</span></span><span class=line><span class=cl>                            │             │
+</span></span><span class=line><span class=cl>                    本机进程发出的包       │
+</span></span><span class=line><span class=cl>                            │             │
+</span></span><span class=line><span class=cl>              ④ NF_INET_LOCAL_OUT         │
+</span></span><span class=line><span class=cl>                (iptables OUTPUT)         │
+</span></span><span class=line><span class=cl>                            │             │
+</span></span><span class=line><span class=cl>                            ▼             ▼
+</span></span><span class=line><span class=cl>                            ┌───────────────┐
+</span></span><span class=line><span class=cl>                            │   路由决策     │
+</span></span><span class=line><span class=cl>                            └───────┬───────┘
+</span></span><span class=line><span class=cl>                                    │
+</span></span><span class=line><span class=cl>                  ⑤ NF_INET_POST_ROUTING ── SNAT 在这里做（改源地址）
+</span></span><span class=line><span class=cl>                                    │         conntrack 确认
+</span></span><span class=line><span class=cl>                                    ▼
+</span></span><span class=line><span class=cl>                              ┌───────────┐
+</span></span><span class=line><span class=cl>                              │  网卡发送  │
+</span></span><span class=line><span class=cl>                              └───────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=42-每个钩子的源码位置>4.2 每个钩子的源码位置</h3><div class=table-wrapper><table><thead><tr><th>#</th><th>钩子</th><th>函数</th><th>源码位置</th><th>触发时机</th></tr></thead><tbody><tr><td>①</td><td><code>NF_INET_PRE_ROUTING</code></td><td><code>ip_rcv()</code></td><td><code>net/ipv4/ip_input.c:599</code></td><td>IP 头校验通过，路由查找之前</td></tr><tr><td>②</td><td><code>NF_INET_LOCAL_IN</code></td><td><code>ip_local_deliver()</code></td><td><code>net/ipv4/ip_input.c:307</code></td><td>路由判定目的是本机，分片重组之后</td></tr><tr><td>③</td><td><code>NF_INET_FORWARD</code></td><td><code>ip_forward()</code></td><td><code>net/ipv4/ip_forward.c:157</code></td><td>路由判定需要转发，TTL 递减之后</td></tr><tr><td>④</td><td><code>NF_INET_LOCAL_OUT</code></td><td><code>__ip_local_out()</code></td><td><code>net/ipv4/ip_output.c:131</code></td><td>本机生成的包，IP 头填充完毕，路由之前</td></tr><tr><td>⑤</td><td><code>NF_INET_POST_ROUTING</code></td><td><code>ip_output()</code></td><td><code>net/ipv4/ip_output.c:643</code></td><td>路由完成，即将交给网卡发送</td></tr></tbody></table></div><h3 id=43-三种流量经过的钩子>4.3 三种流量经过的钩子</h3><div class=table-wrapper><table><thead><tr><th>流量类型</th><th>经过的钩子</th><th>示例</th></tr></thead><tbody><tr><td>外部 → 本机</td><td>① PRE_ROUTING → ② LOCAL_IN</td><td>SSH 连接本机</td></tr><tr><td>本机 → 外部</td><td>④ LOCAL_OUT → ⑤ POST_ROUTING</td><td>本机 curl 外部</td></tr><tr><td>转发（穿越）</td><td>① PRE_ROUTING → ③ FORWARD → ⑤ POST_ROUTING</td><td>本机作网关</td></tr></tbody></table></div><p>转发流量<strong>不经过</strong> LOCAL_IN 和 LOCAL_OUT — 包不"进入"传输层，只在 IP 层转弯就从另一个网卡出去。</p><h3 id=44-源码验证pre_routing>4.4 源码验证：PRE_ROUTING</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/ip_input.c:589-601
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>ip_rcv</span><span class=p>(</span><span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>,</span> <span class=k>struct</span> <span class=n>net_device</span> <span class=o>*</span><span class=n>dev</span><span class=p>,</span> <span class=p>...)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>dev_net</span><span class=p>(</span><span class=n>dev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>skb</span> <span class=o>=</span> <span class=nf>ip_rcv_core</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>net</span><span class=p>);</span>  <span class=c1>// IP 头校验
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>skb</span> <span class=o>==</span> <span class=nb>NULL</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>NET_RX_DROP</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// PRE_ROUTING 钩子：通过后调用 ip_rcv_finish 做路由查找
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>NF_HOOK</span><span class=p>(</span><span class=n>NFPROTO_IPV4</span><span class=p>,</span> <span class=n>NF_INET_PRE_ROUTING</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                   <span class=n>net</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>dev</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                   <span class=n>ip_rcv_finish</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=45-源码验证local_out-vs-post_routing>4.5 源码验证：LOCAL_OUT vs POST_ROUTING</h3><p>这两个钩子看似都在"发出去"的路径上，但<strong>中间隔着路由决策</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/ip_output.c:113 — LOCAL_OUT: 路由之前
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>__ip_local_out</span><span class=p>(</span><span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>iph</span><span class=o>-&gt;</span><span class=n>tot_len</span> <span class=o>=</span> <span class=nf>htons</span><span class=p>(</span><span class=n>skb</span><span class=o>-&gt;</span><span class=n>len</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>ip_send_check</span><span class=p>(</span><span class=n>iph</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// LOCAL_OUT → 通过后调用 dst_output() 执行路由
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>nf_hook</span><span class=p>(</span><span class=n>NFPROTO_IPV4</span><span class=p>,</span> <span class=n>NF_INET_LOCAL_OUT</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                   <span class=n>net</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span> <span class=nf>skb_dst</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>dev</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                   <span class=n>dst_output</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// net/ipv4/ip_output.c:630 — POST_ROUTING: 路由之后
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>ip_output</span><span class=p>(</span><span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>skb</span><span class=o>-&gt;</span><span class=n>dev</span> <span class=o>=</span> <span class=nf>skb_dst</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>dev</span><span class=p>;</span>  <span class=c1>// 出口设备已确定
+</span></span></span><span class=line><span class=cl>    <span class=c1>// POST_ROUTING → 通过后调用 ip_finish_output() 发往网卡
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>NF_HOOK_COND</span><span class=p>(</span><span class=n>NFPROTO_IPV4</span><span class=p>,</span> <span class=n>NF_INET_POST_ROUTING</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=n>net</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>indev</span><span class=p>,</span> <span class=n>dev</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=n>ip_finish_output</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>为什么不能合并？</strong> 因为 LOCAL_OUT 能通过 DNAT 改变目的地址从而影响路由结果，POST_ROUTING 做不到（路由已完成）。而 POST_ROUTING 同时覆盖本机发出和转发的包（两条路径汇合于此），LOCAL_OUT 只覆盖本机发出的包。</p><h2 id=五nf_hook-宏的工作机制>五、NF_HOOK 宏的工作机制</h2><h3 id=51-宏定义>5.1 宏定义</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/netfilter.h:300
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>int</span>
+</span></span><span class=line><span class=cl><span class=nf>NF_HOOK</span><span class=p>(</span><span class=kt>uint8_t</span> <span class=n>pf</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>hook</span><span class=p>,</span> <span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>,</span> <span class=k>struct</span> <span class=n>net_device</span> <span class=o>*</span><span class=n>in</span><span class=p>,</span> <span class=k>struct</span> <span class=n>net_device</span> <span class=o>*</span><span class=n>out</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>okfn</span><span class=p>)(</span><span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=p>))</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>ret</span> <span class=o>=</span> <span class=nf>nf_hook</span><span class=p>(</span><span class=n>pf</span><span class=p>,</span> <span class=n>hook</span><span class=p>,</span> <span class=n>net</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>in</span><span class=p>,</span> <span class=n>out</span><span class=p>,</span> <span class=n>okfn</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>ret</span> <span class=o>==</span> <span class=mi>1</span><span class=p>)</span>         <span class=c1>// 所有钩子函数返回 NF_ACCEPT
+</span></span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=nf>okfn</span><span class=p>(...);</span>  <span class=c1>// 调用正常处理函数（如 ip_rcv_finish）
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=52-钩子函数的返回值>5.2 钩子函数的返回值</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/uapi/linux/netfilter.h:11
+</span></span></span><span class=line><span class=cl><span class=cp>#define NF_DROP   0  </span><span class=c1>// 丢弃包
+</span></span></span><span class=line><span class=cl><span class=cp>#define NF_ACCEPT 1  </span><span class=c1>// 放行，继续下一个钩子函数
+</span></span></span><span class=line><span class=cl><span class=cp>#define NF_STOLEN 2  </span><span class=c1>// 钩子函数接管了包（不调用 okfn，也不释放）
+</span></span></span><span class=line><span class=cl><span class=cp>#define NF_QUEUE  3  </span><span class=c1>// 送到用户空间队列（如 NFQUEUE 目标）
+</span></span></span><span class=line><span class=cl><span class=cp>#define NF_REPEAT 4  </span><span class=c1>// 再调用一次当前钩子函数
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=53-执行流程>5.3 执行流程</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING, ..., ip_rcv_finish)
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>nf_hook() 遍历该钩子点注册的所有函数，按优先级排序：
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ├─ conntrack 回调 (优先级 -200)  → 返回 NF_ACCEPT
+</span></span><span class=line><span class=cl>    ├─ mangle 回调   (优先级 -150)  → 返回 NF_ACCEPT
+</span></span><span class=line><span class=cl>    ├─ DNAT 回调     (优先级 -100)  → 修改目的IP，返回 NF_ACCEPT
+</span></span><span class=line><span class=cl>    ├─ filter 回调   (优先级 0)     → 检查规则，返回 NF_ACCEPT 或 NF_DROP
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>全部 ACCEPT → 调用 okfn (ip_rcv_finish)
+</span></span><span class=line><span class=cl>任一 DROP   → kfree_skb()，包被丢弃
+</span></span></code></pre></td></tr></table></div></div><h2 id=六钩子优先级--同一钩子上的执行顺序>六、钩子优先级 — 同一钩子上的执行顺序</h2><p>每个钩子点上可以注册多个回调函数，按 <code>priority</code> 字段排序（数值小的先执行）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/uapi/linux/netfilter_ipv4.h:31
+</span></span></span><span class=line><span class=cl><span class=k>enum</span> <span class=n>nf_ip_hook_priorities</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_FIRST</span>            <span class=o>=</span> <span class=n>INT_MIN</span><span class=p>,</span>   <span class=c1>// 最先执行
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_RAW_BEFORE_DEFRAG</span> <span class=o>=</span> <span class=o>-</span><span class=mi>450</span><span class=p>,</span>     <span class=c1>// raw 表（分片重组前）
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_CONNTRACK_DEFRAG</span> <span class=o>=</span> <span class=o>-</span><span class=mi>400</span><span class=p>,</span>      <span class=c1>// conntrack 分片重组
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_RAW</span>              <span class=o>=</span> <span class=o>-</span><span class=mi>300</span><span class=p>,</span>      <span class=c1>// raw 表
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_SELINUX_FIRST</span>    <span class=o>=</span> <span class=o>-</span><span class=mi>225</span><span class=p>,</span>      <span class=c1>// SELinux
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_CONNTRACK</span>        <span class=o>=</span> <span class=o>-</span><span class=mi>200</span><span class=p>,</span>      <span class=c1>// conntrack 连接跟踪 ← 最先知道包属于哪个连接
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_MANGLE</span>           <span class=o>=</span> <span class=o>-</span><span class=mi>150</span><span class=p>,</span>      <span class=c1>// mangle 表（修改包头）
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_NAT_DST</span>          <span class=o>=</span> <span class=o>-</span><span class=mi>100</span><span class=p>,</span>      <span class=c1>// DNAT（目的地址转换）
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_FILTER</span>           <span class=o>=</span> <span class=mi>0</span><span class=p>,</span>         <span class=c1>// filter 表（防火墙规则）← 用户最常用
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_SECURITY</span>         <span class=o>=</span> <span class=mi>50</span><span class=p>,</span>        <span class=c1>// security 表
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_NAT_SRC</span>          <span class=o>=</span> <span class=mi>100</span><span class=p>,</span>       <span class=c1>// SNAT（源地址转换）
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_SELINUX_LAST</span>     <span class=o>=</span> <span class=mi>225</span><span class=p>,</span>       <span class=c1>// SELinux 收尾
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_CONNTRACK_HELPER</span> <span class=o>=</span> <span class=mi>300</span><span class=p>,</span>       <span class=c1>// conntrack helper（FTP 等）
+</span></span></span><span class=line><span class=cl>    <span class=n>NF_IP_PRI_CONNTRACK_CONFIRM</span> <span class=o>=</span> <span class=n>INT_MAX</span><span class=p>,</span>  <span class=c1>// conntrack 确认 ← 最后执行
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>设计逻辑</strong>：conntrack 最先（需要知道包属于哪个连接），NAT 在 filter 之前（DNAT 改了地址后 filter 才能正确匹配），filter 在中间（用户规则），conntrack confirm 最后（确认连接状态）。</p><h3 id=61-以-pre_routing-为例>6.1 以 PRE_ROUTING 为例</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>包到达 PRE_ROUTING 钩子:
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ├─ [-400] conntrack_defrag  — 分片重组
+</span></span><span class=line><span class=cl>    ├─ [-300] raw 表            — 跳过 conntrack (NOTRACK)
+</span></span><span class=line><span class=cl>    ├─ [-200] conntrack         — 连接跟踪，确定包属于哪个连接
+</span></span><span class=line><span class=cl>    ├─ [-150] mangle 表         — 修改 TOS/TTL 等
+</span></span><span class=line><span class=cl>    ├─ [-100] nat (DNAT)        — 目的地址转换
+</span></span><span class=line><span class=cl>    ├─ [  0 ] filter 表         — 不在 PRE_ROUTING（filter 只在 INPUT/FORWARD/OUTPUT）
+</span></span><span class=line><span class=cl>    ├─ [ 300] conntrack helper  — 应用层网关（FTP 等）
+</span></span><span class=line><span class=cl>    └─ [MAX ] conntrack confirm — 确认连接
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>    ip_rcv_finish() → 路由查找
+</span></span></code></pre></td></tr></table></div></div><h2 id=七钩子注册机制>七、钩子注册机制</h2><h3 id=71-注册结构体>7.1 注册结构体</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/netfilter.h:85
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>nf_hook_ops</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>nf_hookfn</span>           <span class=o>*</span><span class=n>hook</span><span class=p>;</span>     <span class=c1>// 回调函数
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>net_device</span>   <span class=o>*</span><span class=n>dev</span><span class=p>;</span>      <span class=c1>// 绑定的网络设备（NULL=所有设备）
+</span></span></span><span class=line><span class=cl>    <span class=kt>void</span>                <span class=o>*</span><span class=n>priv</span><span class=p>;</span>     <span class=c1>// 私有数据
+</span></span></span><span class=line><span class=cl>    <span class=n>u8</span>                  <span class=n>pf</span><span class=p>;</span>        <span class=c1>// 协议族: NFPROTO_IPV4
+</span></span></span><span class=line><span class=cl>    <span class=k>enum</span> <span class=n>nf_hook_ops_type</span> <span class=nl>hook_ops_type</span><span class=p>:</span><span class=mi>8</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span>        <span class=n>hooknum</span><span class=p>;</span>   <span class=c1>// 钩子点: NF_INET_PRE_ROUTING 等
+</span></span></span><span class=line><span class=cl>    <span class=kt>int</span>                 <span class=n>priority</span><span class=p>;</span>  <span class=c1>// 优先级
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=72-注册示例conntrack>7.2 注册示例（conntrack）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/netfilter/nf_conntrack_proto.c:466
+</span></span></span><span class=line><span class=cl><span class=n>err</span> <span class=o>=</span> <span class=nf>nf_register_net_hooks</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>ipv4_conntrack_ops</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                            <span class=nf>ARRAY_SIZE</span><span class=p>(</span><span class=n>ipv4_conntrack_ops</span><span class=p>));</span>
+</span></span></code></pre></td></tr></table></div></div><p>conntrack 在 PRE_ROUTING 和 LOCAL_OUT 注册回调（入向和出向各跟踪一次），优先级 <code>NF_IP_PRI_CONNTRACK</code>（-200），确保在 NAT 和 filter 之前执行。</p><h2 id=八iptables-四表五链与钩子的映射>八、iptables 四表五链与钩子的映射</h2><p>iptables 的"表"和"链"本质上就是注册在不同钩子、不同优先级上的回调函数：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                 ① PRE_ROUTING         ② INPUT          ③ FORWARD
+</span></span><span class=line><span class=cl>                 ┌─────────────┐    ┌─────────────┐  ┌─────────────┐
+</span></span><span class=line><span class=cl>  conntrack(-200)│ conntrack   │    │ conntrack   │  │             │
+</span></span><span class=line><span class=cl>  raw     (-300) │ raw 表      │    │             │  │             │
+</span></span><span class=line><span class=cl>  mangle  (-150) │ mangle 表   │    │ mangle 表   │  │ mangle 表   │
+</span></span><span class=line><span class=cl>  nat     (-100) │ nat(DNAT)   │    │             │  │             │
+</span></span><span class=line><span class=cl>  filter  (  0)  │             │    │ filter 表   │  │ filter 表   │
+</span></span><span class=line><span class=cl>  security( 50)  │             │    │ security 表 │  │ security 表 │
+</span></span><span class=line><span class=cl>  nat_src ( 100) │             │    │ nat 表      │  │             │
+</span></span><span class=line><span class=cl>                 └─────────────┘    └─────────────┘  └─────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>                 ④ OUTPUT              ⑤ POST_ROUTING
+</span></span><span class=line><span class=cl>                 ┌─────────────┐    ┌─────────────┐
+</span></span><span class=line><span class=cl>  conntrack(-200)│ conntrack   │    │             │
+</span></span><span class=line><span class=cl>  raw     (-300) │ raw 表      │    │             │
+</span></span><span class=line><span class=cl>  mangle  (-150) │ mangle 表   │    │ mangle 表   │
+</span></span><span class=line><span class=cl>  nat     (-100) │ nat(DNAT)   │    │             │
+</span></span><span class=line><span class=cl>  filter  (  0)  │ filter 表   │    │             │
+</span></span><span class=line><span class=cl>  security( 50)  │ security 表 │    │             │
+</span></span><span class=line><span class=cl>  nat_src ( 100) │             │    │ nat(SNAT)   │
+</span></span><span class=line><span class=cl>                 └─────────────┘    └─────────────┘
+</span></span></code></pre></td></tr></table></div></div><p><strong>filter 表只出现在 INPUT/FORWARD/OUTPUT</strong> — 这三个链是防火墙过滤的正确位置。PRE_ROUTING 和 POST_ROUTING 的 filter 没有意义（还没决定包的走向 / 已经要出去了）。</p><h2 id=九网络调试工具速查>九、网络调试工具速查</h2><blockquote><p>除了 eBPF、SNMP、netstat、tcpdump、iptables、ip route、ip rule 之外的实用工具。</p></blockquote><div class=table-wrapper><table><thead><tr><th>场景</th><th>工具</th><th>用法示例</th><th>优势</th></tr></thead><tbody><tr><td>替代 netstat</td><td><strong>ss</strong></td><td><code>ss -tiepm</code></td><td>直接读 netlink，速度快两个量级；显示拥塞算法、RTT、重传数</td></tr><tr><td>丢包定位</td><td><strong>dropwatch</strong></td><td><code>dropwatch -l kas</code></td><td>精确报告包在哪个内核函数被丢弃</td></tr><tr><td>丢包定位</td><td><strong>perf trace</strong></td><td><code>perf trace -e skb:kfree_skb</code></td><td>追踪所有内核丢包事件</td></tr><tr><td>内核函数追踪</td><td><strong>bpftrace</strong></td><td><code>bpftrace -e 'kprobe:tcp_retransmit_skb { printf("retx\n"); }'</code></td><td>一行脚本追踪任意内核函数</td></tr><tr><td>路由模拟</td><td><strong>ip route get</strong></td><td><code>ip route get 8.8.8.8</code></td><td>模拟一个包的路由查找，显示走哪条路、哪个网卡</td></tr><tr><td>连接跟踪</td><td><strong>conntrack</strong></td><td><code>conntrack -L</code> / <code>conntrack -E</code></td><td>查看/监听 conntrack 表（NAT 映射）</td></tr><tr><td>nftables</td><td><strong>nft</strong></td><td><code>nft list ruleset</code></td><td>iptables 继任者，语法统一、性能更好</td></tr><tr><td>深度抓包</td><td><strong>tshark</strong></td><td><code>tshark -i eth0 -Y "tcp.analysis.retransmission"</code></td><td>Wireshark CLI，协议解析更强</td></tr><tr><td>内核网络事件</td><td><strong>trace-cmd</strong></td><td><code>trace-cmd record -e 'net:*'</code></td><td>追踪所有网络子系统 tracepoint</td></tr><tr><td>TCP 诊断</td><td><strong>ss -tiepm</strong></td><td>显示每个 TCP 连接的 cwnd/rtt/retrans/拥塞算法</td><td>比 <code>/proc/net/tcp</code> 信息丰富</td></tr><tr><td>XDP 高性能</td><td><strong>xdp-tools</strong></td><td><code>xdpdump -i eth0</code></td><td>网卡驱动层抓包/处理</td></tr><tr><td>网络命名空间</td><td><strong>ip netns</strong></td><td><code>ip netns exec test ping 10.0.0.1</code></td><td>隔离环境调试网络问题</td></tr><tr><td>BPF 工具集</td><td><strong>bcc-tools</strong></td><td><code>tcplife</code> / <code>tcpretrans</code> / <code>tcpdrop</code></td><td>即装即用的 TCP 诊断脚本</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/netfilter/>Netfilter</a>
+<a href=/tags/iptables/>Iptables</a>
+<a href=/tags/nftables/>Nftables</a>
+<a href=/tags/nf_hook/>NF_HOOK</a>
+<a href=/tags/pre_routing/>PRE_ROUTING</a>
+<a href=/tags/post_routing/>POST_ROUTING</a>
+<a href=/tags/forward/>FORWARD</a>
+<a href=/tags/input/>INPUT</a>
+<a href=/tags/output/>OUTPUT</a>
+<a href=/tags/conntrack/>Conntrack</a>
+<a href=/tags/nat/>NAT</a>
+<a href=/tags/dnat/>DNAT</a>
+<a href=/tags/snat/>SNAT</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

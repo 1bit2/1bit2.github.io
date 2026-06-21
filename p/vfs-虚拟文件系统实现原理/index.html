@@ -1,0 +1,864 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='VFS 虚拟文件系统实现原理 基于 Linux 5.15.78 源码。本文从"VFS 解决什么问题"出发，剖析四大核心对象的设计动机，追踪 open/read/write 完整调用链，解析 mount 如何将磁盘接入目录树，以及 remount 如何修改读写权限。\n一、VFS 解决什么问题 1.1 没有 VFS 的世界 假设 Linux 没有 VFS 抽象层，每种文件系统（ext4、xfs、btrfs、tmpfs、procfs&mldr;）都有自己的系统调用接口：\n1 2 3 用户程序要读 ext4 文件 → ext4_read() 用户程序要读 xfs 文件 → xfs_read() 用户程序要读 proc 文件 → proc_read() 这带来三个严重问题：\n应用程序必须知道底层文件系统类型 — 程序不可移植 每新增一种文件系统，所有应用都要修改 — 扩展性为零 不同文件系统无法统一在一棵目录树里 — 用户体验割裂 1.2 VFS 的解决方案：面向对象 + 多态 VFS 在用户和具体文件系统之间插入一层抽象，定义四个通用对象和一组操作函数表：\n1 2 3 4 5 6 7 8 9 10 用户程序: open("/mnt/disk/file.txt") → read(fd, buf, 4096) → write(fd, buf, 4096) │ │ │ ▼ ▼ ▼ VFS 层: path_openat() vfs_read() vfs_write() │ │ │ ▼ ▼ ▼ inode->i_fop->open() file->f_op->read_iter() file->f_op->write_iter() │ │ │ ▼ ▼ ▼ ext4 实现: ext4_file_open() ext4_file_read_iter() ext4_file_write_iter() 核心设计思想：用户只看到统一的 open/read/write，VFS 通过函数指针表（类似 C++ 虚函数表）分派给具体文件系统。这就是"Virtual"的含义 — 调用接口是虚的（通用的），实际实现是实的（具体文件系统提供的）。\n'><title>VFS 虚拟文件系统实现原理</title><link rel=canonical href=https://1bit2.github.io/p/vfs-%E8%99%9A%E6%8B%9F%E6%96%87%E4%BB%B6%E7%B3%BB%E7%BB%9F%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="VFS 虚拟文件系统实现原理"><meta property='og:description' content='VFS 虚拟文件系统实现原理 基于 Linux 5.15.78 源码。本文从"VFS 解决什么问题"出发，剖析四大核心对象的设计动机，追踪 open/read/write 完整调用链，解析 mount 如何将磁盘接入目录树，以及 remount 如何修改读写权限。\n一、VFS 解决什么问题 1.1 没有 VFS 的世界 假设 Linux 没有 VFS 抽象层，每种文件系统（ext4、xfs、btrfs、tmpfs、procfs&mldr;）都有自己的系统调用接口：\n1 2 3 用户程序要读 ext4 文件 → ext4_read() 用户程序要读 xfs 文件 → xfs_read() 用户程序要读 proc 文件 → proc_read() 这带来三个严重问题：\n应用程序必须知道底层文件系统类型 — 程序不可移植 每新增一种文件系统，所有应用都要修改 — 扩展性为零 不同文件系统无法统一在一棵目录树里 — 用户体验割裂 1.2 VFS 的解决方案：面向对象 + 多态 VFS 在用户和具体文件系统之间插入一层抽象，定义四个通用对象和一组操作函数表：\n1 2 3 4 5 6 7 8 9 10 用户程序: open("/mnt/disk/file.txt") → read(fd, buf, 4096) → write(fd, buf, 4096) │ │ │ ▼ ▼ ▼ VFS 层: path_openat() vfs_read() vfs_write() │ │ │ ▼ ▼ ▼ inode->i_fop->open() file->f_op->read_iter() file->f_op->write_iter() │ │ │ ▼ ▼ ▼ ext4 实现: ext4_file_open() ext4_file_read_iter() ext4_file_write_iter() 核心设计思想：用户只看到统一的 open/read/write，VFS 通过函数指针表（类似 C++ 虚函数表）分派给具体文件系统。这就是"Virtual"的含义 — 调用接口是虚的（通用的），实际实现是实的（具体文件系统提供的）。\n'><meta property='og:url' content='https://1bit2.github.io/p/vfs-%E8%99%9A%E6%8B%9F%E6%96%87%E4%BB%B6%E7%B3%BB%E7%BB%9F%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='VFS'><meta property='article:tag' content='super_block'><meta property='article:tag' content='inode'><meta property='article:tag' content='dentry'><meta property='article:tag' content='file'><meta property='article:tag' content='file_operations'><meta property='article:tag' content='mount'><meta property='article:tag' content='open'><meta property='article:tag' content='read'><meta property='article:tag' content='write'><meta property='article:tag' content='ext4'><meta property='article:tag' content='remount'><meta property='article:published_time' content='2026-05-07T00:00:00+00:00'><meta property='article:modified_time' content='2026-05-07T00:00:00+00:00'><meta name=twitter:title content="VFS 虚拟文件系统实现原理"><meta name=twitter:description content='VFS 虚拟文件系统实现原理 基于 Linux 5.15.78 源码。本文从"VFS 解决什么问题"出发，剖析四大核心对象的设计动机，追踪 open/read/write 完整调用链，解析 mount 如何将磁盘接入目录树，以及 remount 如何修改读写权限。\n一、VFS 解决什么问题 1.1 没有 VFS 的世界 假设 Linux 没有 VFS 抽象层，每种文件系统（ext4、xfs、btrfs、tmpfs、procfs&mldr;）都有自己的系统调用接口：\n1 2 3 用户程序要读 ext4 文件 → ext4_read() 用户程序要读 xfs 文件 → xfs_read() 用户程序要读 proc 文件 → proc_read() 这带来三个严重问题：\n应用程序必须知道底层文件系统类型 — 程序不可移植 每新增一种文件系统，所有应用都要修改 — 扩展性为零 不同文件系统无法统一在一棵目录树里 — 用户体验割裂 1.2 VFS 的解决方案：面向对象 + 多态 VFS 在用户和具体文件系统之间插入一层抽象，定义四个通用对象和一组操作函数表：\n1 2 3 4 5 6 7 8 9 10 用户程序: open("/mnt/disk/file.txt") → read(fd, buf, 4096) → write(fd, buf, 4096) │ │ │ ▼ ▼ ▼ VFS 层: path_openat() vfs_read() vfs_write() │ │ │ ▼ ▼ ▼ inode->i_fop->open() file->f_op->read_iter() file->f_op->write_iter() │ │ │ ▼ ▼ ▼ ext4 实现: ext4_file_open() ext4_file_read_iter() ext4_file_write_iter() 核心设计思想：用户只看到统一的 open/read/write，VFS 通过函数指针表（类似 C++ 虚函数表）分派给具体文件系统。这就是"Virtual"的含义 — 调用接口是虚的（通用的），实际实现是实的（具体文件系统提供的）。\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一vfs-解决什么问题>一、VFS 解决什么问题</a><ol><li><a href=#11-没有-vfs-的世界>1.1 没有 VFS 的世界</a></li><li><a href=#12-vfs-的解决方案面向对象--多态>1.2 VFS 的解决方案：面向对象 + 多态</a></li><li><a href=#13-四大对象的职责划分>1.3 四大对象的职责划分</a></li></ol></li><li><a href=#二四大核心对象的源码结构>二、四大核心对象的源码结构</a><ol><li><a href=#21-super_block--已挂载文件系统的描述符>2.1 super_block — 已挂载文件系统的描述符</a></li><li><a href=#22-inode--文件的身份证>2.2 inode — 文件的身份证</a></li><li><a href=#23-dentry--路径查找的加速器>2.3 dentry — 路径查找的加速器</a></li><li><a href=#24-file--进程打开文件的会话>2.4 file — 进程打开文件的会话</a></li><li><a href=#25-四大对象关系图>2.5 四大对象关系图</a></li></ol></li><li><a href=#三文件系统注册--vfs-如何知道-ext4-的存在>三、文件系统注册 — VFS 如何知道 ext4 的存在</a><ol><li><a href=#31-file_system_type--文件系统的出生证>3.1 file_system_type — 文件系统的"出生证"</a></li><li><a href=#32-ext4-注册自己>3.2 ext4 注册自己</a></li><li><a href=#33-register_filesystem--加入全局链表>3.3 register_filesystem — 加入全局链表</a></li></ol></li><li><a href=#四mount--将磁盘接入目录树>四、mount — 将磁盘接入目录树</a><ol><li><a href=#41-mount-的本质>4.1 mount 的本质</a></li><li><a href=#42-挂载点mountpoint的魔法>4.2 挂载点（mountpoint）的魔法</a></li><li><a href=#43-struct-mount--挂载实例的完整信息>4.3 struct mount — 挂载实例的完整信息</a></li><li><a href=#44-mount-的完整调用链>4.4 mount 的完整调用链</a></li></ol></li><li><a href=#五open--从路径到-file-对象>五、open — 从路径到 file 对象</a><ol><li><a href=#51-调用链总览>5.1 调用链总览</a></li><li><a href=#52-路径查找--vfs-最复杂的部分>5.2 路径查找 — VFS 最复杂的部分</a></li><li><a href=#53-fd_install--file-对象和-fd-的绑定>5.3 fd_install — file 对象和 fd 的绑定</a></li></ol></li><li><a href=#六readwrite--数据流经-vfs>六、read/write — 数据流经 VFS</a><ol><li><a href=#61-read-调用链>6.1 read 调用链</a></li><li><a href=#62-vfs_read--vfs-层的分发点>6.2 vfs_read — VFS 层的分发点</a></li><li><a href=#63-数据流全貌>6.3 数据流全貌</a></li></ol></li><li><a href=#七remount--为什么-mount--o-remountrw--能获得写权限>七、remount — 为什么 <code>mount -o remount,rw /</code> 能获得写权限</a><ol><li><a href=#71-场景>7.1 场景</a></li><li><a href=#72-调用链>7.2 调用链</a></li><li><a href=#73-reconfigure_super--标志位翻转>7.3 reconfigure_super — 标志位翻转</a></li><li><a href=#74-remount-还做了哪些保护>7.4 remount 还做了哪些保护？</a></li></ol></li><li><a href=#八vfs-四大操作函数表的协作>八、VFS 四大操作函数表的协作</a></li><li><a href=#九vfs-的设计总结>九、VFS 的设计总结</a><ol><li><a href=#91-设计哲学>9.1 设计哲学</a></li><li><a href=#92-vfs-处理的文件系统种类>9.2 VFS 处理的文件系统种类</a></li><li><a href=#93-一句话总结>9.3 一句话总结</a></li></ol></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E6%96%87%E4%BB%B6/ style=background-color:#34a853;color:#fff>文件</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/vfs-%E8%99%9A%E6%8B%9F%E6%96%87%E4%BB%B6%E7%B3%BB%E7%BB%9F%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86/>VFS 虚拟文件系统实现原理</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>May 07, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>14 minute read</time></div></footer></div></header><section class=article-content><h1 id=vfs-虚拟文件系统实现原理>VFS 虚拟文件系统实现原理</h1><blockquote><p>基于 Linux 5.15.78 源码。本文从"VFS 解决什么问题"出发，剖析四大核心对象的设计动机，追踪 open/read/write 完整调用链，解析 mount 如何将磁盘接入目录树，以及 remount 如何修改读写权限。</p></blockquote><h2 id=一vfs-解决什么问题>一、VFS 解决什么问题</h2><h3 id=11-没有-vfs-的世界>1.1 没有 VFS 的世界</h3><p>假设 Linux 没有 VFS 抽象层，每种文件系统（ext4、xfs、btrfs、tmpfs、procfs&mldr;）都有自己的系统调用接口：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户程序要读 ext4 文件 → ext4_read()
+</span></span><span class=line><span class=cl>用户程序要读 xfs 文件  → xfs_read()
+</span></span><span class=line><span class=cl>用户程序要读 proc 文件 → proc_read()
+</span></span></code></pre></td></tr></table></div></div><p>这带来三个严重问题：</p><ol><li><strong>应用程序必须知道底层文件系统类型</strong> — 程序不可移植</li><li><strong>每新增一种文件系统，所有应用都要修改</strong> — 扩展性为零</li><li><strong>不同文件系统无法统一在一棵目录树里</strong> — 用户体验割裂</li></ol><h3 id=12-vfs-的解决方案面向对象--多态>1.2 VFS 的解决方案：面向对象 + 多态</h3><p>VFS 在用户和具体文件系统之间插入一层抽象，定义<strong>四个通用对象</strong>和<strong>一组操作函数表</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户程序: open(&#34;/mnt/disk/file.txt&#34;) → read(fd, buf, 4096) → write(fd, buf, 4096)
+</span></span><span class=line><span class=cl>                      │                         │                       │
+</span></span><span class=line><span class=cl>                      ▼                         ▼                       ▼
+</span></span><span class=line><span class=cl>VFS 层:          path_openat()              vfs_read()              vfs_write()
+</span></span><span class=line><span class=cl>                      │                         │                       │
+</span></span><span class=line><span class=cl>                      ▼                         ▼                       ▼
+</span></span><span class=line><span class=cl>            inode-&gt;i_fop-&gt;open()    file-&gt;f_op-&gt;read_iter()  file-&gt;f_op-&gt;write_iter()
+</span></span><span class=line><span class=cl>                      │                         │                       │
+</span></span><span class=line><span class=cl>                      ▼                         ▼                       ▼
+</span></span><span class=line><span class=cl>ext4 实现:    ext4_file_open()      ext4_file_read_iter()   ext4_file_write_iter()
+</span></span></code></pre></td></tr></table></div></div><p><strong>核心设计思想</strong>：用户只看到统一的 <code>open/read/write</code>，VFS 通过函数指针表（类似 C++ 虚函数表）分派给具体文件系统。这就是"Virtual"的含义 — <strong>调用接口是虚的（通用的），实际实现是实的（具体文件系统提供的）</strong>。</p><h3 id=13-四大对象的职责划分>1.3 四大对象的职责划分</h3><div class=table-wrapper><table><thead><tr><th>对象</th><th>解决什么问题</th><th>关键操作函数表</th><th>生命周期</th></tr></thead><tbody><tr><td><code>super_block</code></td><td>&ldquo;这个磁盘用什么规则组织数据？&rdquo;</td><td><code>super_operations</code></td><td>mount 时创建，umount 时销毁</td></tr><tr><td><code>inode</code></td><td>&ldquo;这个文件的元数据（大小、权限、数据在哪）是什么？&rdquo;</td><td><code>inode_operations</code></td><td>首次访问时从磁盘读入缓存</td></tr><tr><td><code>dentry</code></td><td>&ldquo;路径名的每一段怎么找到对应的 inode？&rdquo;</td><td><code>dentry_operations</code></td><td>路径查找时创建，LRU 淘汰</td></tr><tr><td><code>file</code></td><td>&ldquo;进程打开文件后的读写状态（偏移量、打开模式）是什么？&rdquo;</td><td><code>file_operations</code></td><td>open 时创建，close 时销毁</td></tr></tbody></table></div><p>为什么需要四个而不是一个？因为它们的生命周期和共享关系完全不同：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>进程 A: open(&#34;/home/test.txt&#34;) → fd=3, file 对象 A (pos=0)
+</span></span><span class=line><span class=cl>进程 B: open(&#34;/home/test.txt&#34;) → fd=5, file 对象 B (pos=0)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>                file A (pos=100)  ──┐
+</span></span><span class=line><span class=cl>                                     ├──→ dentry(&#34;test.txt&#34;) ──→ inode(ino=12345)
+</span></span><span class=line><span class=cl>                file B (pos=200)  ──┘           │                      │
+</span></span><span class=line><span class=cl>                                          dentry(&#34;home&#34;)          super_block
+</span></span><span class=line><span class=cl>                                                │
+</span></span><span class=line><span class=cl>                                          dentry(&#34;/&#34;)
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong>file</strong> 是进程私有的（每次 open 产生一个新的，各自维护读写偏移）</li><li><strong>dentry</strong> 和 <strong>inode</strong> 是全局缓存的（多个进程打开同一文件共享同一个 inode）</li><li><strong>super_block</strong> 是文件系统级的（一次 mount 一个）</li></ul><h2 id=二四大核心对象的源码结构>二、四大核心对象的源码结构</h2><h3 id=21-super_block--已挂载文件系统的描述符>2.1 super_block — 已挂载文件系统的描述符</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/fs.h:1498
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>super_block</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span>    <span class=n>s_list</span><span class=p>;</span>      <span class=cm>/* 全局超级块链表 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>dev_t</span>               <span class=n>s_dev</span><span class=p>;</span>       <span class=cm>/* 设备号(主+次) */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>s_blocksize</span><span class=p>;</span> <span class=cm>/* 块大小(字节) */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>loff_t</span>              <span class=n>s_maxbytes</span><span class=p>;</span>  <span class=cm>/* 最大文件大小 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>file_system_type</span> <span class=o>*</span><span class=n>s_type</span><span class=p>;</span> <span class=cm>/* 文件系统类型 → ext4_fs_type */</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>super_operations</span> <span class=o>*</span><span class=n>s_op</span><span class=p>;</span> <span class=cm>/* 操作函数表 ← VFS多态的核心 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>s_flags</span><span class=p>;</span>     <span class=cm>/* 挂载标志 SB_RDONLY 等 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>s_magic</span><span class=p>;</span>     <span class=cm>/* 魔数 (ext4=0xEF53) */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>dentry</span>       <span class=o>*</span><span class=n>s_root</span><span class=p>;</span>     <span class=cm>/* 根目录 dentry ← 文件系统入口 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>block_device</span> <span class=o>*</span><span class=n>s_bdev</span><span class=p>;</span>     <span class=cm>/* 底层块设备 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span>                <span class=o>*</span><span class=n>s_fs_info</span><span class=p>;</span>  <span class=cm>/* 文件系统私有数据 ← ext4: ext4_sb_info */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>设计动机</strong>：<code>s_fs_info</code> 是最巧妙的设计 — VFS 层不需要知道 ext4 的块组、日志等细节，ext4 自己把这些信息放在 <code>ext4_sb_info</code> 里，通过 <code>s_fs_info</code> 指针自取。这实现了<strong>接口与实现的分离</strong>。</p><p><code>s_op</code> 指向的 <code>super_operations</code> 定义了文件系统级别的操作（<code>include/linux/fs.h:2165</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>super_operations</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>(</span><span class=o>*</span><span class=n>alloc_inode</span><span class=p>)(</span><span class=k>struct</span> <span class=n>super_block</span> <span class=o>*</span><span class=n>sb</span><span class=p>);</span>  <span class=cm>/* 分配 inode */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>destroy_inode</span><span class=p>)(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>);</span>                 <span class=cm>/* 销毁 inode */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>dirty_inode</span><span class=p>)(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=kt>int</span> <span class=n>flags</span><span class=p>);</span>        <span class=cm>/* 标记 inode 为脏 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>write_inode</span><span class=p>)(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=p>...);</span>               <span class=cm>/* 回写 inode 到磁盘 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>sync_fs</span><span class=p>)(</span><span class=k>struct</span> <span class=n>super_block</span> <span class=o>*</span><span class=n>sb</span><span class=p>,</span> <span class=kt>int</span> <span class=n>wait</span><span class=p>);</span>      <span class=cm>/* 同步文件系统 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>statfs</span><span class=p>)(</span><span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>kstatfs</span> <span class=o>*</span><span class=p>);</span>      <span class=cm>/* 获取文件系统统计 df 命令 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>remount_fs</span><span class=p>)(</span><span class=k>struct</span> <span class=n>super_block</span> <span class=o>*</span><span class=p>,</span> <span class=kt>int</span> <span class=o>*</span><span class=p>,</span> <span class=kt>char</span> <span class=o>*</span><span class=p>);</span><span class=cm>/* 重挂载 */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=22-inode--文件的身份证>2.2 inode — 文件的身份证</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/fs.h:624
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>inode</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>umode_t</span>             <span class=n>i_mode</span><span class=p>;</span>      <span class=cm>/* 文件类型+权限: S_IFREG|0644 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>kuid_t</span>              <span class=n>i_uid</span><span class=p>;</span>       <span class=cm>/* 所有者 UID */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>kgid_t</span>              <span class=n>i_gid</span><span class=p>;</span>       <span class=cm>/* 所属组 GID */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span>       <span class=n>i_ino</span><span class=p>;</span>       <span class=cm>/* inode 号 — 文件的唯一标识 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>loff_t</span>              <span class=n>i_size</span><span class=p>;</span>      <span class=cm>/* 文件大小 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>blkcnt_t</span>            <span class=n>i_blocks</span><span class=p>;</span>    <span class=cm>/* 占用磁盘块数 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>timespec64</span>   <span class=n>i_atime</span><span class=p>;</span>     <span class=cm>/* 最后访问时间 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>timespec64</span>   <span class=n>i_mtime</span><span class=p>;</span>     <span class=cm>/* 最后修改时间 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>timespec64</span>   <span class=n>i_ctime</span><span class=p>;</span>     <span class=cm>/* 状态改变时间 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>inode_operations</span> <span class=o>*</span><span class=n>i_op</span><span class=p>;</span>  <span class=cm>/* inode 操作: lookup/create/unlink */</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>file_operations</span>  <span class=o>*</span><span class=n>i_fop</span><span class=p>;</span> <span class=cm>/* 默认的文件操作: open 时拷贝给 file */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>super_block</span>  <span class=o>*</span><span class=n>i_sb</span><span class=p>;</span>       <span class=cm>/* 所属超级块 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>address_space</span> <span class=o>*</span><span class=n>i_mapping</span><span class=p>;</span> <span class=cm>/* 页缓存 ← 文件数据在内存中的缓存 */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键设计</strong>：inode 不包含文件名。文件名在 dentry 中。这使得硬链接成为可能 — 多个 dentry（多个文件名）可以指向同一个 inode。</p><p><code>i_op</code> 定义目录层面的操作（<code>include/linux/fs.h:2083</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>inode_operations</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>(</span><span class=o>*</span><span class=n>lookup</span><span class=p>)(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>int</span><span class=p>);</span>  <span class=cm>/* 路径查找 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>create</span><span class=p>)(</span><span class=k>struct</span> <span class=n>user_namespace</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>,</span> <span class=kt>umode_t</span><span class=p>,</span> <span class=kt>bool</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>link</span><span class=p>)(</span><span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>);</span>    <span class=cm>/* 硬链接 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>unlink</span><span class=p>)(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>);</span>                   <span class=cm>/* 删除文件 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>mkdir</span><span class=p>)(</span><span class=k>struct</span> <span class=n>user_namespace</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>,</span> <span class=kt>umode_t</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>rmdir</span><span class=p>)(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>rename</span><span class=p>)(...);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>permission</span><span class=p>)(</span><span class=k>struct</span> <span class=n>user_namespace</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=kt>int</span><span class=p>);</span>  <span class=cm>/* 权限检查 */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=23-dentry--路径查找的加速器>2.3 dentry — 路径查找的加速器</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/dcache.h:91
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>dentry</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span>        <span class=n>d_flags</span><span class=p>;</span>     <span class=cm>/* DCACHE_MOUNTED 等标志 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>hlist_bl_node</span> <span class=n>d_hash</span><span class=p>;</span>     <span class=cm>/* 哈希表节点 ← 加速路径查找 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>dentry</span>       <span class=o>*</span><span class=n>d_parent</span><span class=p>;</span>   <span class=cm>/* 父目录 dentry */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>qstr</span>         <span class=n>d_name</span><span class=p>;</span>      <span class=cm>/* 当前路径段名: &#34;home&#34;, &#34;test.txt&#34; */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inode</span>        <span class=o>*</span><span class=n>d_inode</span><span class=p>;</span>    <span class=cm>/* 指向 inode (NULL=负缓存) */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>super_block</span>  <span class=o>*</span><span class=n>d_sb</span><span class=p>;</span>       <span class=cm>/* 所属超级块 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>dentry_operations</span> <span class=o>*</span><span class=n>d_op</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span>    <span class=n>d_child</span><span class=p>;</span>     <span class=cm>/* 在父目录的子链表中 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span>    <span class=n>d_subdirs</span><span class=p>;</span>   <span class=cm>/* 子目录/子文件链表 */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>为什么需要 dentry？</strong> 磁盘上只有 inode 号，没有路径的概念。用户用路径 <code>/home/test.txt</code> 访问文件，内核需要逐段解析：</p><ol><li><code>/</code> → 找到根 inode</li><li><code>home</code> → 在根 inode 的目录数据中查找名为 &ldquo;home&rdquo; 的条目，得到 inode 号</li><li><code>test.txt</code> → 在 home 的 inode 目录数据中查找，得到目标 inode</li></ol><p>如果每次都从磁盘读取目录数据，代价太高。dentry 缓存了<strong>路径名 → inode</strong> 的映射关系，构成一棵内存中的目录树。</p><p><strong>负缓存（negative dentry）</strong>：<code>d_inode == NULL</code> 表示"这个路径不存在"也被缓存了。好处：避免反复到磁盘查找不存在的文件（比如动态链接器逐目录搜索 <code>.so</code>）。</p><h3 id=24-file--进程打开文件的会话>2.4 file — 进程打开文件的会话</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/fs.h:966
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>file</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>path</span>          <span class=n>f_path</span><span class=p>;</span>     <span class=cm>/* { vfsmount, dentry } 定位到哪个文件 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inode</span>        <span class=o>*</span><span class=n>f_inode</span><span class=p>;</span>    <span class=cm>/* 快速访问 inode */</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>file_operations</span> <span class=o>*</span><span class=n>f_op</span><span class=p>;</span> <span class=cm>/* 操作函数表 ← 从 inode-&gt;i_fop 拷贝 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>atomic_long_t</span>        <span class=n>f_count</span><span class=p>;</span>    <span class=cm>/* 引用计数 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span>         <span class=n>f_flags</span><span class=p>;</span>    <span class=cm>/* O_RDONLY / O_WRONLY / O_APPEND 等 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>fmode_t</span>              <span class=n>f_mode</span><span class=p>;</span>     <span class=cm>/* FMODE_READ / FMODE_WRITE */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>loff_t</span>               <span class=n>f_pos</span><span class=p>;</span>      <span class=cm>/* 当前读写偏移 ← 进程私有 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mutex</span>         <span class=n>f_pos_lock</span><span class=p>;</span> <span class=cm>/* 保护 f_pos 的并发访问 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>cred</span>   <span class=o>*</span><span class=n>f_cred</span><span class=p>;</span>     <span class=cm>/* 打开时的进程凭证 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>file_ra_state</span> <span class=n>f_ra</span><span class=p>;</span>       <span class=cm>/* 预读状态 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span>                <span class=o>*</span><span class=n>private_data</span><span class=p>;</span> <span class=cm>/* 文件系统/驱动私有数据 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>address_space</span> <span class=o>*</span><span class=n>f_mapping</span><span class=p>;</span> <span class=cm>/* 页缓存映射 */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>f_op</code> 指向文件级别的操作（<code>include/linux/fs.h:2041</code>），这是用户最直接打交道的函数表：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>file_operations</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>loff_t</span> <span class=p>(</span><span class=o>*</span><span class=n>llseek</span><span class=p>)(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>,</span> <span class=kt>loff_t</span><span class=p>,</span> <span class=kt>int</span><span class=p>);</span>                      <span class=cm>/* lseek */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>ssize_t</span> <span class=p>(</span><span class=o>*</span><span class=n>read</span><span class=p>)(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>,</span> <span class=kt>char</span> <span class=n>__user</span> <span class=o>*</span><span class=p>,</span> <span class=kt>size_t</span><span class=p>,</span> <span class=kt>loff_t</span> <span class=o>*</span><span class=p>);</span>   <span class=cm>/* read */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>ssize_t</span> <span class=p>(</span><span class=o>*</span><span class=n>write</span><span class=p>)(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>,</span> <span class=k>const</span> <span class=kt>char</span> <span class=n>__user</span> <span class=o>*</span><span class=p>,</span> <span class=kt>size_t</span><span class=p>,</span> <span class=kt>loff_t</span> <span class=o>*</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>ssize_t</span> <span class=p>(</span><span class=o>*</span><span class=n>read_iter</span><span class=p>)(</span><span class=k>struct</span> <span class=n>kiocb</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>iov_iter</span> <span class=o>*</span><span class=p>);</span>           <span class=cm>/* 新式 read */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>ssize_t</span> <span class=p>(</span><span class=o>*</span><span class=n>write_iter</span><span class=p>)(</span><span class=k>struct</span> <span class=n>kiocb</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>iov_iter</span> <span class=o>*</span><span class=p>);</span>          <span class=cm>/* 新式 write */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>__poll_t</span> <span class=p>(</span><span class=o>*</span><span class=n>poll</span><span class=p>)(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>poll_table_struct</span> <span class=o>*</span><span class=p>);</span>        <span class=cm>/* select/poll */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>mmap</span><span class=p>)(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>vm_area_struct</span> <span class=o>*</span><span class=p>);</span>                <span class=cm>/* mmap */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>open</span><span class=p>)(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>);</span>                         <span class=cm>/* open */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>release</span><span class=p>)(</span><span class=k>struct</span> <span class=n>inode</span> <span class=o>*</span><span class=p>,</span> <span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>);</span>                      <span class=cm>/* close 最后引用 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>fsync</span><span class=p>)(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=p>,</span> <span class=kt>loff_t</span><span class=p>,</span> <span class=kt>loff_t</span><span class=p>,</span> <span class=kt>int</span> <span class=n>datasync</span><span class=p>);</span>         <span class=cm>/* fsync */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=25-四大对象关系图>2.5 四大对象关系图</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                        进程的文件描述符表
+</span></span><span class=line><span class=cl>                    fd[0] fd[1] fd[2] fd[3]
+</span></span><span class=line><span class=cl>                      │     │     │     │
+</span></span><span class=line><span class=cl>                      ▼     ▼     ▼     ▼
+</span></span><span class=line><span class=cl>                    ┌─────────────────────┐
+</span></span><span class=line><span class=cl>                    │    struct file       │  ← 进程私有, 维护 f_pos
+</span></span><span class=line><span class=cl>                    │  f_op → ext4_fops   │
+</span></span><span class=line><span class=cl>                    │  f_path.dentry ─────┼──┐
+</span></span><span class=line><span class=cl>                    └─────────────────────┘  │
+</span></span><span class=line><span class=cl>                                              ▼
+</span></span><span class=line><span class=cl>                                   ┌──────────────────┐
+</span></span><span class=line><span class=cl>                              ┌────│  struct dentry    │  ← 全局缓存
+</span></span><span class=line><span class=cl>                              │    │  d_name=&#34;test.txt&#34;│
+</span></span><span class=line><span class=cl>                              │    │  d_parent ────────┼──→ dentry(&#34;home&#34;)
+</span></span><span class=line><span class=cl>                              │    └──────────────────┘          │
+</span></span><span class=line><span class=cl>                              ▼                           d_parent │
+</span></span><span class=line><span class=cl>                    ┌──────────────────┐                         ▼
+</span></span><span class=line><span class=cl>                    │   struct inode   │              dentry(&#34;/&#34;) ← rootfs
+</span></span><span class=line><span class=cl>                    │  i_ino = 12345   │
+</span></span><span class=line><span class=cl>                    │  i_size = 4096   │
+</span></span><span class=line><span class=cl>                    │  i_sb ───────────┼──┐
+</span></span><span class=line><span class=cl>                    └──────────────────┘  │
+</span></span><span class=line><span class=cl>                                          ▼
+</span></span><span class=line><span class=cl>                              ┌────────────────────┐
+</span></span><span class=line><span class=cl>                              │ struct super_block  │  ← 每个已挂载文件系统一个
+</span></span><span class=line><span class=cl>                              │ s_type → ext4      │
+</span></span><span class=line><span class=cl>                              │ s_op → ext4_sops   │
+</span></span><span class=line><span class=cl>                              │ s_root → dentry(&#34;/&#34;)│
+</span></span><span class=line><span class=cl>                              │ s_bdev → /dev/sda1 │
+</span></span><span class=line><span class=cl>                              └────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h2 id=三文件系统注册--vfs-如何知道-ext4-的存在>三、文件系统注册 — VFS 如何知道 ext4 的存在</h2><p>在 mount 之前，VFS 需要知道系统支持哪些文件系统类型。每种文件系统通过 <code>register_filesystem()</code> 注册自己。</p><h3 id=31-file_system_type--文件系统的出生证>3.1 file_system_type — 文件系统的"出生证"</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/fs.h:2514
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>file_system_type</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=kt>char</span> <span class=o>*</span><span class=n>name</span><span class=p>;</span>        <span class=cm>/* &#34;ext4&#34; / &#34;xfs&#34; / &#34;tmpfs&#34; */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>fs_flags</span><span class=p>;</span>            <span class=cm>/* FS_REQUIRES_DEV: 需要块设备 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>init_fs_context</span><span class=p>)(</span><span class=k>struct</span> <span class=n>fs_context</span> <span class=o>*</span><span class=p>);</span> <span class=cm>/* 新式 mount 接口 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=p>(</span><span class=o>*</span><span class=n>mount</span><span class=p>)(</span><span class=k>struct</span> <span class=n>file_system_type</span> <span class=o>*</span><span class=p>,</span> <span class=kt>int</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                            <span class=k>const</span> <span class=kt>char</span> <span class=o>*</span><span class=p>,</span> <span class=kt>void</span> <span class=o>*</span><span class=p>);</span>  <span class=cm>/* 旧式 mount 接口 */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>kill_sb</span><span class=p>)(</span><span class=k>struct</span> <span class=n>super_block</span> <span class=o>*</span><span class=p>);</span>           <span class=cm>/* umount 时清理 */</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>module</span> <span class=o>*</span><span class=n>owner</span><span class=p>;</span>                <span class=cm>/* 所属内核模块 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>file_system_type</span> <span class=o>*</span><span class=n>next</span><span class=p>;</span>       <span class=cm>/* 单链表 → 下一个文件系统类型 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>hlist_head</span> <span class=n>fs_supers</span><span class=p>;</span>         <span class=cm>/* 该类型的所有 super_block 实例 */</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=32-ext4-注册自己>3.2 ext4 注册自己</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/ext4/super.c:6600
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>struct</span> <span class=n>file_system_type</span> <span class=n>ext4_fs_type</span> <span class=o>=</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>owner</span>    <span class=o>=</span> <span class=n>THIS_MODULE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>name</span>     <span class=o>=</span> <span class=s>&#34;ext4&#34;</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>mount</span>    <span class=o>=</span> <span class=n>ext4_mount</span><span class=p>,</span>          <span class=cm>/* mount 时调用 */</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>kill_sb</span>  <span class=o>=</span> <span class=n>kill_block_super</span><span class=p>,</span>    <span class=cm>/* umount 时调用 */</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>fs_flags</span> <span class=o>=</span> <span class=n>FS_REQUIRES_DEV</span> <span class=o>|</span> <span class=n>FS_ALLOW_IDMAP</span><span class=p>,</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// fs/ext4/super.c:6662 — 模块初始化时注册
+</span></span></span><span class=line><span class=cl><span class=n>err</span> <span class=o>=</span> <span class=nf>register_filesystem</span><span class=p>(</span><span class=o>&amp;</span><span class=n>ext4_fs_type</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=33-register_filesystem--加入全局链表>3.3 register_filesystem — 加入全局链表</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/filesystems.c:72
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>register_filesystem</span><span class=p>(</span><span class=k>struct</span> <span class=n>file_system_type</span> <span class=o>*</span><span class=n>fs</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>file_system_type</span> <span class=o>**</span><span class=n>p</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>write_lock</span><span class=p>(</span><span class=o>&amp;</span><span class=n>file_systems_lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>p</span> <span class=o>=</span> <span class=nf>find_filesystem</span><span class=p>(</span><span class=n>fs</span><span class=o>-&gt;</span><span class=n>name</span><span class=p>,</span> <span class=nf>strlen</span><span class=p>(</span><span class=n>fs</span><span class=o>-&gt;</span><span class=n>name</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>*</span><span class=n>p</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>res</span> <span class=o>=</span> <span class=o>-</span><span class=n>EBUSY</span><span class=p>;</span>  <span class=cm>/* 同名文件系统已注册 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>else</span>
+</span></span><span class=line><span class=cl>        <span class=o>*</span><span class=n>p</span> <span class=o>=</span> <span class=n>fs</span><span class=p>;</span>        <span class=cm>/* 挂到链表末尾 */</span>
+</span></span><span class=line><span class=cl>    <span class=nf>write_unlock</span><span class=p>(</span><span class=o>&amp;</span><span class=n>file_systems_lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>res</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>内核维护一个简单的单链表 <code>file_systems</code>，所有注册的文件系统类型串在一起。<code>mount -t ext4</code> 时，VFS 调用 <code>get_fs_type("ext4")</code> 遍历这个链表找到 <code>ext4_fs_type</code>。</p><p>可以通过 <code>/proc/filesystems</code> 查看当前系统注册的所有文件系统类型。</p><h2 id=四mount--将磁盘接入目录树>四、mount — 将磁盘接入目录树</h2><blockquote><p>详细的 mount 调用链分析见 <a class=link href=Mount%e6%9c%ba%e5%88%b6%e5%88%86%e6%9e%90.md>Mount 机制分析</a>，本节侧重 mount 在 VFS 整体架构中的角色。</p></blockquote><h3 id=41-mount-的本质>4.1 mount 的本质</h3><p>你的理解是对的：<strong>mount 就是把磁盘里的文件系统和 VFS 目录树建立联系</strong>。更精确地说：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>mount(&#34;/dev/sda1&#34;, &#34;/mnt/disk&#34;, &#34;ext4&#34;, 0, NULL) 做了三件事:
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>1. 读磁盘 → 创建内存对象
+</span></span><span class=line><span class=cl>   ┌──────────────┐         ┌─────────────────────────────┐
+</span></span><span class=line><span class=cl>   │  /dev/sda1   │ ──读──→ │ super_block + 根inode + 根dentry │
+</span></span><span class=line><span class=cl>   │  (磁盘字节)   │         │ (内存数据结构)                │
+</span></span><span class=line><span class=cl>   └──────────────┘         └─────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>2. 设置操作函数指针
+</span></span><span class=line><span class=cl>   sb-&gt;s_op  = &amp;ext4_sops;
+</span></span><span class=line><span class=cl>   inode-&gt;i_op  = &amp;ext4_dir_inode_operations;
+</span></span><span class=line><span class=cl>   inode-&gt;i_fop = &amp;ext4_dir_operations;
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>3. 将新文件系统&#34;嫁接&#34;到目录树
+</span></span><span class=line><span class=cl>   VFS 目录树:    /  ─→  mnt  ─→  disk (DCACHE_MOUNTED)
+</span></span><span class=line><span class=cl>                                    ↓  vfsmount
+</span></span><span class=line><span class=cl>   ext4 目录树:                    /  ─→  file1.txt
+</span></span><span class=line><span class=cl>                                       ─→  dir1/
+</span></span></code></pre></td></tr></table></div></div><h3 id=42-挂载点mountpoint的魔法>4.2 挂载点（mountpoint）的魔法</h3><p>mount 的关键一步是在挂载点 dentry 上设置 <code>DCACHE_MOUNTED</code> 标志。路径查找时：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 路径查找逻辑 (fs/namei.c 简化)
+</span></span></span><span class=line><span class=cl><span class=err>走到</span> <span class=n>dentry</span> <span class=s>&#34;disk&#34;</span> <span class=err>时</span><span class=o>:</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>dentry</span><span class=o>-&gt;</span><span class=n>d_flags</span> <span class=o>&amp;</span> <span class=n>DCACHE_MOUNTED</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 查找挂载在此处的 vfsmount
+</span></span></span><span class=line><span class=cl>        <span class=n>vfsmount</span> <span class=o>=</span> <span class=nf>lookup_mnt</span><span class=p>(</span><span class=n>path</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 跨越到新文件系统的根 dentry
+</span></span></span><span class=line><span class=cl>        <span class=n>path</span><span class=o>-&gt;</span><span class=n>dentry</span> <span class=o>=</span> <span class=n>vfsmount</span><span class=o>-&gt;</span><span class=n>mnt_root</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>path</span><span class=o>-&gt;</span><span class=n>mnt</span> <span class=o>=</span> <span class=n>vfsmount</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>这就像"传送门" — 走到挂载点时自动跳到另一个文件系统。</p><h3 id=43-struct-mount--挂载实例的完整信息>4.3 struct mount — 挂载实例的完整信息</h3><p><code>struct vfsmount</code> 只是对外暴露的精简结构，实际的挂载信息保存在 <code>struct mount</code>（<code>fs/mount.h:39</code>）中：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>struct</span> <span class=n>mount</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>hlist_node</span> <span class=n>mnt_hash</span><span class=p>;</span>       <span class=cm>/* 哈希表加速查找 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mount</span> <span class=o>*</span><span class=n>mnt_parent</span><span class=p>;</span>         <span class=cm>/* 父挂载 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>dentry</span> <span class=o>*</span><span class=n>mnt_mountpoint</span><span class=p>;</span>    <span class=cm>/* 挂载点 dentry (disk) */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>vfsmount</span> <span class=n>mnt</span><span class=p>;</span>              <span class=cm>/* 嵌入的 vfsmount */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span> <span class=n>mnt_mounts</span><span class=p>;</span>      <span class=cm>/* 子挂载列表 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span> <span class=n>mnt_child</span><span class=p>;</span>       <span class=cm>/* 在父挂载的子列表中 */</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=kt>char</span> <span class=o>*</span><span class=n>mnt_devname</span><span class=p>;</span>          <span class=cm>/* 设备名 &#34;/dev/sda1&#34; */</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mnt_namespace</span> <span class=o>*</span><span class=n>mnt_ns</span><span class=p>;</span>     <span class=cm>/* 所属 mount namespace */</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>mnt_id</span><span class=p>;</span>                       <span class=cm>/* 唯一挂载 ID */</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>struct mount</code> 和 <code>struct vfsmount</code> 的关系类似于 <code>struct task_struct</code> 和 <code>struct thread_info</code> — 前者是完整的内部表示，后者是精简的对外接口。通过 <code>real_mount()</code> 宏可以从 <code>vfsmount</code> 反推 <code>mount</code>。</p><h3 id=44-mount-的完整调用链>4.4 mount 的完整调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间: mount(&#34;/dev/sda1&#34;, &#34;/mnt/disk&#34;, &#34;ext4&#34;, 0, NULL)
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>SYSCALL_DEFINE5(mount)                    [fs/namespace.c:3651]
+</span></span><span class=line><span class=cl>    │ 拷贝用户空间参数到内核
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>do_mount(dev_name, dir_name, type, flags) [fs/namespace.c:3416]
+</span></span><span class=line><span class=cl>    │ user_path_at() 解析挂载点路径
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>path_mount(dev_name, &amp;path, type, flags)  [fs/namespace.c:3321]
+</span></span><span class=line><span class=cl>    │ 根据 flags 分发:
+</span></span><span class=line><span class=cl>    │   MS_REMOUNT → do_remount()
+</span></span><span class=line><span class=cl>    │   MS_BIND    → do_loopback()
+</span></span><span class=line><span class=cl>    │   MS_MOVE    → do_move_mount_old()
+</span></span><span class=line><span class=cl>    │   默认       → do_new_mount()
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>do_new_mount(path, &#34;ext4&#34;, sb_flags, ...) [fs/namespace.c:2978]
+</span></span><span class=line><span class=cl>    │ ① get_fs_type(&#34;ext4&#34;) → 找到 ext4_fs_type
+</span></span><span class=line><span class=cl>    │ ② fs_context_for_mount() → 创建文件系统上下文
+</span></span><span class=line><span class=cl>    │ ③ vfs_get_tree(fc) → 核心！读取磁盘并创建 super_block
+</span></span><span class=line><span class=cl>    │ ④ do_new_mount_fc() → 将文件系统接入目录树
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>vfs_get_tree(fc)                          [fs/super.c]
+</span></span><span class=line><span class=cl>    │ 调用 fc-&gt;ops-&gt;get_tree(fc)
+</span></span><span class=line><span class=cl>    │ 对于 ext4: ext4_get_tree() → ext4_fill_super()
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>ext4_fill_super(sb, data, silent)         [fs/ext4/super.c]
+</span></span><span class=line><span class=cl>    ├── 打开块设备
+</span></span><span class=line><span class=cl>    ├── 读取磁盘超级块 (偏移 1024 字节)
+</span></span><span class=line><span class=cl>    ├── 验证魔数 0xEF53
+</span></span><span class=line><span class=cl>    ├── 初始化 ext4_sb_info
+</span></span><span class=line><span class=cl>    ├── 设置 sb-&gt;s_op = &amp;ext4_sops
+</span></span><span class=line><span class=cl>    ├── 读取根 inode (ino=2): ext4_iget(sb, EXT4_ROOT_INO)
+</span></span><span class=line><span class=cl>    └── 创建根 dentry: sb-&gt;s_root = d_make_root(root_inode)
+</span></span></code></pre></td></tr></table></div></div><h2 id=五open--从路径到-file-对象>五、open — 从路径到 file 对象</h2><h3 id=51-调用链总览>5.1 调用链总览</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间: int fd = open(&#34;/mnt/disk/file.txt&#34;, O_RDONLY)
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>SYSCALL_DEFINE3(open, filename, flags, mode)  [fs/open.c:1231]
+</span></span><span class=line><span class=cl>    │ force_o_largefile()
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>do_sys_open(AT_FDCWD, filename, flags, mode)  [fs/open.c:1224]
+</span></span><span class=line><span class=cl>    │ → do_sys_openat2()
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>do_sys_openat2(dfd, filename, &amp;how)           [fs/open.c:1195]
+</span></span><span class=line><span class=cl>    │ ① build_open_flags() → 构建 open_flags
+</span></span><span class=line><span class=cl>    │ ② getname(filename) → 从用户空间拷贝文件名
+</span></span><span class=line><span class=cl>    │ ③ get_unused_fd_flags() → 分配 fd 号
+</span></span><span class=line><span class=cl>    │ ④ do_filp_open() → 核心：路径查找 + 打开
+</span></span><span class=line><span class=cl>    │ ⑤ fd_install(fd, file) → 将 file 装入进程 fd 表
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>do_filp_open(dfd, pathname, &amp;op)              [fs/namei.c:3634]
+</span></span><span class=line><span class=cl>    │ 设置 nameidata，先尝试 RCU 路径查找
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>path_openat(&amp;nd, &amp;op, flags)                  [fs/namei.c:3595]
+</span></span><span class=line><span class=cl>    │ ① alloc_empty_file() → 分配空 file 对象
+</span></span><span class=line><span class=cl>    │ ② path_init() → 确定查找起点 (根目录或当前目录)
+</span></span><span class=line><span class=cl>    │ ③ link_path_walk() → 逐段解析路径 &#34;mnt&#34; → &#34;disk&#34; → &#34;file.txt&#34;
+</span></span><span class=line><span class=cl>    │ ④ open_last_lookups() → 处理最后一段 (可能需要创建文件)
+</span></span><span class=line><span class=cl>    │ ⑤ do_open() → 权限检查 + 调用文件系统的 open
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>do_open()
+</span></span><span class=line><span class=cl>    │ vfs_open() → file-&gt;f_op-&gt;open()
+</span></span><span class=line><span class=cl>    │ 对于 ext4: ext4_file_open()
+</span></span><span class=line><span class=cl>    └── 完成! file 对象已就绪
+</span></span></code></pre></td></tr></table></div></div><h3 id=52-路径查找--vfs-最复杂的部分>5.2 路径查找 — VFS 最复杂的部分</h3><p><code>link_path_walk()</code> 是路径解析的核心，对 <code>/mnt/disk/file.txt</code> 逐段处理：</p><ol><li>从当前 dentry 开始（根目录 <code>/</code>）</li><li>取出下一段路径名 <code>mnt</code></li><li>在 dentry 缓存的哈希表中查找 — <strong>这就是 dentry 存在的意义</strong></li><li>如果缓存未命中，调用 <code>inode->i_op->lookup()</code> 从磁盘读取</li><li>检查是否为挂载点（<code>DCACHE_MOUNTED</code>），是则跨越到新文件系统</li><li>检查权限（<code>inode->i_op->permission()</code>）</li><li>重复直到最后一段</li></ol><p>路径查找有两种模式：</p><ul><li><strong>RCU 模式</strong>：无锁快速路径，不增加引用计数，失败回退到 ref 模式</li><li><strong>REF 模式</strong>：传统加锁路径，逐步增加 dentry/vfsmount 的引用计数</li></ul><h3 id=53-fd_install--file-对象和-fd-的绑定>5.3 fd_install — file 对象和 fd 的绑定</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/open.c:1209-1217 (简化)
+</span></span></span><span class=line><span class=cl><span class=n>fd</span> <span class=o>=</span> <span class=nf>get_unused_fd_flags</span><span class=p>(</span><span class=n>how</span><span class=o>-&gt;</span><span class=n>flags</span><span class=p>);</span>  <span class=c1>// 从进程 fd 表找空位
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>f</span> <span class=o>=</span> <span class=nf>do_filp_open</span><span class=p>(</span><span class=n>dfd</span><span class=p>,</span> <span class=n>tmp</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>op</span><span class=p>);</span>  <span class=c1>// 创建 file 对象
+</span></span></span><span class=line><span class=cl><span class=nf>fd_install</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=n>f</span><span class=p>);</span>  <span class=c1>// current-&gt;files-&gt;fdt-&gt;fd[fd] = f
+</span></span></span></code></pre></td></tr></table></div></div><p>从此，进程通过 <code>fd</code> 就能找到 <code>file → dentry → inode → super_block</code>，完成对任何文件系统的透明访问。</p><h2 id=六readwrite--数据流经-vfs>六、read/write — 数据流经 VFS</h2><h3 id=61-read-调用链>6.1 read 调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/read_write.c:631
+</span></span></span><span class=line><span class=cl><span class=nf>SYSCALL_DEFINE3</span><span class=p>(</span><span class=n>read</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>int</span><span class=p>,</span> <span class=n>fd</span><span class=p>,</span> <span class=kt>char</span> <span class=n>__user</span> <span class=o>*</span><span class=p>,</span> <span class=n>buf</span><span class=p>,</span> <span class=kt>size_t</span><span class=p>,</span> <span class=n>count</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>ksys_read</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=n>buf</span><span class=p>,</span> <span class=n>count</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// fs/read_write.c:612
+</span></span></span><span class=line><span class=cl><span class=kt>ssize_t</span> <span class=nf>ksys_read</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>fd</span><span class=p>,</span> <span class=kt>char</span> <span class=n>__user</span> <span class=o>*</span><span class=n>buf</span><span class=p>,</span> <span class=kt>size_t</span> <span class=n>count</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fd</span> <span class=n>f</span> <span class=o>=</span> <span class=nf>fdget_pos</span><span class=p>(</span><span class=n>fd</span><span class=p>);</span>       <span class=c1>// fd → file 对象
+</span></span></span><span class=line><span class=cl>    <span class=kt>loff_t</span> <span class=n>pos</span> <span class=o>=</span> <span class=nf>file_pos_read</span><span class=p>(</span><span class=n>f</span><span class=p>.</span><span class=n>file</span><span class=p>);</span> <span class=c1>// 获取当前偏移
+</span></span></span><span class=line><span class=cl>    <span class=n>ret</span> <span class=o>=</span> <span class=nf>vfs_read</span><span class=p>(</span><span class=n>f</span><span class=p>.</span><span class=n>file</span><span class=p>,</span> <span class=n>buf</span><span class=p>,</span> <span class=n>count</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>pos</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>file_pos_write</span><span class=p>(</span><span class=n>f</span><span class=p>.</span><span class=n>file</span><span class=p>,</span> <span class=n>pos</span><span class=p>);</span>       <span class=c1>// 更新偏移
+</span></span></span><span class=line><span class=cl>    <span class=nf>fdput_pos</span><span class=p>(</span><span class=n>f</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=62-vfs_read--vfs-层的分发点>6.2 vfs_read — VFS 层的分发点</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/read_write.c:465
+</span></span></span><span class=line><span class=cl><span class=kt>ssize_t</span> <span class=nf>vfs_read</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>file</span><span class=p>,</span> <span class=kt>char</span> <span class=n>__user</span> <span class=o>*</span><span class=n>buf</span><span class=p>,</span> <span class=kt>size_t</span> <span class=n>count</span><span class=p>,</span> <span class=kt>loff_t</span> <span class=o>*</span><span class=n>pos</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 权限检查
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>file</span><span class=o>-&gt;</span><span class=n>f_mode</span> <span class=o>&amp;</span> <span class=n>FMODE_READ</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>EBADF</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 地址空间验证
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=o>!</span><span class=nf>access_ok</span><span class=p>(</span><span class=n>buf</span><span class=p>,</span> <span class=n>count</span><span class=p>)))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>EFAULT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 调用具体文件系统实现 ← VFS 多态发生在这里
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>file</span><span class=o>-&gt;</span><span class=n>f_op</span><span class=o>-&gt;</span><span class=n>read</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=n>file</span><span class=o>-&gt;</span><span class=n>f_op</span><span class=o>-&gt;</span><span class=nf>read</span><span class=p>(</span><span class=n>file</span><span class=p>,</span> <span class=n>buf</span><span class=p>,</span> <span class=n>count</span><span class=p>,</span> <span class=n>pos</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>file</span><span class=o>-&gt;</span><span class=n>f_op</span><span class=o>-&gt;</span><span class=n>read_iter</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=nf>new_sync_read</span><span class=p>(</span><span class=n>file</span><span class=p>,</span> <span class=n>buf</span><span class=p>,</span> <span class=n>count</span><span class=p>,</span> <span class=n>pos</span><span class=p>);</span>  <span class=c1>// 包装成 iov_iter 调用
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键一行</strong>：<code>file->f_op->read_iter()</code>。对于 ext4，实际调用的是：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/ext4/file.c:921
+</span></span></span><span class=line><span class=cl><span class=k>const</span> <span class=k>struct</span> <span class=n>file_operations</span> <span class=n>ext4_file_operations</span> <span class=o>=</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>read_iter</span>  <span class=o>=</span> <span class=n>ext4_file_read_iter</span><span class=p>,</span>   <span class=c1>// ← read 最终到达这里
+</span></span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>write_iter</span> <span class=o>=</span> <span class=n>ext4_file_write_iter</span><span class=p>,</span>  <span class=c1>// ← write 最终到达这里
+</span></span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>open</span>       <span class=o>=</span> <span class=n>ext4_file_open</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>fsync</span>      <span class=o>=</span> <span class=n>ext4_sync_file</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>mmap</span>       <span class=o>=</span> <span class=n>ext4_file_mmap</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=63-数据流全貌>6.3 数据流全貌</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间: read(fd, buf, 4096)
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼ 系统调用
+</span></span><span class=line><span class=cl>ksys_read()                    fd → file 对象
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>vfs_read()                     权限检查 + 分发
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼ file-&gt;f_op-&gt;read_iter()
+</span></span><span class=line><span class=cl>ext4_file_read_iter()          ext4 具体实现
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>generic_file_read_iter()       通用页缓存读取
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ├──→ 页缓存命中?
+</span></span><span class=line><span class=cl>    │     是 → copy_to_user()  直接从内存拷贝到用户 buf
+</span></span><span class=line><span class=cl>    │     否 → ↓
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>a_ops-&gt;readahead()             触发磁盘 I/O + 预读
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>submit_bio() → 块设备层 → 磁盘驱动 → 物理磁盘
+</span></span></code></pre></td></tr></table></div></div><p><strong>页缓存（Page Cache）是读性能的关键</strong>：文件数据读取后缓存在 <code>address_space</code> 的页缓存中。同一文件的后续读取直接从内存返回，不需要再访问磁盘。这也是为什么 <code>free -h</code> 中 <code>buff/cache</code> 往往占用很大 — 它在用内存做磁盘缓存。</p><h2 id=七remount--为什么-mount--o-remountrw--能获得写权限>七、remount — 为什么 <code>mount -o remount,rw /</code> 能获得写权限</h2><h3 id=71-场景>7.1 场景</h3><p>嵌入式系统、recovery 模式、或出错时根文件系统以只读挂载（<code>SB_RDONLY</code>）。此时无法修改任何文件。执行：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl>mount -o remount,rw /
+</span></span></code></pre></td></tr></table></div></div><p>重新挂载为读写模式后，就能修改文件了。为什么？</p><h3 id=72-调用链>7.2 调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>mount -o remount,rw /
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ▼ SYSCALL_DEFINE5(mount) → do_mount() → path_mount()
+</span></span><span class=line><span class=cl>    │ 检测到 flags 包含 MS_REMOUNT
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>path_mount()                              [fs/namespace.c:3387]
+</span></span><span class=line><span class=cl>    │ if (flags &amp; MS_REMOUNT)
+</span></span><span class=line><span class=cl>    │     return do_remount(path, flags, sb_flags, mnt_flags, data);
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    │ 注意: 此时 sb_flags 中 SB_RDONLY 位已被清除
+</span></span><span class=line><span class=cl>    │      (因为用户指定了 rw，不再是 rdonly)
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>do_remount()                              [fs/namespace.c:2629]
+</span></span><span class=line><span class=cl>    │ ① 权限检查: ns_capable(sb-&gt;s_user_ns, CAP_SYS_ADMIN)
+</span></span><span class=line><span class=cl>    │ ② 调用 reconfigure_super(fc) 修改超级块标志
+</span></span><span class=line><span class=cl>    │ ③ 调用 set_mount_attributes(mnt, mnt_flags) 修改挂载标志
+</span></span><span class=line><span class=cl>    ▼
+</span></span><span class=line><span class=cl>reconfigure_super(fc)                     [fs/super.c:852]
+</span></span></code></pre></td></tr></table></div></div><h3 id=73-reconfigure_super--标志位翻转>7.3 reconfigure_super — 标志位翻转</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/super.c:917 — 关键一行
+</span></span></span><span class=line><span class=cl><span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>sb</span><span class=o>-&gt;</span><span class=n>s_flags</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>((</span><span class=n>sb</span><span class=o>-&gt;</span><span class=n>s_flags</span> <span class=o>&amp;</span> <span class=o>~</span><span class=n>fc</span><span class=o>-&gt;</span><span class=n>sb_flags_mask</span><span class=p>)</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>     <span class=p>(</span><span class=n>fc</span><span class=o>-&gt;</span><span class=n>sb_flags</span> <span class=o>&amp;</span> <span class=n>fc</span><span class=o>-&gt;</span><span class=n>sb_flags_mask</span><span class=p>)));</span>
+</span></span></code></pre></td></tr></table></div></div><p>这行代码的含义：</p><ul><li><code>fc->sb_flags_mask</code> 包含 <code>SB_RDONLY</code>（表示"我要修改 RDONLY 这个标志"）</li><li><code>fc->sb_flags</code> 中 <code>SB_RDONLY</code> 位为 0（表示"改为非只读"）</li><li>执行后：<code>sb->s_flags</code> 的 <code>SB_RDONLY</code> 位被清零</li></ul><p><strong>之后所有写操作的权限检查都会通过</strong>，因为 VFS 层的写操作检查都是：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>IS_RDONLY</span><span class=p>(</span><span class=n>inode</span><span class=p>))</span>  <span class=c1>// 本质是检查 inode-&gt;i_sb-&gt;s_flags &amp; SB_RDONLY
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=o>-</span><span class=n>EROFS</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>SB_RDONLY</code> 被清除后，<code>IS_RDONLY()</code> 返回 false，写操作放行。</p><h3 id=74-remount-还做了哪些保护>7.4 remount 还做了哪些保护？</h3><p><code>reconfigure_super()</code> 在修改标志前做了安全检查（<code>fs/super.c:868-876</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>fc</span><span class=o>-&gt;</span><span class=n>sb_flags_mask</span> <span class=o>&amp;</span> <span class=n>SB_RDONLY</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 如果要改为读写，但底层块设备本身是只读的（如 CD-ROM），拒绝
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>fc</span><span class=o>-&gt;</span><span class=n>sb_flags</span> <span class=o>&amp;</span> <span class=n>SB_RDONLY</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=n>sb</span><span class=o>-&gt;</span><span class=n>s_bdev</span> <span class=o>&amp;&amp;</span> <span class=nf>bdev_read_only</span><span class=p>(</span><span class=n>sb</span><span class=o>-&gt;</span><span class=n>s_bdev</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>EACCES</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>同时，如果要从读写改为只读（<code>remount_ro = true</code>），需要：</p><ol><li>检查没有文件以写模式打开（<code>sb_prepare_remount_readonly</code>）</li><li>清理页缓存中的脏数据（<code>invalidate_bdev</code>）</li></ol><h2 id=八vfs-四大操作函数表的协作>八、VFS 四大操作函数表的协作</h2><p>用一个完整例子串联所有知识 — 用户执行 <code>cat /mnt/disk/hello.txt</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>步骤 1: open(&#34;/mnt/disk/hello.txt&#34;, O_RDONLY)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  VFS 路径查找:
+</span></span><span class=line><span class=cl>  &#34;/&#34; → dentry 缓存命中 → rootfs 的根 inode
+</span></span><span class=line><span class=cl>  &#34;mnt&#34; → dentry 缓存命中 → rootfs 下的 mnt 目录 inode
+</span></span><span class=line><span class=cl>  &#34;disk&#34; → 发现 DCACHE_MOUNTED → lookup_mnt() → 跨到 ext4 的 vfsmount
+</span></span><span class=line><span class=cl>  &#34;hello.txt&#34; → ext4 inode-&gt;i_op-&gt;lookup() → 从磁盘读目录项 → 找到 inode
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  创建 file 对象:
+</span></span><span class=line><span class=cl>  file-&gt;f_op = inode-&gt;i_fop = &amp;ext4_file_operations
+</span></span><span class=line><span class=cl>  file-&gt;f_pos = 0
+</span></span><span class=line><span class=cl>  fd_install(3, file) → 进程 fd[3] = file
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>步骤 2: read(3, buf, 4096)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  fd[3] → file 对象
+</span></span><span class=line><span class=cl>  vfs_read() → file-&gt;f_op-&gt;read_iter() → ext4_file_read_iter()
+</span></span><span class=line><span class=cl>  → 检查页缓存 → 未命中 → 向块设备发起 I/O → 数据加载到页缓存
+</span></span><span class=line><span class=cl>  → copy_to_user(buf, page_data, count)
+</span></span><span class=line><span class=cl>  → 返回读取字节数
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>步骤 3: close(3)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  fd[3] → file 对象 → f_count--
+</span></span><span class=line><span class=cl>  引用计数归零 → file-&gt;f_op-&gt;release() → ext4_release_file()
+</span></span><span class=line><span class=cl>  → 释放 file 对象
+</span></span><span class=line><span class=cl>  → dentry 和 inode 仍在缓存中（可能被其他进程使用）
+</span></span></code></pre></td></tr></table></div></div><h2 id=九vfs-的设计总结>九、VFS 的设计总结</h2><h3 id=91-设计哲学>9.1 设计哲学</h3><div class=table-wrapper><table><thead><tr><th>设计选择</th><th>为什么</th><th>带来的代价</th></tr></thead><tbody><tr><td>函数指针表做多态</td><td>C 语言没有虚函数，函数指针表是最高效的替代</td><td>间接调用有轻微性能开销；新增操作要改结构体</td></tr><tr><td>dentry 缓存</td><td>路径查找是最频繁的操作，必须避免每次都读磁盘</td><td>消耗大量内存（大型系统可能缓存数百万 dentry）</td></tr><tr><td>inode 和 dentry 分离</td><td>支持硬链接；inode 号才是文件身份，文件名只是别名</td><td>需要维护两套缓存和它们的映射关系</td></tr><tr><td>file 独立于 inode</td><td>同一文件的多次 open 需要独立的读写偏移和打开模式</td><td>每次 open 都要分配内存</td></tr><tr><td>super_block 的 s_fs_info</td><td>让 VFS 不依赖任何具体文件系统的数据结构</td><td>类型不安全（void *），需要文件系统自己管理</td></tr></tbody></table></div><h3 id=92-vfs-处理的文件系统种类>9.2 VFS 处理的文件系统种类</h3><p>VFS 不仅仅是为磁盘文件系统设计的：</p><div class=table-wrapper><table><thead><tr><th>类型</th><th>示例</th><th>有磁盘？</th><th>FS_REQUIRES_DEV</th></tr></thead><tbody><tr><td>磁盘文件系统</td><td>ext4, xfs, btrfs</td><td>有</td><td>是</td></tr><tr><td>网络文件系统</td><td>NFS, CIFS, 9P</td><td>无（网络）</td><td>否</td></tr><tr><td>伪文件系统</td><td>procfs, sysfs, debugfs</td><td>无（内存）</td><td>否</td></tr><tr><td>内存文件系统</td><td>tmpfs, ramfs</td><td>无（内存）</td><td>否</td></tr><tr><td>特殊文件系统</td><td>devtmpfs, sockfs, pipefs</td><td>无</td><td>否</td></tr></tbody></table></div><p>它们都通过相同的 <code>register_filesystem</code> 注册，通过相同的 <code>open/read/write</code> 接口访问。这就是 Unix &ldquo;一切皆文件"哲学的实现基础。</p><h3 id=93-一句话总结>9.3 一句话总结</h3><p><strong>VFS 是 Linux 内核中最典型的"面向对象"设计 — 用 <code>super_block</code> / <code>inode</code> / <code>dentry</code> / <code>file</code> 四个对象和三组操作函数表（<code>super_operations</code> / <code>inode_operations</code> / <code>file_operations</code>），将几十种完全不同的文件系统统一在一棵目录树和一套系统调用之下。mount 负责建立连接，open 负责创建会话，read/write 通过函数指针分派到具体实现。</strong></p></section><footer class=article-footer><section class=article-tags><a href=/tags/vfs/>VFS</a>
+<a href=/tags/super_block/>Super_block</a>
+<a href=/tags/inode/>Inode</a>
+<a href=/tags/dentry/>Dentry</a>
+<a href=/tags/file/>File</a>
+<a href=/tags/file_operations/>File_operations</a>
+<a href=/tags/mount/>Mount</a>
+<a href=/tags/open/>Open</a>
+<a href=/tags/read/>Read</a>
+<a href=/tags/write/>Write</a>
+<a href=/tags/ext4/>Ext4</a>
+<a href=/tags/remount/>Remount</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/%E4%B8%BA%E4%BB%80%E4%B9%88%E7%A3%81%E7%9B%98%E9%9C%80%E8%A6%81-mount-%E6%89%8D%E8%83%BD%E4%BD%BF%E7%94%A8-%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>为什么磁盘需要 Mount 才能使用 - 内核源码分析</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

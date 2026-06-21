@@ -1,0 +1,949 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="共享库加载与内存共享机制 Linux 5.15.78 下共享库（.so）从文件到进程虚拟地址空间的完整加载路径：ELF 段解析 → VMA 创建 → 缺页按需加载 → 物理页共享与 COW 隔离。所有流程均来自内核源码。\n前置阅读：内存管理完全指南 — VMA、缺页处理、伙伴系统的基本流程。 相关文档：x86_64 虚拟内存布局 — 进程地址空间中各段（.text/.data/mmap）的位置。\n零、三个常见疑问的直觉回答 Q1：内核是一次性把整个 .so 读进内存，还是按需加载？ 不是整个 .so。 内核只做两件事，其余全靠缺页中断按需加载：\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 步骤 1: 读文件头（几百字节） elf_read(file, &amp;elf_ex, sizeof(elf_ex), 0) → 64 字节 ELF header elf_read(file, phdata, size, elf_ex.e_phoff) → N × 56 字节 program headers 此时内核已知： PT_LOAD #1: offset=0x0000, filesz=0x1234, flags=R+X ← .text + .rodata PT_LOAD #2: offset=0x2000, filesz=0x0456, flags=RW ← .data + .bss PT_NOTE: offset=0x1500 ← 跳过，不处理 PT_DYNAMIC: offset=0x1800 ← 跳过，不处理 步骤 2: 对每个 PT_LOAD 调 mmap()，只建 VMA，不读文件 elf_map() → vm_mmap(file, addr, size, prot, MAP_PRIVATE, offset) → 创建 VMA: 虚拟地址 → (inode, 文件偏移) 的映射关系 → 物理内存：空。页表项：空。 步骤 3: 进程首次访问时才触发 page fault，从磁盘读入那一页（4KB） 结论：如果一个 .so 有 100 页代码但进程只调了 1 个函数，可能只有 1-2 页被加载到物理内存。.symtab、.strtab、.note 等非 PT_LOAD 段永远不会被映射。\n"><title>共享库加载与内存共享机制</title><link rel=canonical href=https://1bit2.github.io/p/%E5%85%B1%E4%BA%AB%E5%BA%93%E5%8A%A0%E8%BD%BD%E4%B8%8E%E5%86%85%E5%AD%98%E5%85%B1%E4%BA%AB%E6%9C%BA%E5%88%B6/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="共享库加载与内存共享机制"><meta property='og:description' content="共享库加载与内存共享机制 Linux 5.15.78 下共享库（.so）从文件到进程虚拟地址空间的完整加载路径：ELF 段解析 → VMA 创建 → 缺页按需加载 → 物理页共享与 COW 隔离。所有流程均来自内核源码。\n前置阅读：内存管理完全指南 — VMA、缺页处理、伙伴系统的基本流程。 相关文档：x86_64 虚拟内存布局 — 进程地址空间中各段（.text/.data/mmap）的位置。\n零、三个常见疑问的直觉回答 Q1：内核是一次性把整个 .so 读进内存，还是按需加载？ 不是整个 .so。 内核只做两件事，其余全靠缺页中断按需加载：\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 步骤 1: 读文件头（几百字节） elf_read(file, &amp;elf_ex, sizeof(elf_ex), 0) → 64 字节 ELF header elf_read(file, phdata, size, elf_ex.e_phoff) → N × 56 字节 program headers 此时内核已知： PT_LOAD #1: offset=0x0000, filesz=0x1234, flags=R+X ← .text + .rodata PT_LOAD #2: offset=0x2000, filesz=0x0456, flags=RW ← .data + .bss PT_NOTE: offset=0x1500 ← 跳过，不处理 PT_DYNAMIC: offset=0x1800 ← 跳过，不处理 步骤 2: 对每个 PT_LOAD 调 mmap()，只建 VMA，不读文件 elf_map() → vm_mmap(file, addr, size, prot, MAP_PRIVATE, offset) → 创建 VMA: 虚拟地址 → (inode, 文件偏移) 的映射关系 → 物理内存：空。页表项：空。 步骤 3: 进程首次访问时才触发 page fault，从磁盘读入那一页（4KB） 结论：如果一个 .so 有 100 页代码但进程只调了 1 个函数，可能只有 1-2 页被加载到物理内存。.symtab、.strtab、.note 等非 PT_LOAD 段永远不会被映射。\n"><meta property='og:url' content='https://1bit2.github.io/p/%E5%85%B1%E4%BA%AB%E5%BA%93%E5%8A%A0%E8%BD%BD%E4%B8%8E%E5%86%85%E5%AD%98%E5%85%B1%E4%BA%AB%E6%9C%BA%E5%88%B6/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='共享库'><meta property='article:tag' content='mmap'><meta property='article:tag' content='VMA'><meta property='article:tag' content='缺页中断'><meta property='article:tag' content='COW'><meta property='article:tag' content='page cache'><meta property='article:tag' content='ELF'><meta property='article:tag' content='PT_LOAD'><meta property='article:published_time' content='2026-06-10T00:00:00+00:00'><meta property='article:modified_time' content='2026-06-10T00:00:00+00:00'><meta name=twitter:title content="共享库加载与内存共享机制"><meta name=twitter:description content="共享库加载与内存共享机制 Linux 5.15.78 下共享库（.so）从文件到进程虚拟地址空间的完整加载路径：ELF 段解析 → VMA 创建 → 缺页按需加载 → 物理页共享与 COW 隔离。所有流程均来自内核源码。\n前置阅读：内存管理完全指南 — VMA、缺页处理、伙伴系统的基本流程。 相关文档：x86_64 虚拟内存布局 — 进程地址空间中各段（.text/.data/mmap）的位置。\n零、三个常见疑问的直觉回答 Q1：内核是一次性把整个 .so 读进内存，还是按需加载？ 不是整个 .so。 内核只做两件事，其余全靠缺页中断按需加载：\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 步骤 1: 读文件头（几百字节） elf_read(file, &amp;elf_ex, sizeof(elf_ex), 0) → 64 字节 ELF header elf_read(file, phdata, size, elf_ex.e_phoff) → N × 56 字节 program headers 此时内核已知： PT_LOAD #1: offset=0x0000, filesz=0x1234, flags=R+X ← .text + .rodata PT_LOAD #2: offset=0x2000, filesz=0x0456, flags=RW ← .data + .bss PT_NOTE: offset=0x1500 ← 跳过，不处理 PT_DYNAMIC: offset=0x1800 ← 跳过，不处理 步骤 2: 对每个 PT_LOAD 调 mmap()，只建 VMA，不读文件 elf_map() → vm_mmap(file, addr, size, prot, MAP_PRIVATE, offset) → 创建 VMA: 虚拟地址 → (inode, 文件偏移) 的映射关系 → 物理内存：空。页表项：空。 步骤 3: 进程首次访问时才触发 page fault，从磁盘读入那一页（4KB） 结论：如果一个 .so 有 100 页代码但进程只调了 1 个函数，可能只有 1-2 页被加载到物理内存。.symtab、.strtab、.note 等非 PT_LOAD 段永远不会被映射。\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#零三个常见疑问的直觉回答>零、三个常见疑问的直觉回答</a><ol><li><a href=#q1内核是一次性把整个-so-读进内存还是按需加载>Q1：内核是一次性把整个 .so 读进内存，还是按需加载？</a></li><li><a href=#q2textrodata-在同一个-pt_load-段里所有进程共享这个物理页吗怎么实现的>Q2：.text/.rodata 在同一个 PT_LOAD 段里，所有进程共享这个物理页吗？怎么实现的？</a></li><li><a href=#q3全局变量和常量落在进程的哪块内存区域>Q3：全局变量和常量落在进程的哪块内存区域？</a></li><li><a href=#q4page-cache-是物理内存吗cow-是复制整个段还是单个页>Q4：page cache 是物理内存吗？COW 是复制整个段还是单个页？</a></li></ol></li><li><a href=#一so-文件的-elf-段结构>一、SO 文件的 ELF 段结构</a></li><li><a href=#二加载触发谁调用-mmap>二、加载触发：谁调用 mmap</a></li><li><a href=#三阶段一elf_map--参数转换>三、阶段一：elf_map() — 参数转换</a></li><li><a href=#四阶段二vm_mmap--do_mmap--参数校验与地址选择>四、阶段二：vm_mmap → do_mmap — 参数校验与地址选择</a></li><li><a href=#五阶段三mmap_region--创建-vma>五、阶段三：mmap_region() — 创建 VMA</a><ol><li><a href=#call_mmap-做了什么>call_mmap() 做了什么</a></li></ol></li><li><a href=#六阶段四缺页中断--按需加载物理页>六、阶段四：缺页中断 — 按需加载物理页</a><ol><li><a href=#61-缺页入口do_fault>6.1 缺页入口：do_fault()</a></li><li><a href=#62-读缺页do_read_fault--加载-text-页面>6.2 读缺页：do_read_fault() — 加载 .text 页面</a></li><li><a href=#63-filemap_fault--从-page-cache-或磁盘获取页面>6.3 filemap_fault() — 从 page cache 或磁盘获取页面</a></li><li><a href=#64-写缺页do_cow_fault--data-段的-copy-on-write>6.4 写缺页：do_cow_fault() — .data 段的 Copy-on-Write</a></li><li><a href=#65-已映射页面的写保护do_wp_page>6.5 已映射页面的写保护：do_wp_page()</a></li></ol></li><li><a href=#七两个进程的物理内存分布>七、两个进程的物理内存分布</a></li><li><a href=#八加载完成后的进程内存布局>八、加载完成后的进程内存布局</a></li><li><a href=#九内存存储数据与地址的本质>九、内存存储数据与地址的本质</a></li><li><a href=#十完整调用链一览>十、完整调用链一览</a></li><li><a href=#十一观察与验证>十一、观察与验证</a></li><li><a href=#十二参考资料>十二、参考资料</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E5%86%85%E5%AD%98/ style=background-color:#4285f4;color:#fff>内存</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/%E5%85%B1%E4%BA%AB%E5%BA%93%E5%8A%A0%E8%BD%BD%E4%B8%8E%E5%86%85%E5%AD%98%E5%85%B1%E4%BA%AB%E6%9C%BA%E5%88%B6/>共享库加载与内存共享机制</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Jun 10, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>14 minute read</time></div></footer></div></header><section class=article-content><h1 id=共享库加载与内存共享机制>共享库加载与内存共享机制</h1><blockquote><p>Linux 5.15.78 下共享库（.so）从文件到进程虚拟地址空间的完整加载路径：ELF 段解析 → VMA 创建 → 缺页按需加载 → 物理页共享与 COW 隔离。所有流程均来自内核源码。</p><p>前置阅读：<a class=link href=%e5%86%85%e5%ad%98%e7%ae%a1%e7%90%86%e5%ae%8c%e5%85%a8%e6%8c%87%e5%8d%97.md>内存管理完全指南</a> — VMA、缺页处理、伙伴系统的基本流程。
+相关文档：<a class=link href=x86_64%e8%99%9a%e6%8b%9f%e5%86%85%e5%ad%98%e5%b8%83%e5%b1%80.md>x86_64 虚拟内存布局</a> — 进程地址空间中各段（.text/.data/mmap）的位置。</p></blockquote><hr><h2 id=零三个常见疑问的直觉回答>零、三个常见疑问的直觉回答</h2><h3 id=q1内核是一次性把整个-so-读进内存还是按需加载>Q1：内核是一次性把整个 .so 读进内存，还是按需加载？</h3><p><strong>不是整个 .so。</strong> 内核只做两件事，其余全靠缺页中断按需加载：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>步骤 1: 读文件头（几百字节）
+</span></span><span class=line><span class=cl>  elf_read(file, &amp;elf_ex, sizeof(elf_ex), 0)     → 64 字节 ELF header
+</span></span><span class=line><span class=cl>  elf_read(file, phdata, size, elf_ex.e_phoff)   → N × 56 字节 program headers
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  此时内核已知：
+</span></span><span class=line><span class=cl>    PT_LOAD #1: offset=0x0000, filesz=0x1234, flags=R+X  ← .text + .rodata
+</span></span><span class=line><span class=cl>    PT_LOAD #2: offset=0x2000, filesz=0x0456, flags=RW   ← .data + .bss
+</span></span><span class=line><span class=cl>    PT_NOTE:    offset=0x1500  ← 跳过，不处理
+</span></span><span class=line><span class=cl>    PT_DYNAMIC: offset=0x1800  ← 跳过，不处理
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>步骤 2: 对每个 PT_LOAD 调 mmap()，只建 VMA，不读文件
+</span></span><span class=line><span class=cl>  elf_map() → vm_mmap(file, addr, size, prot, MAP_PRIVATE, offset)
+</span></span><span class=line><span class=cl>  → 创建 VMA: 虚拟地址 → (inode, 文件偏移) 的映射关系
+</span></span><span class=line><span class=cl>  → 物理内存：空。页表项：空。
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>步骤 3: 进程首次访问时才触发 page fault，从磁盘读入那一页（4KB）
+</span></span></code></pre></td></tr></table></div></div><p><strong>结论</strong>：如果一个 .so 有 100 页代码但进程只调了 1 个函数，可能只有 1-2 页被加载到物理内存。<code>.symtab</code>、<code>.strtab</code>、<code>.note</code> 等非 PT_LOAD 段永远不会被映射。</p><h3 id=q2textrodata-在同一个-pt_load-段里所有进程共享这个物理页吗怎么实现的>Q2：.text/.rodata 在同一个 PT_LOAD 段里，所有进程共享这个物理页吗？怎么实现的？</h3><p><strong>共享。</strong> 机制是 page cache — 一个以 <code>(inode, 页偏移)</code> 为 key 的全局物理页缓存：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>.so 文件 (inode=12345)            page cache (全局)
+</span></span><span class=line><span class=cl>┌──────────────┐                 ┌──────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ offset 0x0000│──首次缺页加载──→│ key=(12345, 0) → 物理页 A (.text)│
+</span></span><span class=line><span class=cl>│ (.text 前4KB)│                 │ key=(12345, 1) → 物理页 B (.text)│
+</span></span><span class=line><span class=cl>│ offset 0x1000│──首次缺页加载──→│ key=(12345, 2) → 物理页 C (.rodata)│
+</span></span><span class=line><span class=cl>│ (.rodata)    │                 └──────────┬──────────┬────────────┘
+</span></span><span class=line><span class=cl>└──────────────┘                            │          │
+</span></span><span class=line><span class=cl>                              ┌─────────────┘          └──────────────┐
+</span></span><span class=line><span class=cl>                              ▼                                       ▼
+</span></span><span class=line><span class=cl>                    进程 A 的页表                              进程 B 的页表
+</span></span><span class=line><span class=cl>                    PTE: VA_A → 物理页 A (只读)               PTE: VA_B → 物理页 A (只读)
+</span></span><span class=line><span class=cl>                    PTE: VA_A+4K → 物理页 C (只读)            PTE: VA_B+4K → 物理页 C (只读)
+</span></span><span class=line><span class=cl>                              同一物理页                                   同一物理页
+</span></span></code></pre></td></tr></table></div></div><p><strong>进程 A 先 <code>dlopen</code></strong>：首次执行 <code>.text</code> 中的代码 → page fault → 内核查 page cache 未命中 → 从磁盘读入 4KB → 存入 page cache → 建立 A 的页表项。</p><p><strong>进程 B 后 <code>dlopen</code> 同一个 .so</strong>：首次执行同一函数 → page fault → 内核查 page cache <strong>命中</strong>（<code>find_get_page(mapping, offset)</code> 返回同一个 <code>struct page</code>）→ 直接建立 B 的页表项，指向同一物理页。零磁盘 IO。</p><p><strong>为什么 .text/.rodata 永远共享，而 .data 不会？</strong> <code>.text</code>/<code>.rodata</code> 的 VMA 权限是 <code>R+X</code>（不可写），永远不会触发写保护缺页（<code>do_wp_page</code>），所以页表永远指向 page cache 中的同一物理页。<code>.data</code> 的 VMA 权限是 <code>RW</code>（可写），初始也共享 page cache 页，但首次写入时 <code>do_wp_page()</code> → <code>wp_page_copy()</code> 分配新物理页并复制，此后各进程独立。</p><h3 id=q3全局变量和常量落在进程的哪块内存区域>Q3：全局变量和常量落在进程的哪块内存区域？</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>进程虚拟地址空间:
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>0x0000_0000_0000 ┌──────────────────────┐
+</span></span><span class=line><span class=cl>                 │  主程序 .text/.data   │
+</span></span><span class=line><span class=cl>                 ├──────────────────────┤
+</span></span><span class=line><span class=cl>                 │  堆 (brk/mmap)       │
+</span></span><span class=line><span class=cl>                 │        ↓              │
+</span></span><span class=line><span class=cl>                 ├──────────────────────┤
+</span></span><span class=line><span class=cl>                 │  .so: R+X (PT_LOAD#1)│ ← .text + .rodata → 多进程共享物理页
+</span></span><span class=line><span class=cl>                 │  .so: RW  (PT_LOAD#2)│ ← .data + .bss → 写入时 COW 私有
+</span></span><span class=line><span class=cl>                 ├──────────────────────┤
+</span></span><span class=line><span class=cl>                 │  栈 / [vdso]         │
+</span></span><span class=line><span class=cl>0xFFFF_8000_0000 ├──────────────────────┤
+</span></span><span class=line><span class=cl>                 │  内核空间             │
+</span></span></code></pre></td></tr></table></div></div><p><strong>不在主程序的堆上</strong>。全局变量（<code>.data</code>/<code>.bss</code>）和常量（<code>.rodata</code>）都在 .so 的 mmap 映射区。通过 <code>dlsym()</code> 拿到的指针，指向的就是这个 mmap 区域内的虚拟地址。</p><h3 id=q4page-cache-是物理内存吗cow-是复制整个段还是单个页>Q4：page cache 是物理内存吗？COW 是复制整个段还是单个页？</h3><p><strong>page cache 就是物理内存（RAM）。</strong> 它和进程的堆/栈使用的匿名页是同一种东西 — 都是物理页帧，区别只在于内容和回收策略：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>物理内存 (RAM):
+</span></span><span class=line><span class=cl>┌────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│  page cache 页                    匿名页               │
+</span></span><span class=line><span class=cl>│  ┌──────────────────┐    ┌──────────────────────┐      │
+</span></span><span class=line><span class=cl>│  │ libfoo.so .text   │    │ 进程 A 的栈          │      │
+</span></span><span class=line><span class=cl>│  │ libfoo.so .rodata │    │ 进程 A 的堆          │      │
+</span></span><span class=line><span class=cl>│  │ libfoo.so .data   │    │ A 的 COW 私有副本    │      │
+</span></span><span class=line><span class=cl>│  └──────────────────┘    └──────────────────────┘      │
+</span></span><span class=line><span class=cl>│  内容来自磁盘文件              内容来自进程运行          │
+</span></span><span class=line><span class=cl>│  按 (inode, offset) 索引     按 (anon_vma, VA) 索引    │
+</span></span><span class=line><span class=cl>│  内存压力时直接丢弃            内存压力时交换到 swap     │
+</span></span><span class=line><span class=cl>│  (磁盘有副本,需要时再读回)     (无磁盘副本,必须持久化)   │
+</span></span><span class=line><span class=cl>└────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><p><strong>COW 是按页粒度（4KB），不是整个段一次性复制。</strong> 如果 <code>.data</code> 段占 10 个页，进程只写了其中 1 个页的全局变量，内核只为那 1 页分配新物理页并复制，其余 9 页仍然与 page cache 共享：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>初始状态 — A、B 共享 .data 段的 3 个 page cache 物理页:
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  A 页表                   page cache (物理内存)          B 页表
+</span></span><span class=line><span class=cl>  ┌─────────┐             ┌──────────┐                ┌─────────┐
+</span></span><span class=line><span class=cl>  │ 页 0 ───┼────────────→│ 物理页 Y0 │←───────────────┼── 页 0  │  共享
+</span></span><span class=line><span class=cl>  │ 页 1 ───┼────────────→│ 物理页 Y1 │←───────────────┼── 页 1  │  共享
+</span></span><span class=line><span class=cl>  │ 页 2 ───┼────────────→│ 物理页 Y2 │←───────────────┼── 页 2  │  共享
+</span></span><span class=line><span class=cl>  └─────────┘             └──────────┘                └─────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>A 写 page 1 中的全局变量 g_count = 99:
+</span></span><span class=line><span class=cl>  → do_wp_page() → wp_page_copy()
+</span></span><span class=line><span class=cl>  → 只复制 Y1 为 Z1，Y0 和 Y2 仍然共享
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  A 页表                   page cache (物理内存)          B 页表
+</span></span><span class=line><span class=cl>  ┌─────────┐             ┌──────────┐                ┌─────────┐
+</span></span><span class=line><span class=cl>  │ 页 0 ───┼────────────→│ 物理页 Y0 │←───────────────┼── 页 0  │  仍共享
+</span></span><span class=line><span class=cl>  │ 页 1 ───┼──┐          │ 物理页 Y1 │  ←─────────────┼── 页 1  │  仍共享
+</span></span><span class=line><span class=cl>  └─────────┘  │          │(原始数据) │                └─────────┘
+</span></span><span class=line><span class=cl>               │          └──────────┘
+</span></span><span class=line><span class=cl>               └─────────→┌──────────┐
+</span></span><span class=line><span class=cl>                           │ 物理页 Z1 │  ← A 的匿名私有页
+</span></span><span class=line><span class=cl>                           │ g_count=99│     B 看不到这次修改
+</span></span><span class=line><span class=cl>                           └──────────┘
+</span></span></code></pre></td></tr></table></div></div><p><strong>page cache 中的原始页永远不会被 COW 修改</strong> — <code>wp_page_copy()</code> 分配一个<strong>新的匿名物理页</strong>，将原始内容复制过去，然后更新该进程的 PTE 指向新页。page cache 中的 Y1 保持不变，B 仍然读到原始值 <code>g_count = 42</code>。</p><p><strong>进程退出后 page cache 页不消失。</strong> page cache 是内核的全局资源，按 <code>(inode, 页偏移)</code> 索引，不属于任何进程。加载 .so 的进程退出后，page cache 中的物理页仍然保留（直到内存压力触发回收）。后续进程 dlopen 同一 .so 时仍然命中 page cache，无需重新读磁盘。</p><hr><h2 id=一so-文件的-elf-段结构>一、SO 文件的 ELF 段结构</h2><p><code>.so</code> 是位置无关的 ELF 共享目标文件（<code>ET_DYN</code>），由若干 <strong>PT_LOAD 段</strong>组成。每个段描述一块需要加载到内存的内容（<code>include/uapi/linux/elf.h:256</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/uapi/linux/elf.h:256
+</span></span></span><span class=line><span class=cl><span class=k>typedef</span> <span class=k>struct</span> <span class=n>elf64_phdr</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>Elf64_Word</span>  <span class=n>p_type</span><span class=p>;</span>     <span class=c1>// 段类型: PT_LOAD = 1
+</span></span></span><span class=line><span class=cl>    <span class=n>Elf64_Word</span>  <span class=n>p_flags</span><span class=p>;</span>    <span class=c1>// 权限: PF_R(4) | PF_W(2) | PF_X(1)
+</span></span></span><span class=line><span class=cl>    <span class=n>Elf64_Off</span>   <span class=n>p_offset</span><span class=p>;</span>   <span class=c1>// 段在文件中的字节偏移
+</span></span></span><span class=line><span class=cl>    <span class=n>Elf64_Addr</span>  <span class=n>p_vaddr</span><span class=p>;</span>    <span class=c1>// 段链接时的虚拟地址 (相对值)
+</span></span></span><span class=line><span class=cl>    <span class=n>Elf64_Addr</span>  <span class=n>p_paddr</span><span class=p>;</span>    <span class=c1>// 物理地址 (不使用, 为 0)
+</span></span></span><span class=line><span class=cl>    <span class=n>Elf64_Xword</span> <span class=n>p_filesz</span><span class=p>;</span>   <span class=c1>// 段在文件中占的字节数
+</span></span></span><span class=line><span class=cl>    <span class=n>Elf64_Xword</span> <span class=n>p_memsz</span><span class=p>;</span>    <span class=c1>// 段在内存中占的字节数 (memsz &gt; filesz 部分为 .bss)
+</span></span></span><span class=line><span class=cl>    <span class=n>Elf64_Xword</span> <span class=n>p_align</span><span class=p>;</span>    <span class=c1>// 对齐粒度 (通常 0x1000 = 4KB)
+</span></span></span><span class=line><span class=cl><span class=p>}</span> <span class=n>Elf64_Phdr</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>典型的 <code>libfoo.so</code> 有 2 个 PT_LOAD 段：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>  readelf -l libfoo.so:
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  Type  Offset   VirtAddr         PhysAddr  FileSiz  MemSiz   Flg  Align
+</span></span><span class=line><span class=cl>  LOAD  0x000000 0x000000000000   0x...     0x1234   0x1234   R E  0x1000
+</span></span><span class=line><span class=cl>        └─ 代码段: .text + .rodata + .plt     filesz == memsz (无 BSS)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  LOAD  0x002000 0x000000003000   0x...     0x0100   0x0200   RW   0x1000
+</span></span><span class=line><span class=cl>        └─ 数据段: .data + .got + .bss        memsz &gt; filesz → 多出 0x100 是 .bss
+</span></span></code></pre></td></tr></table></div></div><p><strong>设计思考</strong>：<code>.so</code> 不指定绝对加载地址，<code>p_vaddr</code> 是相对偏移。这使得同一个 <code>.so</code> 可以被加载到任意虚拟地址（ASLR 随机化），是位置无关代码（PIC, <code>-fPIC</code>）的基础。</p><hr><h2 id=二加载触发谁调用-mmap>二、加载触发：谁调用 mmap</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=err>①</span> <span class=err>程序启动时</span> <span class=p>(</span><span class=err>静态依赖</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>   <span class=n>execve</span><span class=p>()</span> <span class=err>→</span> <span class=n>load_elf_binary</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>     <span class=err>→</span> <span class=err>读取</span> <span class=n>PT_INTERP</span> <span class=err>段，发现需要</span> <span class=o>/</span><span class=n>lib64</span><span class=o>/</span><span class=n>ld</span><span class=o>-</span><span class=n>linux</span><span class=o>-</span><span class=n>x86</span><span class=o>-</span><span class=mf>64.</span><span class=n>so</span><span class=o>.</span><span class=mi>2</span>
+</span></span><span class=line><span class=cl>     <span class=err>→</span> <span class=n>load_elf_interp</span><span class=p>()</span> <span class=err>→</span> <span class=n>elf_map</span><span class=p>()</span> <span class=err>→</span> <span class=n>vm_mmap</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=err>②</span> <span class=err>运行时</span> <span class=n>dlopen</span><span class=p>()</span> <span class=p>(</span><span class=err>动态依赖</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>   <span class=n>dlopen</span><span class=p>(</span><span class=s2>&#34;libfoo.so&#34;</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>     <span class=err>→</span> <span class=n>ld</span><span class=o>-</span><span class=n>linux</span><span class=o>.</span><span class=n>so</span> <span class=err>解析</span> <span class=n>ELF</span> <span class=err>→</span> <span class=n>open</span><span class=p>()</span> <span class=o>+</span> <span class=n>mmap</span><span class=p>()</span> <span class=err>系统调用</span>
+</span></span><span class=line><span class=cl>     <span class=err>→</span> <span class=n>do_mmap</span><span class=p>()</span> <span class=err>→</span> <span class=n>mmap_region</span><span class=p>()</span>
+</span></span></code></pre></td></tr></table></div></div><p>无论哪种方式，最终都走到同一条内核路径。</p><hr><h2 id=三阶段一elf_map--参数转换>三、阶段一：elf_map() — 参数转换</h2><p>内核遍历所有 PT_LOAD 段，对每段调用 <code>elf_map()</code>（<code>fs/binfmt_elf.c:409</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/binfmt_elf.c:409
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=nf>elf_map</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>filep</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>addr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=k>const</span> <span class=k>struct</span> <span class=n>elf_phdr</span> <span class=o>*</span><span class=n>eppnt</span><span class=p>,</span> <span class=kt>int</span> <span class=n>prot</span><span class=p>,</span> <span class=kt>int</span> <span class=n>type</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>total_size</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>size</span> <span class=o>=</span> <span class=n>eppnt</span><span class=o>-&gt;</span><span class=n>p_filesz</span> <span class=o>+</span> <span class=nf>ELF_PAGEOFFSET</span><span class=p>(</span><span class=n>eppnt</span><span class=o>-&gt;</span><span class=n>p_vaddr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>off</span>  <span class=o>=</span> <span class=n>eppnt</span><span class=o>-&gt;</span><span class=n>p_offset</span> <span class=o>-</span> <span class=nf>ELF_PAGEOFFSET</span><span class=p>(</span><span class=n>eppnt</span><span class=o>-&gt;</span><span class=n>p_vaddr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>addr</span> <span class=o>=</span> <span class=nf>ELF_PAGESTART</span><span class=p>(</span><span class=n>addr</span><span class=p>);</span>   <span class=c1>// 页对齐地址 (向下到 4KB)
+</span></span></span><span class=line><span class=cl>    <span class=n>size</span> <span class=o>=</span> <span class=nf>ELF_PAGEALIGN</span><span class=p>(</span><span class=n>size</span><span class=p>);</span>   <span class=c1>// 页对齐大小 (向上到 4KB)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>total_size</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ET_DYN 首个段: 先映射整个 .so 映像大小，再 munmap 多余部分
+</span></span></span><span class=line><span class=cl>        <span class=c1>// 目的: 预留完整地址空间，防止 ASLR 导致段之间被其他映射插入
+</span></span></span><span class=line><span class=cl>        <span class=n>total_size</span> <span class=o>=</span> <span class=nf>ELF_PAGEALIGN</span><span class=p>(</span><span class=n>total_size</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>map_addr</span> <span class=o>=</span> <span class=nf>vm_mmap</span><span class=p>(</span><span class=n>filep</span><span class=p>,</span> <span class=n>addr</span><span class=p>,</span> <span class=n>total_size</span><span class=p>,</span> <span class=n>prot</span><span class=p>,</span> <span class=n>type</span><span class=p>,</span> <span class=n>off</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>BAD_ADDR</span><span class=p>(</span><span class=n>map_addr</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=nf>vm_munmap</span><span class=p>(</span><span class=n>map_addr</span> <span class=o>+</span> <span class=n>size</span><span class=p>,</span> <span class=n>total_size</span> <span class=o>-</span> <span class=n>size</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 后续段: 按实际大小映射
+</span></span></span><span class=line><span class=cl>        <span class=n>map_addr</span> <span class=o>=</span> <span class=nf>vm_mmap</span><span class=p>(</span><span class=n>filep</span><span class=p>,</span> <span class=n>addr</span><span class=p>,</span> <span class=n>size</span><span class=p>,</span> <span class=n>prot</span><span class=p>,</span> <span class=n>type</span><span class=p>,</span> <span class=n>off</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>map_addr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>参数转换示例</strong>（代码段 PT_LOAD#1）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>输入:
+</span></span><span class=line><span class=cl>  p_offset  = 0x0000     p_vaddr  = 0x0000
+</span></span><span class=line><span class=cl>  p_filesz  = 0x1234     p_flags  = PF_R | PF_X
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>转换:
+</span></span><span class=line><span class=cl>  size = 0x1234 + (0x0000 &amp; 0xFFF) = 0x1234
+</span></span><span class=line><span class=cl>       → ELF_PAGEALIGN(0x1234) = 0x2000 (2 页)
+</span></span><span class=line><span class=cl>  off  = 0x0000 - 0 = 0x0000
+</span></span><span class=line><span class=cl>  prot = PROT_READ | PROT_EXEC  (PF_R|PF_X → PROT 标志)
+</span></span><span class=line><span class=cl>  type = MAP_PRIVATE             (私有映射: 写时复制)
+</span></span></code></pre></td></tr></table></div></div><p><strong>ET_DYN 首次映射的 total_size 策略</strong>：<code>total_mapping_size()</code>（<code>fs/binfmt_elf.c:443</code>）计算所有 PT_LOAD 段覆盖的总虚拟地址范围。先 <code>vm_mmap</code> 整个范围，再 <code>vm_munmap</code> 多余部分，确保段间间隙不会被其他映射抢占。</p><hr><h2 id=四阶段二vm_mmap--do_mmap--参数校验与地址选择>四、阶段二：vm_mmap → do_mmap — 参数校验与地址选择</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/util.c:561
+</span></span></span><span class=line><span class=cl><span class=kt>unsigned</span> <span class=kt>long</span> <span class=nf>vm_mmap</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>file</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>addr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>len</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>prot</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>flags</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>pgoff</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 包装 do_mmap: 加锁 mmap_sem → 调用 do_mmap → 解锁
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>do_mmap</span><span class=p>(</span><span class=n>file</span><span class=p>,</span> <span class=n>addr</span><span class=p>,</span> <span class=n>len</span><span class=p>,</span> <span class=n>prot</span><span class=p>,</span> <span class=n>flags</span><span class=p>,</span> <span class=n>pgoff</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/mmap.c:2137
+</span></span></span><span class=line><span class=cl><span class=kt>unsigned</span> <span class=kt>long</span> <span class=nf>do_mmap</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>file</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>addr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>len</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>prot</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>flags</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>pgoff</span><span class=p>,</span> <span class=p>...)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>mm</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>;</span>  <span class=c1>// 当前进程的内存描述符
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 1. 长度对齐到页 (4KB 整数倍)
+</span></span></span><span class=line><span class=cl>    <span class=c1>//    MMU 以页为最小粒度管理内存，不可能映射半个页
+</span></span></span><span class=line><span class=cl>    <span class=n>len</span> <span class=o>=</span> <span class=nf>PAGE_ALIGN</span><span class=p>(</span><span class=n>len</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 2. 非 MAP_FIXED 时，确保地址不低于 mmap_min_addr (通常 0x10000)
+</span></span></span><span class=line><span class=cl>    <span class=c1>//    低地址映射容易被 NULL 指针解引用利用
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>MAP_FIXED</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=n>addr</span> <span class=o>=</span> <span class=nf>round_hint_to_min</span><span class=p>(</span><span class=n>addr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 3. 将用户态标志转为内核 vm_flags:
+</span></span></span><span class=line><span class=cl>    <span class=c1>//    PROT_READ|PROT_EXEC + MAP_PRIVATE
+</span></span></span><span class=line><span class=cl>    <span class=c1>//    → VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC
+</span></span></span><span class=line><span class=cl>    <span class=n>vm_flags</span> <span class=o>=</span> <span class=nf>calc_vm_prot_bits</span><span class=p>(</span><span class=n>prot</span><span class=p>,</span> <span class=n>pkey</span><span class=p>)</span> <span class=o>|</span> <span class=nf>calc_vm_flag_bits</span><span class=p>(</span><span class=n>flags</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 4. 在进程的虚拟地址空间中找一个空闲区域
+</span></span></span><span class=line><span class=cl>    <span class=n>addr</span> <span class=o>=</span> <span class=nf>get_unmapped_area</span><span class=p>(</span><span class=n>file</span><span class=p>,</span> <span class=n>addr</span><span class=p>,</span> <span class=n>len</span><span class=p>,</span> <span class=n>pgoff</span><span class=p>,</span> <span class=n>flags</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 5. 调用 mmap_region 创建 VMA
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>mmap_region</span><span class=p>(</span><span class=n>file</span><span class=p>,</span> <span class=n>addr</span><span class=p>,</span> <span class=n>len</span><span class=p>,</span> <span class=n>vm_flags</span><span class=p>,</span> <span class=n>pgoff</span><span class=p>,</span> <span class=n>uf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=五阶段三mmap_region--创建-vma>五、阶段三：mmap_region() — 创建 VMA</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/mmap.c:2932
+</span></span></span><span class=line><span class=cl><span class=kt>unsigned</span> <span class=kt>long</span> <span class=nf>mmap_region</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>file</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>addr</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>len</span><span class=p>,</span> <span class=kt>vm_flags_t</span> <span class=n>vm_flags</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>pgoff</span><span class=p>,</span> <span class=p>...)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>mm</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 步骤1: 检查虚拟地址空间是否超限 (RLIMIT_AS, ulimit -v)
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>may_expand_vm</span><span class=p>(</span><span class=n>mm</span><span class=p>,</span> <span class=n>vm_flags</span><span class=p>,</span> <span class=n>len</span> <span class=o>&gt;&gt;</span> <span class=n>PAGE_SHIFT</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>ENOMEM</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 步骤2: 清理目标区域的旧映射 (MAP_FIXED 时覆盖已有 VMA)
+</span></span></span><span class=line><span class=cl>    <span class=c1>//        并查找新 VMA 在红黑树中的插入位置
+</span></span></span><span class=line><span class=cl>    <span class=nf>munmap_vma_range</span><span class=p>(</span><span class=n>mm</span><span class=p>,</span> <span class=n>addr</span><span class=p>,</span> <span class=n>len</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>prev</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rb_link</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rb_parent</span><span class=p>,</span> <span class=n>uf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 步骤3: 内存配额检查 (overcommit accounting)
+</span></span></span><span class=line><span class=cl>    <span class=c1>//        只有&#34;私有可写&#34;映射才需要记账 (可能消耗物理内存)
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>accountable_mapping</span><span class=p>(</span><span class=n>file</span><span class=p>,</span> <span class=n>vm_flags</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>charged</span> <span class=o>=</span> <span class=n>len</span> <span class=o>&gt;&gt;</span> <span class=n>PAGE_SHIFT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>security_vm_enough_memory_mm</span><span class=p>(</span><span class=n>mm</span><span class=p>,</span> <span class=n>charged</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span> <span class=o>-</span><span class=n>ENOMEM</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>vm_flags</span> <span class=o>|=</span> <span class=n>VM_ACCOUNT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 步骤4: 尝试与相邻 VMA 合并 (相同属性且地址连续 → 节省结构体)
+</span></span></span><span class=line><span class=cl>    <span class=n>vma</span> <span class=o>=</span> <span class=nf>vma_merge</span><span class=p>(</span><span class=n>mm</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>addr</span><span class=p>,</span> <span class=n>addr</span> <span class=o>+</span> <span class=n>len</span><span class=p>,</span> <span class=n>vm_flags</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                    <span class=nb>NULL</span><span class=p>,</span> <span class=n>file</span><span class=p>,</span> <span class=n>pgoff</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>vma</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>  <span class=c1>// 合并成功, 无需新建
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 步骤5: 分配 vm_area_struct (从 vm_area_cachep SLUB 缓存分配)
+</span></span></span><span class=line><span class=cl>    <span class=n>vma</span> <span class=o>=</span> <span class=nf>vm_area_alloc</span><span class=p>(</span><span class=n>mm</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 步骤6: 填充 VMA 核心字段
+</span></span></span><span class=line><span class=cl>    <span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_start</span>     <span class=o>=</span> <span class=n>addr</span><span class=p>;</span>           <span class=c1>// 起始虚拟地址
+</span></span></span><span class=line><span class=cl>    <span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_end</span>       <span class=o>=</span> <span class=n>addr</span> <span class=o>+</span> <span class=n>len</span><span class=p>;</span>     <span class=c1>// 结束虚拟地址 (不包含)
+</span></span></span><span class=line><span class=cl>    <span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_flags</span>     <span class=o>=</span> <span class=n>vm_flags</span><span class=p>;</span>       <span class=c1>// VM_READ|VM_EXEC|...
+</span></span></span><span class=line><span class=cl>    <span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_page_prot</span> <span class=o>=</span> <span class=nf>vm_get_page_prot</span><span class=p>(</span><span class=n>vm_flags</span><span class=p>);</span>  <span class=c1>// 转换为硬件 PTE 保护位
+</span></span></span><span class=line><span class=cl>    <span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_pgoff</span>     <span class=o>=</span> <span class=n>pgoff</span><span class=p>;</span>          <span class=c1>// 文件偏移 (页为单位)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 步骤7: 文件映射 — 关联 struct file 并设置 vm_ops
+</span></span></span><span class=line><span class=cl>    <span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_file</span> <span class=o>=</span> <span class=nf>get_file</span><span class=p>(</span><span class=n>file</span><span class=p>);</span>       <span class=c1>// 增加文件引用计数 (f_count++)
+</span></span></span><span class=line><span class=cl>    <span class=n>error</span> <span class=o>=</span> <span class=nf>call_mmap</span><span class=p>(</span><span class=n>file</span><span class=p>,</span> <span class=n>vma</span><span class=p>);</span>        <span class=c1>// 调用 file-&gt;f_op-&gt;mmap(file, vma)
+</span></span></span><span class=line><span class=cl>                                         <span class=c1>// → 设置 vma-&gt;vm_ops (含 fault 回调)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 步骤8: 将 VMA 插入进程的 VMA 红黑树 + 链表
+</span></span></span><span class=line><span class=cl>    <span class=nf>vma_link</span><span class=p>(</span><span class=n>mm</span><span class=p>,</span> <span class=n>vma</span><span class=p>,</span> <span class=n>prev</span><span class=p>,</span> <span class=n>rb_link</span><span class=p>,</span> <span class=n>rb_parent</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>addr</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=call_mmap-做了什么>call_mmap() 做了什么</h3><p><code>call_mmap()</code> 调用文件系统的 <code>mmap</code> 方法（<code>mm/mmap.c:3116</code>）。对于 ext4 等普通文件系统上的 <code>.so</code> 文件，最终设置：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>vma-&gt;vm_ops = &amp;generic_file_vm_ops
+</span></span><span class=line><span class=cl>  其中 vm_ops-&gt;fault = filemap_fault    ← 缺页时从文件读取页面
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键：此时只创建了 VMA 数据结构，页表项为空，没有分配物理页。</strong></p><hr><h2 id=六阶段四缺页中断--按需加载物理页>六、阶段四：缺页中断 — 按需加载物理页</h2><p>当进程首次访问 <code>.so</code> 中的代码或数据时，MMU 发现 PTE 为空（Present bit = 0），触发 Page Fault：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>CPU 执行 call 0x7f1a00200100 (libfoo.so 中的函数)
+</span></span><span class=line><span class=cl>  → MMU 查页表: PTE Present=0
+</span></span><span class=line><span class=cl>  → CPU 触发 #PF 异常
+</span></span><span class=line><span class=cl>  → entry_64.S → do_page_fault() → handle_mm_fault()
+</span></span><span class=line><span class=cl>  → do_fault()                      [mm/memory.c:4484]
+</span></span></code></pre></td></tr></table></div></div><h3 id=61-缺页入口do_fault>6.1 缺页入口：do_fault()</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/memory.c:4484
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>vm_fault_t</span> <span class=nf>do_fault</span><span class=p>(</span><span class=k>struct</span> <span class=n>vm_fault</span> <span class=o>*</span><span class=n>vmf</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>vm_area_struct</span> <span class=o>*</span><span class=n>vma</span> <span class=o>=</span> <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>vma</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>vmf</span><span class=o>-&gt;</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>FAULT_FLAG_WRITE</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=nf>do_read_fault</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>     <span class=c1>// 读缺页: .text 只读段走这里
+</span></span></span><span class=line><span class=cl>    <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_flags</span> <span class=o>&amp;</span> <span class=n>VM_SHARED</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=nf>do_cow_fault</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>      <span class=c1>// 写缺页 + MAP_PRIVATE: .data 走这里 (COW)
+</span></span></span><span class=line><span class=cl>    <span class=k>else</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=nf>do_shared_fault</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>   <span class=c1>// 写缺页 + MAP_SHARED
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=62-读缺页do_read_fault--加载-text-页面>6.2 读缺页：do_read_fault() — 加载 .text 页面</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/memory.c:4374
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>vm_fault_t</span> <span class=nf>do_read_fault</span><span class=p>(</span><span class=k>struct</span> <span class=n>vm_fault</span> <span class=o>*</span><span class=n>vmf</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 1. fault_around: 尝试一次性映射附近多个页 (减少缺页次数)
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_ops</span><span class=o>-&gt;</span><span class=n>map_pages</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=nf>do_fault_around</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 2. 调用 vma-&gt;vm_ops-&gt;fault → filemap_fault()
+</span></span></span><span class=line><span class=cl>    <span class=n>ret</span> <span class=o>=</span> <span class=nf>__do_fault</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 3. 将物理页填入页表项 (PTE)
+</span></span></span><span class=line><span class=cl>    <span class=n>ret</span> <span class=o>|=</span> <span class=nf>finish_fault</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>    <span class=c1>// → do_set_pte(): 设置 PTE 指向物理页帧
+</span></span></span><span class=line><span class=cl>                                 <span class=c1>//   设置保护位 (R-X)，Present=1
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>unlock_page</span><span class=p>(</span><span class=n>vmf</span><span class=o>-&gt;</span><span class=n>page</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=63-filemap_fault--从-page-cache-或磁盘获取页面>6.3 filemap_fault() — 从 page cache 或磁盘获取页面</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/filemap.c:3042
+</span></span></span><span class=line><span class=cl><span class=kt>vm_fault_t</span> <span class=nf>filemap_fault</span><span class=p>(</span><span class=k>struct</span> <span class=n>vm_fault</span> <span class=o>*</span><span class=n>vmf</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>file</span> <span class=o>=</span> <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_file</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>address_space</span> <span class=o>*</span><span class=n>mapping</span> <span class=o>=</span> <span class=n>file</span><span class=o>-&gt;</span><span class=n>f_mapping</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>pgoff_t</span> <span class=n>offset</span> <span class=o>=</span> <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>pgoff</span><span class=p>;</span>     <span class=c1>// 要读取的页在文件中的偏移 (页单位)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 1. 查 page cache: 这个文件页是否已在物理内存中?
+</span></span></span><span class=line><span class=cl>    <span class=n>page</span> <span class=o>=</span> <span class=nf>find_get_page</span><span class=p>(</span><span class=n>mapping</span><span class=p>,</span> <span class=n>offset</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>page</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ★ 命中! 页已在 page cache 中
+</span></span></span><span class=line><span class=cl>        <span class=c1>// 另一个进程之前加载过同一 .so → 直接共享这个物理页帧
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>vmf</span><span class=o>-&gt;</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>FAULT_FLAG_TRIED</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=n>fpin</span> <span class=o>=</span> <span class=nf>do_async_mmap_readahead</span><span class=p>(</span><span class=n>vmf</span><span class=p>,</span> <span class=n>page</span><span class=p>);</span>  <span class=c1>// 异步预读相邻页
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>page</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 未命中: 需要从磁盘读取 (主缺页)
+</span></span></span><span class=line><span class=cl>        <span class=nf>count_vm_event</span><span class=p>(</span><span class=n>PGMAJFAULT</span><span class=p>);</span>    <span class=c1>// /proc/vmstat 中 pgmajfault +1
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 2. 同步预读: 不仅读当前页，还预读相邻页
+</span></span></span><span class=line><span class=cl>        <span class=n>fpin</span> <span class=o>=</span> <span class=nf>do_sync_mmap_readahead</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 3. 分配物理页并从文件读入内容
+</span></span></span><span class=line><span class=cl>        <span class=n>page</span> <span class=o>=</span> <span class=nf>pagecache_get_page</span><span class=p>(</span><span class=n>mapping</span><span class=p>,</span> <span class=n>offset</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                  <span class=n>FGP_CREAT</span> <span class=o>|</span> <span class=n>FGP_FOR_MMAP</span><span class=p>,</span> <span class=n>gfp_mask</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// → 分配物理页帧
+</span></span></span><span class=line><span class=cl>        <span class=c1>// → 调用文件系统的 readpage 从磁盘读取
+</span></span></span><span class=line><span class=cl>        <span class=c1>// → 插入 page cache (后续进程直接命中)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>page</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>两个进程共享物理页的关键</strong>：page cache 以 <code>(inode, offset)</code> 为键索引。两个进程 <code>mmap</code> 同一个 <code>.so</code> 文件时，<code>find_get_page()</code> 找到的是同一个 <code>struct page</code>，因此两个进程的 PTE 指向<strong>同一个物理页帧</strong>。</p><h3 id=64-写缺页do_cow_fault--data-段的-copy-on-write>6.4 写缺页：do_cow_fault() — .data 段的 Copy-on-Write</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/memory.c:4403
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>vm_fault_t</span> <span class=nf>do_cow_fault</span><span class=p>(</span><span class=k>struct</span> <span class=n>vm_fault</span> <span class=o>*</span><span class=n>vmf</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 1. 准备匿名 VMA 反向映射结构
+</span></span></span><span class=line><span class=cl>    <span class=nf>anon_vma_prepare</span><span class=p>(</span><span class=n>vma</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 2. 分配一个新的私有物理页 (COW 的 &#34;Copy&#34; 目标)
+</span></span></span><span class=line><span class=cl>    <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>cow_page</span> <span class=o>=</span> <span class=nf>alloc_page_vma</span><span class=p>(</span><span class=n>GFP_HIGHUSER_MOVABLE</span><span class=p>,</span> <span class=n>vma</span><span class=p>,</span> <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>address</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 3. 调用 vma-&gt;vm_ops-&gt;fault 从文件读取原始内容
+</span></span></span><span class=line><span class=cl>    <span class=n>ret</span> <span class=o>=</span> <span class=nf>__do_fault</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>      <span class=c1>// vmf-&gt;page = 文件中的原始页
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 4. ★ 核心: 将原始内容复制到新分配的私有页
+</span></span></span><span class=line><span class=cl>    <span class=nf>copy_user_highpage</span><span class=p>(</span><span class=n>vmf</span><span class=o>-&gt;</span><span class=n>cow_page</span><span class=p>,</span> <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>page</span><span class=p>,</span> <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>address</span><span class=p>,</span> <span class=n>vma</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>//            ↑ 新私有页          ↑ 文件原始页 (page cache 中)
+</span></span></span><span class=line><span class=cl>    <span class=nf>__SetPageUptodate</span><span class=p>(</span><span class=n>vmf</span><span class=o>-&gt;</span><span class=n>cow_page</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 5. 将私有页填入 PTE (可读写, Present=1)
+</span></span></span><span class=line><span class=cl>    <span class=n>ret</span> <span class=o>|=</span> <span class=nf>finish_fault</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 6. 释放对原始页的引用 (page cache 中的页不受影响)
+</span></span></span><span class=line><span class=cl>    <span class=nf>unlock_page</span><span class=p>(</span><span class=n>vmf</span><span class=o>-&gt;</span><span class=n>page</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>put_page</span><span class=p>(</span><span class=n>vmf</span><span class=o>-&gt;</span><span class=n>page</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=65-已映射页面的写保护do_wp_page>6.5 已映射页面的写保护：do_wp_page()</h3><p>页面首次以只读方式映射后（<code>.data</code> 段初始也是只读映射），当进程首次写入时触发写保护缺页：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/memory.c:3420
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>vm_fault_t</span> <span class=nf>do_wp_page</span><span class=p>(</span><span class=k>struct</span> <span class=n>vm_fault</span> <span class=o>*</span><span class=n>vmf</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>page</span> <span class=o>=</span> <span class=nf>vm_normal_page</span><span class=p>(</span><span class=n>vma</span><span class=p>,</span> <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>address</span><span class=p>,</span> <span class=n>vmf</span><span class=o>-&gt;</span><span class=n>orig_pte</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>PageAnon</span><span class=p>(</span><span class=n>vmf</span><span class=o>-&gt;</span><span class=n>page</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 匿名页: 检查是否独占
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>page_mapcount</span><span class=p>(</span><span class=n>page</span><span class=p>)</span> <span class=o>==</span> <span class=mi>1</span> <span class=o>&amp;&amp;</span> <span class=nf>page_count</span><span class=p>(</span><span class=n>page</span><span class=p>)</span> <span class=o>==</span> <span class=mi>1</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span> <span class=nf>wp_page_reuse</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>   <span class=c1>// 独占 → 直接改为可写 (无需复制)
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>copy</span><span class=p>;</span>                        <span class=c1>// 共享 → 复制
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>copy</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 文件页: 分配新物理页，复制内容，更新 PTE 指向新页
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>wp_page_copy</span><span class=p>(</span><span class=n>vmf</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>//   alloc_page → copy_user_highpage → ptep_clear_flush → set_pte_at
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=七两个进程的物理内存分布>七、两个进程的物理内存分布</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>  进程 A 页表                     物理内存                      进程 B 页表
+</span></span><span class=line><span class=cl>  ┌────────────────┐            ┌──────────────────┐          ┌────────────────┐
+</span></span><span class=line><span class=cl>  │ VA 0x7f1a..200 │───────────→│ page frame 0x1234 │←─────────│ VA 0x7f3b..200 │
+</span></span><span class=line><span class=cl>  │ PTE: R-X       │  .text     │ (page cache 中)   │  共享    │ PTE: R-X       │
+</span></span><span class=line><span class=cl>  │ P=1            │  只读      │ 来自 libfoo.so     │          │ P=1            │
+</span></span><span class=line><span class=cl>  └────────────────┘            │ 文件偏移 0x0000   │          └────────────────┘
+</span></span><span class=line><span class=cl>                                ├──────────────────┤
+</span></span><span class=line><span class=cl>  ┌────────────────┐            │ page frame 0x5678 │          ┌────────────────┐
+</span></span><span class=line><span class=cl>  │ VA 0x7f1a..300 │── 写入前 ──→│ (page cache 中)   │── 写入前 ─│ VA 0x7f3b..300 │
+</span></span><span class=line><span class=cl>  │ PTE: R--       │  .data     │ 初始共享           │          │ PTE: R--       │
+</span></span><span class=line><span class=cl>  │ P=1, COW       │            │                    │          │ P=1, COW       │
+</span></span><span class=line><span class=cl>  └────────────────┘            └──────────────────┘          └────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  进程 A 首次写入 .data 后 (do_wp_page → wp_page_copy):
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  ┌────────────────┐            ┌──────────────────┐          ┌────────────────┐
+</span></span><span class=line><span class=cl>  │ VA 0x7f1a..300 │───────────→│ page frame 0xAAAA │          │ VA 0x7f3b..300 │
+</span></span><span class=line><span class=cl>  │ PTE: RW-       │  .data     │ (A 的私有副本)     │          │ PTE: R--       │
+</span></span><span class=line><span class=cl>  │ P=1            │  进程A独有 │ copy_user_highpage │          │ P=1            │
+</span></span><span class=line><span class=cl>  └────────────────┘            └──────────────────┘          │ → 0x5678 共享  │
+</span></span><span class=line><span class=cl>                                                              └────────────────┘
+</span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>段</th><th>权限</th><th>物理页行为</th><th>内核路径</th></tr></thead><tbody><tr><td><code>.text</code></td><td>R-X</td><td>始终共享</td><td><code>do_read_fault</code> → <code>filemap_fault</code> → <code>find_get_page</code> 命中 page cache</td></tr><tr><td><code>.rodata</code></td><td>R&ndash;</td><td>始终共享</td><td>同上</td></tr><tr><td><code>.data</code></td><td>RW-</td><td>初始共享，写入时 COW 分离</td><td>首次写: <code>do_wp_page</code> → <code>wp_page_copy</code> → 分配新页 + 复制</td></tr><tr><td><code>.bss</code></td><td>RW-</td><td>初始共享，写入时 COW 分离</td><td>同上 (<code>.bss</code> 与 <code>.data</code> 在同一个 PT_LOAD 段中)</td></tr></tbody></table></div><p><strong>设计本质</strong>：只读段天然共享（无需分离）；可写段用 COW 延迟复制，兼顾共享效率和隔离正确性。</p><hr><h2 id=八加载完成后的进程内存布局>八、加载完成后的进程内存布局</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl>  <span class=err>加载</span> <span class=n>libfoo</span><span class=o>.</span><span class=n>so</span> <span class=err>后的进程虚拟地址空间</span> <span class=p>(</span><span class=n>load_bias</span> <span class=o>=</span> <span class=mh>0x7f1a00200000</span><span class=p>):</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  <span class=mh>0x7f1a00205000</span> <span class=err>┌────────────────────────────────────────┐</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=o>.</span><span class=n>bss</span> <span class=p>(</span><span class=err>匿名页</span><span class=p>,</span> <span class=n>padzero</span> <span class=err>清零</span><span class=p>)</span>              <span class=err>│</span> <span class=err>←</span> <span class=n>p_memsz</span> <span class=o>&gt;</span> <span class=n>p_filesz</span> <span class=err>部分</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=err>由</span> <span class=n>set_brk</span><span class=p>()</span> <span class=o>/</span> <span class=n>vm_brk</span><span class=p>()</span> <span class=err>分配</span>             <span class=err>│</span>    <span class=err>不在文件中，内核零填充</span>
+</span></span><span class=line><span class=cl>  <span class=mh>0x7f1a00204000</span> <span class=err>├────────────────────────────────────────┤</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=o>.</span><span class=n>got</span> <span class=o>/</span> <span class=o>.</span><span class=n>got</span><span class=o>.</span><span class=n>plt</span> <span class=p>(</span><span class=err>可读写</span><span class=p>)</span>                 <span class=err>│</span> <span class=err>←</span> <span class=n>PT_LOAD</span><span class=c1>#2 (RW)</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=o>.</span><span class=n>data</span> <span class=p>(</span><span class=err>已初始化全局变量</span><span class=p>)</span>                  <span class=err>│</span>    <span class=n>vm_pgoff</span> <span class=o>=</span> <span class=mi>2</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=err>文件映射</span><span class=p>,</span> <span class=n>MAP_PRIVATE</span><span class=p>,</span> <span class=err>写入时</span> <span class=n>COW</span>         <span class=err>│</span>    <span class=p>(</span><span class=err>文件偏移</span> <span class=mh>0x2000</span><span class=o>/</span><span class=n>PAGE_SIZE</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>  <span class=mh>0x7f1a00203000</span> <span class=err>├────────────────────────────────────────┤</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=p>(</span><span class=n>PROT_NONE</span> <span class=err>对齐间隙</span><span class=p>,</span> <span class=err>不可访问</span><span class=p>)</span>            <span class=err>│</span> <span class=err>←</span> <span class=err>段间页对齐填充</span>
+</span></span><span class=line><span class=cl>  <span class=mh>0x7f1a00202000</span> <span class=err>├────────────────────────────────────────┤</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=o>.</span><span class=n>plt</span> <span class=p>(</span><span class=err>过程链接表</span><span class=p>)</span>                        <span class=err>│</span> <span class=err>←</span> <span class=n>PT_LOAD</span><span class=c1>#1 (R-X)</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=o>.</span><span class=n>rodata</span> <span class=p>(</span><span class=err>只读数据</span><span class=p>)</span>                       <span class=err>│</span>    <span class=n>vm_pgoff</span> <span class=o>=</span> <span class=mi>0</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=o>.</span><span class=n>text</span> <span class=p>(</span><span class=err>机器指令</span><span class=p>)</span>                         <span class=err>│</span>    <span class=p>(</span><span class=err>文件起始</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span> <span class=err>文件映射</span><span class=p>,</span> <span class=n>MAP_PRIVATE</span><span class=p>,</span> <span class=err>只读共享</span>           <span class=err>│</span>
+</span></span><span class=line><span class=cl>  <span class=mh>0x7f1a00200000</span> <span class=err>└────────────────────────────────────────┘</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  <span class=n>load_bias</span> <span class=o>=</span> <span class=n>ELF_PAGESTART</span><span class=p>(</span><span class=err>实际映射地址</span> <span class=o>-</span> <span class=n>p_vaddr</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=o>=</span> <span class=mh>0x7f1a00200000</span> <span class=o>-</span> <span class=mh>0x0</span>
+</span></span><span class=line><span class=cl>            <span class=o>=</span> <span class=mh>0x7f1a00200000</span>       <span class=err>←</span> <span class=n>ASLR</span> <span class=err>随机基址</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=九内存存储数据与地址的本质>九、内存存储数据与地址的本质</h2><p>内存本身不区分内容和含义 — 它只是一堆字节。是 CPU 的<strong>指令</strong>决定了这些字节被当作什么解读：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>  物理内存中的连续 8 字节:  0x00 0x00 0x7f 0x1a 0x00 0x20 0x00 0x00
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  mov rax, [addr]    → 当作数据读取，rax = 0x7f1a00200000
+</span></span><span class=line><span class=cl>  call *[addr]       → 当作地址跳转，跳转到 0x7f1a00200000
+</span></span><span class=line><span class=cl>  add  rax, [addr]   → 当作数值参与运算
+</span></span></code></pre></td></tr></table></div></div><p><code>.got.plt</code>（全局偏移表）正是利用了这个特性 — 内存中存的是函数地址，<code>call</code> 指令把它当跳转目标：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>  .got.plt 中的内容 (每个条目 8 字节):
+</span></span><span class=line><span class=cl>  ┌──────────────────────────────────────┐
+</span></span><span class=line><span class=cl>  │  got[3] = 0x7f1a00201040  ← printf  │  存的是虚拟地址
+</span></span><span class=line><span class=cl>  │  got[4] = 0x7f1a00201050  ← malloc  │  动态链接器在加载时填入
+</span></span><span class=line><span class=cl>  └──────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  调用 printf 时:
+</span></span><span class=line><span class=cl>  call *got[3]     ; CPU 把 got[3] 中存的值当地址，跳转到 printf
+</span></span></code></pre></td></tr></table></div></div><p>这是冯·诺依曼架构的本质：<strong>指令和数据存在同一片内存中</strong>，区别仅在于 CPU 当前如何解读。</p><hr><h2 id=十完整调用链一览>十、完整调用链一览</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=n>dlopen</span><span class=p>(</span><span class=s2>&#34;libfoo.so&#34;</span><span class=p>)</span> <span class=o>/</span> <span class=n>load_elf_interp</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>  <span class=err>│</span>
+</span></span><span class=line><span class=cl>  <span class=err>├─</span> <span class=err>读取</span> <span class=n>ELF</span> <span class=err>头</span> <span class=err>→</span> <span class=err>遍历所有</span> <span class=n>PT_LOAD</span> <span class=err>段</span>
+</span></span><span class=line><span class=cl>  <span class=err>│</span>
+</span></span><span class=line><span class=cl>  <span class=err>└─</span> <span class=k>for</span> <span class=n>each</span> <span class=n>PT_LOAD</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>       <span class=err>│</span>
+</span></span><span class=line><span class=cl>       <span class=err>└─</span> <span class=n>elf_map</span><span class=p>()</span>                           <span class=p>[</span><span class=n>fs</span><span class=o>/</span><span class=n>binfmt_elf</span><span class=o>.</span><span class=n>c</span><span class=p>:</span><span class=mi>409</span><span class=p>]</span>
+</span></span><span class=line><span class=cl>            <span class=err>│</span>  <span class=err>参数转换</span><span class=p>:</span> <span class=n>p_filesz</span> <span class=err>→</span> <span class=n>size</span><span class=p>,</span> <span class=n>p_offset</span> <span class=err>→</span> <span class=n>off</span>
+</span></span><span class=line><span class=cl>            <span class=err>│</span>  <span class=n>ET_DYN</span><span class=p>:</span> <span class=err>先映射</span> <span class=n>total_size</span><span class=p>,</span> <span class=err>再</span> <span class=n>munmap</span> <span class=err>多余部分</span>
+</span></span><span class=line><span class=cl>            <span class=err>│</span>
+</span></span><span class=line><span class=cl>            <span class=err>└─</span> <span class=n>vm_mmap</span><span class=p>(</span><span class=n>file</span><span class=p>,</span> <span class=n>addr</span><span class=p>,</span> <span class=n>size</span><span class=p>,</span> <span class=n>prot</span><span class=p>,</span> <span class=n>MAP_PRIVATE</span><span class=p>,</span> <span class=n>off</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                 <span class=err>│</span>                                            <span class=p>[</span><span class=n>mm</span><span class=o>/</span><span class=n>util</span><span class=o>.</span><span class=n>c</span><span class=p>:</span><span class=mi>561</span><span class=p>]</span>
+</span></span><span class=line><span class=cl>                 <span class=err>└─</span> <span class=n>do_mmap</span><span class=p>()</span>                  <span class=p>[</span><span class=n>mm</span><span class=o>/</span><span class=n>mmap</span><span class=o>.</span><span class=n>c</span><span class=p>:</span><span class=mi>2137</span><span class=p>]</span>
+</span></span><span class=line><span class=cl>                      <span class=err>│</span>  <span class=n>PAGE_ALIGN</span><span class=p>(</span><span class=n>len</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                      <span class=err>│</span>  <span class=n>calc_vm_prot_bits</span><span class=p>()</span> <span class=err>→</span> <span class=n>vm_flags</span>
+</span></span><span class=line><span class=cl>                      <span class=err>│</span>  <span class=n>get_unmapped_area</span><span class=p>()</span> <span class=err>→</span> <span class=err>选择空闲虚拟地址</span>
+</span></span><span class=line><span class=cl>                      <span class=err>│</span>
+</span></span><span class=line><span class=cl>                      <span class=err>└─</span> <span class=n>mmap_region</span><span class=p>()</span>         <span class=p>[</span><span class=n>mm</span><span class=o>/</span><span class=n>mmap</span><span class=o>.</span><span class=n>c</span><span class=p>:</span><span class=mi>2932</span><span class=p>]</span>
+</span></span><span class=line><span class=cl>                           <span class=err>│</span>  <span class=n>may_expand_vm</span><span class=p>()</span>    <span class=err>—</span> <span class=err>检查</span> <span class=n>RLIMIT_AS</span>
+</span></span><span class=line><span class=cl>                           <span class=err>│</span>  <span class=n>munmap_vma_range</span><span class=p>()</span> <span class=err>—</span> <span class=err>清理旧映射</span>
+</span></span><span class=line><span class=cl>                           <span class=err>│</span>  <span class=n>vma_merge</span><span class=p>()</span>        <span class=err>—</span> <span class=err>尝试合并相邻</span> <span class=n>VMA</span>
+</span></span><span class=line><span class=cl>                           <span class=err>│</span>  <span class=n>vm_area_alloc</span><span class=p>()</span>    <span class=err>—</span> <span class=err>分配</span> <span class=n>vm_area_struct</span>
+</span></span><span class=line><span class=cl>                           <span class=err>│</span>  <span class=n>vma</span><span class=o>-&gt;</span><span class=n>vm_file</span> <span class=o>=</span> <span class=n>get_file</span><span class=p>(</span><span class=n>file</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                           <span class=err>│</span>  <span class=n>call_mmap</span><span class=p>()</span>        <span class=err>—</span> <span class=err>设置</span> <span class=n>vm_ops</span><span class=o>-&gt;</span><span class=n>fault</span>
+</span></span><span class=line><span class=cl>                           <span class=err>│</span>  <span class=n>vma_link</span><span class=p>()</span>         <span class=err>—</span> <span class=err>插入红黑树</span>
+</span></span><span class=line><span class=cl>                           <span class=err>│</span>
+</span></span><span class=line><span class=cl>                           <span class=err>└─</span> <span class=p>(</span><span class=err>此时无物理页</span><span class=p>,</span> <span class=err>页表项为空</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                                <span class=err>│</span>
+</span></span><span class=line><span class=cl>                                <span class=err>└─</span> <span class=err>进程首次访问</span> <span class=err>→</span> <span class=n>Page</span> <span class=n>Fault</span>
+</span></span><span class=line><span class=cl>                                     <span class=err>│</span>
+</span></span><span class=line><span class=cl>                                     <span class=err>└─</span> <span class=n>do_fault</span><span class=p>()</span>           <span class=p>[</span><span class=n>mm</span><span class=o>/</span><span class=n>memory</span><span class=o>.</span><span class=n>c</span><span class=p>:</span><span class=mi>4484</span><span class=p>]</span>
+</span></span><span class=line><span class=cl>                                          <span class=err>│</span>
+</span></span><span class=line><span class=cl>                          <span class=err>┌───────────────┼───────────────┐</span>
+</span></span><span class=line><span class=cl>                          <span class=err>▼</span>               <span class=err>▼</span>               <span class=err>▼</span>
+</span></span><span class=line><span class=cl>                    <span class=n>do_read_fault</span>   <span class=n>do_cow_fault</span>    <span class=n>do_wp_page</span>
+</span></span><span class=line><span class=cl>                    <span class=p>(</span><span class=o>.</span><span class=n>text</span> <span class=err>读缺页</span><span class=p>)</span>  <span class=p>(</span><span class=o>.</span><span class=n>data</span> <span class=err>首次加载</span><span class=p>)</span> <span class=p>(</span><span class=err>已映射页写保护</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                          <span class=err>│</span>               <span class=err>│</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl>                          <span class=err>▼</span>               <span class=err>▼</span>               <span class=err>▼</span>
+</span></span><span class=line><span class=cl>                    <span class=n>filemap_fault</span>    <span class=n>alloc_page</span> <span class=o>+</span>    <span class=n>wp_page_copy</span>
+</span></span><span class=line><span class=cl>                    <span class=p>[</span><span class=n>mm</span><span class=o>/</span><span class=n>filemap</span><span class=o>.</span><span class=n>c</span>    <span class=n>copy_user_</span>      <span class=n>alloc</span> <span class=o>+</span> <span class=n>copy</span> <span class=o>+</span>
+</span></span><span class=line><span class=cl>                     <span class=p>:</span><span class=mi>3042</span><span class=p>]</span>          <span class=n>highpage</span>        <span class=err>更新</span> <span class=n>PTE</span>
+</span></span><span class=line><span class=cl>                          <span class=err>│</span>               <span class=err>│</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl>                    <span class=err>┌─────┴─────┐</span>         <span class=err>│</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl>                    <span class=err>▼</span>           <span class=err>▼</span>         <span class=err>▼</span>               <span class=err>▼</span>
+</span></span><span class=line><span class=cl>              <span class=n>find_get_page</span>  <span class=n>pagecache_</span>  <span class=err>新私有页填入</span>    <span class=err>新私有页填入</span>
+</span></span><span class=line><span class=cl>              <span class=err>命中</span><span class=n>page</span> <span class=n>cache</span> <span class=n>get_page</span>   <span class=n>PTE</span> <span class=p>(</span><span class=n>RW</span><span class=o>-</span><span class=p>)</span>       <span class=n>PTE</span> <span class=p>(</span><span class=n>RW</span><span class=o>-</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>              <span class=p>(</span><span class=err>共享物理页</span><span class=p>)</span>   <span class=p>(</span><span class=err>从磁盘读</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                    <span class=err>│</span>               <span class=err>│</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl>                    <span class=err>└───────┬───────┘</span>               <span class=err>│</span>
+</span></span><span class=line><span class=cl>                            <span class=err>▼</span>                       <span class=err>▼</span>
+</span></span><span class=line><span class=cl>                      <span class=n>finish_fault</span><span class=p>()</span>          <span class=n>finish_fault</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>                      <span class=n>do_set_pte</span><span class=p>()</span>            <span class=n>do_set_pte</span><span class=p>()</span>
+</span></span><span class=line><span class=cl>                      <span class=err>→</span> <span class=err>进程继续执行</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=十一观察与验证>十一、观察与验证</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 查看进程中 .so 的映射布局</span>
+</span></span><span class=line><span class=cl>cat /proc/&lt;pid&gt;/maps <span class=p>|</span> grep libfoo
+</span></span><span class=line><span class=cl><span class=c1># 输出类似:</span>
+</span></span><span class=line><span class=cl><span class=c1># 7f1a00200000-7f1a00202000 r-xp 00000000 08:01 12345  /usr/lib/libfoo.so</span>
+</span></span><span class=line><span class=cl><span class=c1># 7f1a00203000-7f1a00204000 rw-p 00002000 08:01 12345  /usr/lib/libfoo.so</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看物理内存共享情况</span>
+</span></span><span class=line><span class=cl>cat /proc/&lt;pid&gt;/smaps <span class=p>|</span> grep -A <span class=m>15</span> libfoo
+</span></span><span class=line><span class=cl><span class=c1># Shared_Clean:  只读共享段的物理大小 (所有进程共享同一物理页)</span>
+</span></span><span class=line><span class=cl><span class=c1># Shared_Dirty:  写时复制后仍共享的脏页</span>
+</span></span><span class=line><span class=cl><span class=c1># Private_Clean: COW 后私有的干净页</span>
+</span></span><span class=line><span class=cl><span class=c1># Private_Dirty: COW 后私有的脏页 (进程独有的 .data 修改)</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 查看系统缺页统计</span>
+</span></span><span class=line><span class=cl>cat /proc/vmstat <span class=p>|</span> grep pgfault
+</span></span><span class=line><span class=cl><span class=c1># pgfault   — 总缺页次数 (含 minor: page cache 命中)</span>
+</span></span><span class=line><span class=cl><span class=c1># pgmajfault — 主缺页次数 (需要从磁盘读取)</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=十二参考资料>十二、参考资料</h2><ul><li>ELF 程序头结构: <code>include/uapi/linux/elf.h:256</code> — <code>Elf64_Phdr</code> 定义</li><li>ELF 段映射: <code>fs/binfmt_elf.c:409</code> — <code>elf_map()</code> 参数转换与 <code>vm_mmap</code> 调用</li><li>mmap 参数校验: <code>mm/mmap.c:2137</code> — <code>do_mmap()</code> 地址选择与标志转换</li><li>VMA 创建: <code>mm/mmap.c:2932</code> — <code>mmap_region()</code> 分配 VMA 并设置 vm_ops</li><li>缺页总入口: <code>mm/memory.c:4484</code> — <code>do_fault()</code> 按读/写/共享分支</li><li>读缺页: <code>mm/memory.c:4374</code> — <code>do_read_fault()</code> 调用 filemap_fault</li><li>COW 加载: <code>mm/memory.c:4403</code> — <code>do_cow_fault()</code> 分配私有页并复制</li><li>写保护缺页: <code>mm/memory.c:3420</code> — <code>do_wp_page()</code> COW 分离已映射页</li><li>文件页获取: <code>mm/filemap.c:3042</code> — <code>filemap_fault()</code> page cache 查找与磁盘读取</li></ul></section><footer class=article-footer><section class=article-tags><a href=/tags/%E5%85%B1%E4%BA%AB%E5%BA%93/>共享库</a>
+<a href=/tags/mmap/>Mmap</a>
+<a href=/tags/vma/>VMA</a>
+<a href=/tags/%E7%BC%BA%E9%A1%B5%E4%B8%AD%E6%96%AD/>缺页中断</a>
+<a href=/tags/cow/>COW</a>
+<a href=/tags/page-cache/>Page Cache</a>
+<a href=/tags/elf/>ELF</a>
+<a href=/tags/pt_load/>PT_LOAD</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/linux-5.15.78-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E5%AE%8C%E5%85%A8%E6%8C%87%E5%8D%97/><div class=article-details><h2 class=article-title>Linux 5.15.78 内存管理完全指南</h2></div></a></article><article><a href=/p/cpu-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E4%B8%8E%E5%86%85%E6%A0%B8%E6%A0%88%E8%BF%9B%E7%A8%8B%E6%98%AF%E6%80%8E%E4%B9%88%E8%A2%AB-cpu-%E6%89%A7%E8%A1%8C%E7%9A%84/><div class=article-details><h2 class=article-title>CPU 上下文切换与内核栈——进程是怎么被 CPU 执行的</h2></div></a></article><article><a href=/p/cpu-%E8%AE%BF%E9%97%AE%E5%86%85%E5%AD%98%E7%9A%84%E7%A1%AC%E4%BB%B6%E8%B7%AF%E5%BE%84%E5%9C%B0%E5%9D%80%E6%80%BB%E7%BA%BF%E6%95%B0%E6%8D%AE%E6%80%BB%E7%BA%BF%E4%B8%8E%E7%BC%93%E5%AD%98%E8%A1%8C%E7%AA%81%E5%8F%91%E4%BC%A0%E8%BE%93/><div class=article-details><h2 class=article-title>CPU 访问内存的硬件路径——地址总线、数据总线与缓存行突发传输</h2></div></a></article><article><a href=/p/x86_64-%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%B8%83%E5%B1%80/><div class=article-details><h2 class=article-title>x86_64 虚拟内存布局</h2></div></a></article><article><a href=/p/linux-%E5%86%85%E6%A0%B8%E5%86%85%E5%AD%98%E5%AF%B9%E9%BD%90%E6%9C%BA%E5%88%B6%E4%BB%8E-slab-%E5%88%B0-false-sharing-%E9%98%B2%E6%8A%A4/><div class=article-details><h2 class=article-title>Linux 内核内存对齐机制——从 Slab 到 False Sharing 防护</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

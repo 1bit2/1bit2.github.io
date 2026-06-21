@@ -1,0 +1,564 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='进程与线程的本质区别——从内核源码看共享与隔离 基于 Linux 5.15.78 内核源码。\n前置阅读：进程/线程创建源码分析 — copy_process 完整流程。\n目录 1. 核心结论 2. task_struct 中的关键共享字段 3. clone flags 依赖链 4. 各资源的共享 vs 复制源码分析 5. 共享地址空间却拥有私有栈——线程栈的实现 6. PID 与 TGID 的关系 7. 大量创建线程的影响 8. 内核对线程数的限制机制 9. 进程 vs 线程全景对比 附录：相关内核参数速查 1. 核心结论 Linux 内核中没有独立的"线程"数据结构——进程和线程都用同一个 task_struct 表示，走同一个 copy_process() 创建路径。唯一的区别是 clone flags，决定了各类资源是"共享引用计数+1"还是"复制一份独立副本"。\n1 2 3 fork() → clone_flags ≈ SIGCHLD（所有资源独立复制） pthread_create() → clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | ...（资源共享） Linus Torvalds 的设计哲学：不区分进程和线程，只有"任务"(task) 和"共享程度"的差异。\n'><title>进程与线程的本质区别——从内核源码看共享与隔离</title><link rel=canonical href=https://1bit2.github.io/p/%E8%BF%9B%E7%A8%8B%E4%B8%8E%E7%BA%BF%E7%A8%8B%E7%9A%84%E6%9C%AC%E8%B4%A8%E5%8C%BA%E5%88%AB%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E7%9C%8B%E5%85%B1%E4%BA%AB%E4%B8%8E%E9%9A%94%E7%A6%BB/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="进程与线程的本质区别——从内核源码看共享与隔离"><meta property='og:description' content='进程与线程的本质区别——从内核源码看共享与隔离 基于 Linux 5.15.78 内核源码。\n前置阅读：进程/线程创建源码分析 — copy_process 完整流程。\n目录 1. 核心结论 2. task_struct 中的关键共享字段 3. clone flags 依赖链 4. 各资源的共享 vs 复制源码分析 5. 共享地址空间却拥有私有栈——线程栈的实现 6. PID 与 TGID 的关系 7. 大量创建线程的影响 8. 内核对线程数的限制机制 9. 进程 vs 线程全景对比 附录：相关内核参数速查 1. 核心结论 Linux 内核中没有独立的"线程"数据结构——进程和线程都用同一个 task_struct 表示，走同一个 copy_process() 创建路径。唯一的区别是 clone flags，决定了各类资源是"共享引用计数+1"还是"复制一份独立副本"。\n1 2 3 fork() → clone_flags ≈ SIGCHLD（所有资源独立复制） pthread_create() → clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | ...（资源共享） Linus Torvalds 的设计哲学：不区分进程和线程，只有"任务"(task) 和"共享程度"的差异。\n'><meta property='og:url' content='https://1bit2.github.io/p/%E8%BF%9B%E7%A8%8B%E4%B8%8E%E7%BA%BF%E7%A8%8B%E7%9A%84%E6%9C%AC%E8%B4%A8%E5%8C%BA%E5%88%AB%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E7%9C%8B%E5%85%B1%E4%BA%AB%E4%B8%8E%E9%9A%94%E7%A6%BB/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='进程'><meta property='article:tag' content='线程'><meta property='article:tag' content='task_struct'><meta property='article:tag' content='clone'><meta property='article:tag' content='CLONE_VM'><meta property='article:tag' content='CLONE_THREAD'><meta property='article:tag' content='copy_process'><meta property='article:tag' content='线程数限制'><meta property='article:tag' content='copy_thread'><meta property='article:tag' content='线程栈'><meta property='article:published_time' content='2026-04-30T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-30T00:00:00+00:00'><meta name=twitter:title content="进程与线程的本质区别——从内核源码看共享与隔离"><meta name=twitter:description content='进程与线程的本质区别——从内核源码看共享与隔离 基于 Linux 5.15.78 内核源码。\n前置阅读：进程/线程创建源码分析 — copy_process 完整流程。\n目录 1. 核心结论 2. task_struct 中的关键共享字段 3. clone flags 依赖链 4. 各资源的共享 vs 复制源码分析 5. 共享地址空间却拥有私有栈——线程栈的实现 6. PID 与 TGID 的关系 7. 大量创建线程的影响 8. 内核对线程数的限制机制 9. 进程 vs 线程全景对比 附录：相关内核参数速查 1. 核心结论 Linux 内核中没有独立的"线程"数据结构——进程和线程都用同一个 task_struct 表示，走同一个 copy_process() 创建路径。唯一的区别是 clone flags，决定了各类资源是"共享引用计数+1"还是"复制一份独立副本"。\n1 2 3 fork() → clone_flags ≈ SIGCHLD（所有资源独立复制） pthread_create() → clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | ...（资源共享） Linus Torvalds 的设计哲学：不区分进程和线程，只有"任务"(task) 和"共享程度"的差异。\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#目录>目录</a></li><li><a href=#1-核心结论>1. 核心结论</a></li><li><a href=#2-task_struct-中的关键共享字段>2. task_struct 中的关键共享字段</a></li><li><a href=#3-clone-flags-依赖链>3. clone flags 依赖链</a></li><li><a href=#4-各资源的共享-vs-复制源码分析>4. 各资源的共享 vs 复制源码分析</a><ol><li><a href=#41-地址空间-mm_struct最核心的区别>4.1 地址空间 mm_struct（最核心的区别）</a></li><li><a href=#42-文件描述符表-files_struct>4.2 文件描述符表 files_struct</a></li><li><a href=#43-文件系统信息-fs_struct>4.3 文件系统信息 fs_struct</a></li><li><a href=#44-信号处理程序-sighand_struct>4.4 信号处理程序 sighand_struct</a></li><li><a href=#45-信号队列与资源限制-signal_struct>4.5 信号队列与资源限制 signal_struct</a></li><li><a href=#46-汇总对照表>4.6 汇总对照表</a></li></ol></li><li><a href=#5-共享地址空间却拥有私有栈线程栈的实现>5. 共享地址空间却拥有私有栈——线程栈的实现</a><ol><li><a href=#51-用户栈glibc-mmap-分配--内核设置-rsp>5.1 用户栈：glibc mmap 分配 + 内核设置 RSP</a></li><li><a href=#52-内核栈每个线程永远独立>5.2 内核栈：每个线程永远独立</a></li><li><a href=#53-fork_frame-与首次调度>5.3 fork_frame 与首次调度</a></li><li><a href=#54-地址空间布局>5.4 地址空间布局</a></li></ol></li><li><a href=#6-pid-与-tgid-的关系>6. PID 与 TGID 的关系</a></li><li><a href=#7-大量创建线程的影响>7. 大量创建线程的影响</a><ol><li><a href=#71-内核栈消耗不可-swap>7.1 内核栈消耗（不可 swap）</a></li><li><a href=#72-task_struct-与调度开销>7.2 task_struct 与调度开销</a></li><li><a href=#73-pid-资源消耗>7.3 PID 资源消耗</a></li><li><a href=#74-信号处理锁竞争>7.4 信号处理锁竞争</a></li><li><a href=#75-vma-膨胀>7.5 VMA 膨胀</a></li><li><a href=#76-影响量化>7.6 影响量化</a></li></ol></li><li><a href=#8-内核对线程数的限制机制>8. 内核对线程数的限制机制</a><ol><li><a href=#81-全局线程数上限-max_threads>8.1 全局线程数上限 max_threads</a></li><li><a href=#82-per-user-进程数限制-rlimit_nproc>8.2 per-user 进程数限制 RLIMIT_NPROC</a></li><li><a href=#83-pid-空间耗尽>8.3 PID 空间耗尽</a></li></ol></li><li><a href=#9-进程-vs-线程全景对比>9. 进程 vs 线程全景对比</a></li><li><a href=#附录相关内核参数速查>附录：相关内核参数速查</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E8%BF%9B%E7%A8%8B/ style=background-color:#fbbc04;color:#fff>进程</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/%E8%BF%9B%E7%A8%8B%E4%B8%8E%E7%BA%BF%E7%A8%8B%E7%9A%84%E6%9C%AC%E8%B4%A8%E5%8C%BA%E5%88%AB%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E7%9C%8B%E5%85%B1%E4%BA%AB%E4%B8%8E%E9%9A%94%E7%A6%BB/>进程与线程的本质区别——从内核源码看共享与隔离</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 30, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>9 minute read</time></div></footer></div></header><section class=article-content><h1 id=进程与线程的本质区别从内核源码看共享与隔离>进程与线程的本质区别——从内核源码看共享与隔离</h1><blockquote><p>基于 Linux 5.15.78 内核源码。<br>前置阅读：<a class=link href=%e8%bf%9b%e7%a8%8b%e7%ba%bf%e7%a8%8b%e5%88%9b%e5%bb%ba%e6%ba%90%e7%a0%81%e5%88%86%e6%9e%90.md>进程/线程创建源码分析</a> — <code>copy_process</code> 完整流程。</p></blockquote><hr><h2 id=目录>目录</h2><ul><li><a class=link href=#1-%e6%a0%b8%e5%bf%83%e7%bb%93%e8%ae%ba>1. 核心结论</a></li><li><a class=link href=#2-task_struct-%e4%b8%ad%e7%9a%84%e5%85%b3%e9%94%ae%e5%85%b1%e4%ba%ab%e5%ad%97%e6%ae%b5>2. task_struct 中的关键共享字段</a></li><li><a class=link href=#3-clone-flags-%e4%be%9d%e8%b5%96%e9%93%be>3. clone flags 依赖链</a></li><li><a class=link href=#4-%e5%90%84%e8%b5%84%e6%ba%90%e7%9a%84%e5%85%b1%e4%ba%ab-vs-%e5%a4%8d%e5%88%b6%e6%ba%90%e7%a0%81%e5%88%86%e6%9e%90>4. 各资源的共享 vs 复制源码分析</a></li><li><a class=link href=#5-%e5%85%b1%e4%ba%ab%e5%9c%b0%e5%9d%80%e7%a9%ba%e9%97%b4%e5%8d%b4%e6%8b%a5%e6%9c%89%e7%a7%81%e6%9c%89%e6%a0%88%e7%ba%bf%e7%a8%8b%e6%a0%88%e7%9a%84%e5%ae%9e%e7%8e%b0>5. 共享地址空间却拥有私有栈——线程栈的实现</a></li><li><a class=link href=#6-pid-%e4%b8%8e-tgid-%e7%9a%84%e5%85%b3%e7%b3%bb>6. PID 与 TGID 的关系</a></li><li><a class=link href=#7-%e5%a4%a7%e9%87%8f%e5%88%9b%e5%bb%ba%e7%ba%bf%e7%a8%8b%e7%9a%84%e5%bd%b1%e5%93%8d>7. 大量创建线程的影响</a></li><li><a class=link href=#8-%e5%86%85%e6%a0%b8%e5%af%b9%e7%ba%bf%e7%a8%8b%e6%95%b0%e7%9a%84%e9%99%90%e5%88%b6%e6%9c%ba%e5%88%b6>8. 内核对线程数的限制机制</a></li><li><a class=link href=#9-%e8%bf%9b%e7%a8%8b-vs-%e7%ba%bf%e7%a8%8b%e5%85%a8%e6%99%af%e5%af%b9%e6%af%94>9. 进程 vs 线程全景对比</a></li><li><a class=link href=#%e9%99%84%e5%bd%95%e7%9b%b8%e5%85%b3%e5%86%85%e6%a0%b8%e5%8f%82%e6%95%b0%e9%80%9f%e6%9f%a5>附录：相关内核参数速查</a></li></ul><hr><h2 id=1-核心结论>1. 核心结论</h2><p><strong>Linux 内核中没有独立的"线程"数据结构</strong>——进程和线程都用同一个 <code>task_struct</code> 表示，走同一个 <code>copy_process()</code> 创建路径。<strong>唯一的区别是 clone flags</strong>，决定了各类资源是"共享引用计数+1"还是"复制一份独立副本"。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>fork()           → clone_flags ≈ SIGCHLD（所有资源独立复制）
+</span></span><span class=line><span class=cl>pthread_create() → clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | 
+</span></span><span class=line><span class=cl>                                 CLONE_SIGHAND | CLONE_THREAD | ...（资源共享）
+</span></span></code></pre></td></tr></table></div></div><p>Linus Torvalds 的设计哲学：<strong>不区分进程和线程，只有"任务"(task) 和"共享程度"的差异</strong>。</p><hr><h2 id=2-task_struct-中的关键共享字段>2. task_struct 中的关键共享字段</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/sched.h
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>task_struct</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>pid_t</span>               <span class=n>pid</span><span class=p>;</span>            <span class=c1>// 内核级唯一标识（每个线程不同）
+</span></span></span><span class=line><span class=cl>    <span class=kt>pid_t</span>               <span class=n>tgid</span><span class=p>;</span>           <span class=c1>// 线程组 ID（同进程的线程 tgid 相同）
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>task_struct</span>   <span class=o>*</span><span class=n>group_leader</span><span class=p>;</span>  <span class=c1>// 线程组主线程指针
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mm_struct</span>     <span class=o>*</span><span class=n>mm</span><span class=p>;</span>            <span class=c1>// 地址空间 ← CLONE_VM 控制
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>files_struct</span>  <span class=o>*</span><span class=n>files</span><span class=p>;</span>         <span class=c1>// 文件描述符表 ← CLONE_FILES 控制
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fs_struct</span>     <span class=o>*</span><span class=n>fs</span><span class=p>;</span>            <span class=c1>// 文件系统信息 ← CLONE_FS 控制
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sighand_struct</span> <span class=o>*</span><span class=n>sighand</span><span class=p>;</span>      <span class=c1>// 信号处理程序 ← CLONE_SIGHAND 控制
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>signal_struct</span> <span class=o>*</span><span class=n>signal</span><span class=p>;</span>        <span class=c1>// 信号队列/资源限制 ← CLONE_THREAD 控制
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span>                <span class=o>*</span><span class=n>stack</span><span class=p>;</span>          <span class=c1>// 内核栈（永远独立，不可共享）
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sched_entity</span>  <span class=n>se</span><span class=p>;</span>             <span class=c1>// 调度实体（永远独立）
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p>关键洞察：<strong>这些字段都是指针</strong>。共享时多个 <code>task_struct</code> 的指针指向同一个对象（引用计数+1）；独立时各自指向自己的副本。</p><hr><h2 id=3-clone-flags-依赖链>3. clone flags 依赖链</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:2271-2286 — copy_process() 入口校验
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>((</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_THREAD</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=p>(</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_SIGHAND</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>ERR_PTR</span><span class=p>(</span><span class=o>-</span><span class=n>EINVAL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>((</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_SIGHAND</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=p>(</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_VM</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>ERR_PTR</span><span class=p>(</span><span class=o>-</span><span class=n>EINVAL</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p>内核强制的依赖关系：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>CLONE_THREAD → CLONE_SIGHAND → CLONE_VM
+</span></span><span class=line><span class=cl>（线程组）      （共享信号处理）   （共享地址空间）
+</span></span></code></pre></td></tr></table></div></div><p>逻辑：线程组成员必须共享信号处理程序（否则信号投递语义不一致）；共享信号处理程序必须共享地址空间（信号处理函数的代码和栈在地址空间中）。</p><hr><h2 id=4-各资源的共享-vs-复制源码分析>4. 各资源的共享 vs 复制源码分析</h2><p><code>copy_process()</code> 中依次调用以下函数（<code>kernel/fork.c:2546-2599</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=n>copy_files</span><span class=p>()</span>   <span class=err>→</span> <span class=n>copy_fs</span><span class=p>()</span>    <span class=err>→</span> <span class=n>copy_sighand</span><span class=p>()</span> <span class=err>→</span> <span class=n>copy_signal</span><span class=p>()</span> <span class=err>→</span> <span class=n>copy_mm</span><span class=p>()</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=41-地址空间-mm_struct最核心的区别>4.1 地址空间 mm_struct（最核心的区别）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:1690-1734
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>copy_mm</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>clone_flags</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mm_struct</span> <span class=o>*</span><span class=n>mm</span><span class=p>,</span> <span class=o>*</span><span class=n>oldmm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>mm</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>active_mm</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>oldmm</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>oldmm</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// 内核线程无用户空间 mm
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_VM</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ========== 线程路径 ==========
+</span></span></span><span class=line><span class=cl>        <span class=c1>// 只增加引用计数，共享同一个 mm_struct
+</span></span></span><span class=line><span class=cl>        <span class=nf>mmget</span><span class=p>(</span><span class=n>oldmm</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>mm</span> <span class=o>=</span> <span class=n>oldmm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// ========== 进程路径 ==========
+</span></span></span><span class=line><span class=cl>        <span class=c1>// dup_mm → allocate_mm + memcpy + mm_init + dup_mmap
+</span></span></span><span class=line><span class=cl>        <span class=c1>// dup_mmap 内部调用 copy_page_range 实现 COW
+</span></span></span><span class=line><span class=cl>        <span class=n>mm</span> <span class=o>=</span> <span class=nf>dup_mm</span><span class=p>(</span><span class=n>tsk</span><span class=p>,</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>mm</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>mm</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span> <span class=o>-</span><span class=n>ENOMEM</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>mm</span> <span class=o>=</span> <span class=n>mm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>active_mm</span> <span class=o>=</span> <span class=n>mm</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>进程</strong>：<code>dup_mm()</code> 分配新的 <code>mm_struct</code>，遍历父进程所有 VMA 创建副本，调用 <code>copy_page_range()</code> 设置写时复制（COW）。这是 <code>fork()</code> 最重的操作。</p><p><strong>线程</strong>：仅 <code>mmget(oldmm)</code> 增加引用计数（一条原子指令），几乎零开销。</p><h3 id=42-文件描述符表-files_struct>4.2 文件描述符表 files_struct</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:1784-1811
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>copy_files</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>clone_flags</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>files_struct</span> <span class=o>*</span><span class=n>oldf</span><span class=p>,</span> <span class=o>*</span><span class=n>newf</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>oldf</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>files</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_FILES</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 线程：共享 fd 表，引用计数+1
+</span></span></span><span class=line><span class=cl>        <span class=nf>atomic_inc</span><span class=p>(</span><span class=o>&amp;</span><span class=n>oldf</span><span class=o>-&gt;</span><span class=n>count</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 进程：dup_fd 复制整个 fd 表
+</span></span></span><span class=line><span class=cl>    <span class=n>newf</span> <span class=o>=</span> <span class=nf>dup_fd</span><span class=p>(</span><span class=n>oldf</span><span class=p>,</span> <span class=n>NR_OPEN_MAX</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>error</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>files</span> <span class=o>=</span> <span class=n>newf</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>影响</strong>：线程共享 fd 表意味着一个线程 <code>close(fd)</code> 会影响同进程所有线程。</p><h3 id=43-文件系统信息-fs_struct>4.3 文件系统信息 fs_struct</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:1748-1767
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>copy_fs</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>clone_flags</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fs_struct</span> <span class=o>*</span><span class=n>fs</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>fs</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_FS</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 线程：共享，引用计数+1
+</span></span></span><span class=line><span class=cl>        <span class=n>fs</span><span class=o>-&gt;</span><span class=n>users</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 进程：copy_fs_struct 复制 cwd、root、umask
+</span></span></span><span class=line><span class=cl>    <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>fs</span> <span class=o>=</span> <span class=nf>copy_fs_struct</span><span class=p>(</span><span class=n>fs</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>影响</strong>：线程共享 <code>fs_struct</code> 意味着一个线程 <code>chdir()</code> 会影响同进程所有线程的工作目录。</p><h3 id=44-信号处理程序-sighand_struct>4.4 信号处理程序 sighand_struct</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:1854-1881
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>copy_sighand</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>clone_flags</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_SIGHAND</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 线程：共享信号处理程序表
+</span></span></span><span class=line><span class=cl>        <span class=nf>refcount_inc</span><span class=p>(</span><span class=o>&amp;</span><span class=n>current</span><span class=o>-&gt;</span><span class=n>sighand</span><span class=o>-&gt;</span><span class=n>count</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 进程：分配新的 sighand_struct 并复制 action 数组
+</span></span></span><span class=line><span class=cl>    <span class=n>sig</span> <span class=o>=</span> <span class=nf>kmem_cache_alloc</span><span class=p>(</span><span class=n>sighand_cachep</span><span class=p>,</span> <span class=n>GFP_KERNEL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>RCU_INIT_POINTER</span><span class=p>(</span><span class=n>tsk</span><span class=o>-&gt;</span><span class=n>sighand</span><span class=p>,</span> <span class=n>sig</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=45-信号队列与资源限制-signal_struct>4.5 信号队列与资源限制 signal_struct</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:1925-1931
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>copy_signal</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>clone_flags</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_THREAD</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 线程：复用父线程的 signal_struct（已在 dup_task_struct 中复制指针）
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 进程：分配新的 signal_struct
+</span></span></span><span class=line><span class=cl>    <span class=p>...</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>signal_struct</code> 包含：pending 信号队列、rlimit 资源限制、CPU 时间统计、线程组存活计数等。同一进程的所有线程共享这些信息。</p><h3 id=46-汇总对照表>4.6 汇总对照表</h3><div class=table-wrapper><table><thead><tr><th>资源</th><th>数据结构</th><th>控制 flag</th><th>fork（进程）</th><th>pthread_create（线程）</th><th>共享含义</th></tr></thead><tbody><tr><td>地址空间</td><td><code>mm_struct</code></td><td><code>CLONE_VM</code></td><td>COW 复制</td><td><strong>共享</strong></td><td>全局变量、堆、代码段互通</td></tr><tr><td>文件描述符表</td><td><code>files_struct</code></td><td><code>CLONE_FILES</code></td><td>复制</td><td><strong>共享</strong></td><td>close/dup 互相影响</td></tr><tr><td>文件系统信息</td><td><code>fs_struct</code></td><td><code>CLONE_FS</code></td><td>复制</td><td><strong>共享</strong></td><td>chdir/chroot 互相影响</td></tr><tr><td>信号处理</td><td><code>sighand_struct</code></td><td><code>CLONE_SIGHAND</code></td><td>复制</td><td><strong>共享</strong></td><td>signal handler 统一</td></tr><tr><td>信号队列/rlimit</td><td><code>signal_struct</code></td><td><code>CLONE_THREAD</code></td><td>新建</td><td><strong>共享</strong></td><td>资源限制统一</td></tr><tr><td><strong>内核栈</strong></td><td>—</td><td>—</td><td><strong>独立</strong></td><td><strong>独立</strong></td><td>永远独立</td></tr><tr><td><strong>调度实体</strong></td><td><code>sched_entity</code></td><td>—</td><td><strong>独立</strong></td><td><strong>独立</strong></td><td>独立调度</td></tr></tbody></table></div><hr><h2 id=5-共享地址空间却拥有私有栈线程栈的实现>5. 共享地址空间却拥有私有栈——线程栈的实现</h2><p>理解了第 4 节的资源共享后，一个自然的问题出现了：线程共享 <code>mm_struct</code>（同一个虚拟地址空间），那每个线程怎么拥有自己的栈？答案是——<strong>栈的"私有"不靠内存隔离，靠的是每个线程的 RSP 寄存器指向地址空间中不同的区域</strong>。</p><h3 id=51-用户栈glibc-mmap-分配--内核设置-rsp>5.1 用户栈：glibc mmap 分配 + 内核设置 RSP</h3><p>流程分两步：glibc 在用户空间分配栈内存 → 内核在 <code>copy_thread</code> 中设置新线程的栈指针。</p><p><strong>第一步</strong>：<code>pthread_create()</code> 在调 <code>clone()</code> 之前，先 <code>mmap</code> 一块匿名内存作为栈：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// glibc 伪代码
+</span></span></span><span class=line><span class=cl><span class=n>stack</span> <span class=o>=</span> <span class=nf>mmap</span><span class=p>(</span><span class=nb>NULL</span><span class=p>,</span> <span class=mi>8</span><span class=n>MB</span><span class=p>,</span> <span class=n>PROT_READ</span><span class=o>|</span><span class=n>PROT_WRITE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>             <span class=n>MAP_PRIVATE</span><span class=o>|</span><span class=n>MAP_ANONYMOUS</span><span class=o>|</span><span class=n>MAP_STACK</span><span class=p>,</span> <span class=o>-</span><span class=mi>1</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nf>clone</span><span class=p>(</span><span class=n>CLONE_VM</span><span class=o>|</span><span class=n>CLONE_THREAD</span><span class=o>|</span><span class=p>...,</span> <span class=n>stack</span> <span class=o>+</span> <span class=mi>8</span><span class=n>MB</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=c1>//                                ^^^^^^^^^^^ 栈顶（高地址端）
+</span></span></span></code></pre></td></tr></table></div></div><p>这段 mmap 区域成为共享 <code>mm_struct</code> 中的一个新 VMA。所有线程都<strong>能看到</strong>这块内存（同一地址空间），但只有该线程的 RSP 指向它。</p><p><strong>第二步</strong>：<code>clone()</code> 把栈地址传入内核，最终到达 <code>copy_thread()</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:2619-2633
+</span></span></span><span class=line><span class=cl><span class=n>retval</span> <span class=o>=</span> <span class=nf>copy_thread</span><span class=p>(</span><span class=n>clone_flags</span><span class=p>,</span> <span class=n>args</span><span class=o>-&gt;</span><span class=n>stack</span><span class=p>,</span> <span class=n>args</span><span class=o>-&gt;</span><span class=n>stack_size</span><span class=p>,</span> <span class=n>p</span><span class=p>,</span> <span class=n>args</span><span class=o>-&gt;</span><span class=n>tls</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/kernel/process.c:275-299
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=o>*</span><span class=n>childregs</span> <span class=o>=</span> <span class=o>*</span><span class=nf>current_pt_regs</span><span class=p>();</span>       <span class=c1>// 复制父线程全部寄存器
+</span></span></span><span class=line><span class=cl><span class=n>childregs</span><span class=o>-&gt;</span><span class=n>ax</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>                     <span class=c1>// 子线程返回值 = 0
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>sp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>childregs</span><span class=o>-&gt;</span><span class=n>sp</span> <span class=o>=</span> <span class=n>sp</span><span class=p>;</span>                <span class=c1>// 关键：用新栈地址覆盖 RSP
+</span></span></span></code></pre></td></tr></table></div></div><p><code>fork()</code> 时 <code>sp = 0</code>，子进程继承父进程的 RSP（COW 页表保证安全）。<code>pthread_create()</code> 时 <code>sp = 栈顶</code>，新线程指向独立的 mmap 区域。</p><h3 id=52-内核栈每个线程永远独立>5.2 内核栈：每个线程永远独立</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:1044-1087 — dup_task_struct
+</span></span></span><span class=line><span class=cl><span class=n>stack</span> <span class=o>=</span> <span class=nf>alloc_thread_stack_node</span><span class=p>(</span><span class=n>tsk</span><span class=p>,</span> <span class=n>node</span><span class=p>);</span>  <span class=c1>// vmalloc 分配 16KB
+</span></span></span><span class=line><span class=cl><span class=n>tsk</span><span class=o>-&gt;</span><span class=n>stack</span> <span class=o>=</span> <span class=n>stack</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>内核栈在 vmalloc 空间中（不在用户 <code>mm_struct</code> 里），每个线程永远独立分配。</p><h3 id=53-fork_frame-与首次调度>5.3 fork_frame 与首次调度</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/kernel/process.c:194-221
+</span></span></span><span class=line><span class=cl><span class=n>childregs</span> <span class=o>=</span> <span class=nf>task_pt_regs</span><span class=p>(</span><span class=n>p</span><span class=p>);</span>                     <span class=c1>// 内核栈顶的 pt_regs
+</span></span></span><span class=line><span class=cl><span class=n>fork_frame</span> <span class=o>=</span> <span class=nf>container_of</span><span class=p>(</span><span class=n>childregs</span><span class=p>,</span> <span class=k>struct</span> <span class=n>fork_frame</span><span class=p>,</span> <span class=n>regs</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=n>frame</span><span class=o>-&gt;</span><span class=n>ret_addr</span> <span class=o>=</span> <span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span><span class=p>)</span> <span class=n>ret_from_fork</span><span class=p>;</span>  <span class=c1>// 首次调度跳转到这里
+</span></span></span><span class=line><span class=cl><span class=n>p</span><span class=o>-&gt;</span><span class=kr>thread</span><span class=p>.</span><span class=n>sp</span> <span class=o>=</span> <span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span><span class=p>)</span> <span class=n>fork_frame</span><span class=p>;</span>         <span class=c1>// 子线程内核 RSP
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=54-地址空间布局>5.4 地址空间布局</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>             共享的 mm_struct（同一个虚拟地址空间）
+</span></span><span class=line><span class=cl>             ┌──────────────────────────────────────┐
+</span></span><span class=line><span class=cl>高地址       │  主线程栈 (8MB VMA)                    │ ← 主线程 RSP
+</span></span><span class=line><span class=cl>             ├──────────────────────────────────────┤
+</span></span><span class=line><span class=cl>             │  线程1栈 (8MB VMA, mmap分配)           │ ← 线程1 RSP
+</span></span><span class=line><span class=cl>             ├──────────────────────────────────────┤
+</span></span><span class=line><span class=cl>             │  线程2栈 (8MB VMA, mmap分配)           │ ← 线程2 RSP
+</span></span><span class=line><span class=cl>             ├──────────────────────────────────────┤
+</span></span><span class=line><span class=cl>             │  堆 / 共享库 / 代码段                  │ ← 所有线程共享
+</span></span><span class=line><span class=cl>低地址       └──────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>内核空间 vmalloc 区域（不在用户 mm 中）:
+</span></span><span class=line><span class=cl>             ┌────────────────────┐
+</span></span><span class=line><span class=cl>             │ 主线程内核栈 16KB   │
+</span></span><span class=line><span class=cl>             │ 线程1内核栈 16KB    │  ← 每个线程 task_struct.stack
+</span></span><span class=line><span class=cl>             │ 线程2内核栈 16KB    │
+</span></span><span class=line><span class=cl>             └────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><p><strong>设计本质</strong>：所有线程共享地址空间，栈只是地址空间中的一段普通 VMA，通过 RSP 寄存器的不同指向实现"私有"。这也意味着线程间可以传递栈上变量的指针（同一地址空间，合法但危险）。</p><hr><h2 id=6-pid-与-tgid-的关系>6. PID 与 TGID 的关系</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:2715-2734
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=n>p</span><span class=o>-&gt;</span><span class=n>pid</span> <span class=o>=</span> <span class=nf>pid_nr</span><span class=p>(</span><span class=n>pid</span><span class=p>);</span>  <span class=c1>// 分配唯一的内核 PID
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>clone_flags</span> <span class=o>&amp;</span> <span class=n>CLONE_THREAD</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 线程：继承父线程的 group_leader 和 tgid
+</span></span></span><span class=line><span class=cl>    <span class=n>p</span><span class=o>-&gt;</span><span class=n>group_leader</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>group_leader</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>p</span><span class=o>-&gt;</span><span class=n>tgid</span> <span class=o>=</span> <span class=n>current</span><span class=o>-&gt;</span><span class=n>tgid</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 进程：自己就是 group_leader，tgid = 自己的 pid
+</span></span></span><span class=line><span class=cl>    <span class=n>p</span><span class=o>-&gt;</span><span class=n>group_leader</span> <span class=o>=</span> <span class=n>p</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>p</span><span class=o>-&gt;</span><span class=n>tgid</span> <span class=o>=</span> <span class=n>p</span><span class=o>-&gt;</span><span class=n>pid</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>进程 A (pid=100, tgid=100, group_leader=自己)
+</span></span><span class=line><span class=cl>  ├── 线程 1 (pid=101, tgid=100, group_leader=A)
+</span></span><span class=line><span class=cl>  ├── 线程 2 (pid=102, tgid=100, group_leader=A)
+</span></span><span class=line><span class=cl>  └── 线程 3 (pid=103, tgid=100, group_leader=A)
+</span></span></code></pre></td></tr></table></div></div><ul><li><code>getpid()</code> → 返回 <code>tgid</code>（同进程所有线程看到相同的 &ldquo;PID&rdquo;=100）</li><li><code>gettid()</code> → 返回 <code>pid</code>（每个线程各不相同：100, 101, 102, 103）</li><li><code>ps -ef</code> 只显示 <code>tgid</code>（主线程）；<code>ps -eLf</code> 显示所有 LWP（轻量级进程）</li></ul><p>线程加入线程组的链表操作：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:2875-2903
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=n>current</span><span class=o>-&gt;</span><span class=n>signal</span><span class=o>-&gt;</span><span class=n>nr_threads</span><span class=o>++</span><span class=p>;</span>               <span class=c1>// 线程组线程数+1
+</span></span></span><span class=line><span class=cl><span class=nf>atomic_inc</span><span class=p>(</span><span class=o>&amp;</span><span class=n>current</span><span class=o>-&gt;</span><span class=n>signal</span><span class=o>-&gt;</span><span class=n>live</span><span class=p>);</span>          <span class=c1>// 存活线程数+1
+</span></span></span><span class=line><span class=cl><span class=nf>refcount_inc</span><span class=p>(</span><span class=o>&amp;</span><span class=n>current</span><span class=o>-&gt;</span><span class=n>signal</span><span class=o>-&gt;</span><span class=n>sigcnt</span><span class=p>);</span>      <span class=c1>// 信号结构引用+1
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nf>list_add_tail_rcu</span><span class=p>(</span><span class=o>&amp;</span><span class=n>p</span><span class=o>-&gt;</span><span class=n>thread_group</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                  <span class=o>&amp;</span><span class=n>p</span><span class=o>-&gt;</span><span class=n>group_leader</span><span class=o>-&gt;</span><span class=n>thread_group</span><span class=p>);</span>  <span class=c1>// 加入线程组链表
+</span></span></span><span class=line><span class=cl><span class=nf>list_add_tail_rcu</span><span class=p>(</span><span class=o>&amp;</span><span class=n>p</span><span class=o>-&gt;</span><span class=n>thread_node</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                  <span class=o>&amp;</span><span class=n>p</span><span class=o>-&gt;</span><span class=n>signal</span><span class=o>-&gt;</span><span class=n>thread_head</span><span class=p>);</span>         <span class=c1>// 加入信号线程链表
+</span></span></span></code></pre></td></tr></table></div></div><hr><h2 id=7-大量创建线程的影响>7. 大量创建线程的影响</h2><h3 id=71-内核栈消耗不可-swap>7.1 内核栈消耗（不可 swap）</h3><p>每个线程拥有独立的内核栈，x86-64 下：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/page_64_types.h:15-16
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#define THREAD_SIZE_ORDER  (2 + KASAN_STACK_ORDER)  </span><span class=c1>// 通常为 2
+</span></span></span><span class=line><span class=cl><span class=cp>#define THREAD_SIZE  (PAGE_SIZE &lt;&lt; THREAD_SIZE_ORDER) </span><span class=c1>// = 4096 &lt;&lt; 2 = 16384 (16KB)
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>1000 个线程 = 16MB 纯内核栈</strong>，且这部分内存是 <code>vmalloc</code> 分配、不可 swap 的物理内存。10000 个线程 = 160MB。</p><h3 id=72-task_struct-与调度开销>7.2 task_struct 与调度开销</h3><p>每个线程都是一个独立的 <code>sched_entity</code>，加入 CFS 红黑树。线程越多：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl> ┌──────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl> │           CFS 红黑树                              │
+</span></span><span class=line><span class=cl> │                                                   │
+</span></span><span class=line><span class=cl> │     1000 个线程 = 1000 个红黑树节点                │
+</span></span><span class=line><span class=cl> │     每次 pick_next_task 代价: O(1) 取最左节点      │
+</span></span><span class=line><span class=cl> │     每次 enqueue/dequeue:    O(log N)              │
+</span></span><span class=line><span class=cl> │     但 N=1000 时上下文切换频率急剧上升             │
+</span></span><span class=line><span class=cl> │     CPU 时间大量消耗在调度器本身                    │
+</span></span><span class=line><span class=cl> └──────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><ul><li>时间片被切分得更细，每个线程实际运行时间缩短</li><li>上下文切换频率上升 → cache/TLB 污染加剧</li><li><code>schedule()</code> 本身的锁竞争增大（<code>rq->lock</code>）</li></ul><h3 id=73-pid-资源消耗>7.3 PID 资源消耗</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/threads.h:28-35
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#define PID_MAX_DEFAULT  0x8000              </span><span class=c1>// 32768
+</span></span></span><span class=line><span class=cl><span class=cp>#define PID_MAX_LIMIT    (CONFIG_BASE_SMALL ? PAGE_SIZE * 8 : \
+</span></span></span><span class=line><span class=cl><span class=cp>	(sizeof(long) &gt; 4 ? 4 * 1024 * 1024 : PID_MAX_DEFAULT))
+</span></span></span><span class=line><span class=cl><span class=c1>// 64 位系统: 上限 4,194,304
+</span></span></span></code></pre></td></tr></table></div></div><p>每个线程消耗一个内核 PID（即使用户空间通过 <code>getpid()</code> 看到的是相同的 tgid）。系统全局共享 PID 空间，大量线程会挤压其他进程的 PID 分配。</p><h3 id=74-信号处理锁竞争>7.4 信号处理锁竞争</h3><p>同一线程组共享 <code>signal_struct</code>，信号投递需要持有 <code>siglock</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=err>信号投递路径</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>  <span class=n>complete_signal</span><span class=p>()</span> <span class=err>→</span> <span class=n>lock_task_sighand</span><span class=p>()</span> <span class=err>→</span> <span class=n>spin_lock</span><span class=p>(</span><span class=n>siglock</span><span class=p>)</span> <span class=err>→</span> <span class=o>...</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=err>线程越多</span> <span class=err>→</span> <span class=n>signal_struct</span> <span class=err>上的</span> <span class=n>siglock</span> <span class=err>竞争越激烈</span>
+</span></span><span class=line><span class=cl>         <span class=err>→</span> <span class=err>进程级信号投递（如</span> <span class=n>SIGTERM</span><span class=err>）需要遍历线程组所有成员</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=75-vma-膨胀>7.5 VMA 膨胀</h3><p>虽然线程共享 <code>mm_struct</code>，但每个线程的用户态栈通过 <code>mmap</code> 分配独立区域（默认 8MB）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>1000 个线程 = 1000 个栈 VMA = mm_struct 中 1000+ 个 vm_area_struct
+</span></span><span class=line><span class=cl>→ find_vma() 红黑树查找 O(log N) 变慢
+</span></span><span class=line><span class=cl>→ /proc/&lt;pid&gt;/maps 极长
+</span></span><span class=line><span class=cl>→ fork 此进程时 dup_mmap 需要复制 1000+ 个 VMA
+</span></span></code></pre></td></tr></table></div></div><h3 id=76-影响量化>7.6 影响量化</h3><div class=table-wrapper><table><thead><tr><th>资源</th><th>每线程开销</th><th>1000 线程</th><th>10000 线程</th></tr></thead><tbody><tr><td>内核栈</td><td>16KB (不可 swap)</td><td>16MB</td><td>160MB</td></tr><tr><td>task_struct</td><td>~6KB (slab)</td><td>6MB</td><td>60MB</td></tr><tr><td>内核 PID</td><td>1 个</td><td>1000</td><td>10000</td></tr><tr><td>用户栈 VMA</td><td>8MB 虚拟地址</td><td>8GB 虚拟</td><td>80GB 虚拟</td></tr><tr><td>调度延迟</td><td>O(log N) enqueue</td><td>可感知</td><td>严重退化</td></tr></tbody></table></div><hr><h2 id=8-内核对线程数的限制机制>8. 内核对线程数的限制机制</h2><h3 id=81-全局线程数上限-max_threads>8.1 全局线程数上限 max_threads</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:259,900-918
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=n>max_threads</span><span class=p>;</span>  <span class=c1>// 全局线程数上限
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>set_max_threads</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>max_threads_suggested</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>u64</span> <span class=n>threads</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>nr_pages</span> <span class=o>=</span> <span class=nf>totalram_pages</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 计算方式：总内存 / (THREAD_SIZE * 8)
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 即内核栈最多占用总内存的 1/8
+</span></span></span><span class=line><span class=cl>    <span class=n>threads</span> <span class=o>=</span> <span class=nf>div64_u64</span><span class=p>((</span><span class=n>u64</span><span class=p>)</span> <span class=n>nr_pages</span> <span class=o>*</span> <span class=p>(</span><span class=n>u64</span><span class=p>)</span> <span class=n>PAGE_SIZE</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                        <span class=p>(</span><span class=n>u64</span><span class=p>)</span> <span class=n>THREAD_SIZE</span> <span class=o>*</span> <span class=mi>8UL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>max_threads</span> <span class=o>=</span> <span class=kt>clamp_t</span><span class=p>(</span><span class=n>u64</span><span class=p>,</span> <span class=n>threads</span><span class=p>,</span> <span class=n>MIN_THREADS</span><span class=p>,</span> <span class=n>MAX_THREADS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>在 <code>copy_process()</code> 中强制检查：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:2417
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>data_race</span><span class=p>(</span><span class=n>nr_threads</span> <span class=o>&gt;=</span> <span class=n>max_threads</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=k>goto</span> <span class=n>bad_fork_cleanup_count</span><span class=p>;</span>  <span class=c1>// 返回 -EAGAIN
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=82-per-user-进程数限制-rlimit_nproc>8.2 per-user 进程数限制 RLIMIT_NPROC</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/fork.c:964-967 — 初始化时设为 max_threads/2
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=n>init_task</span><span class=p>.</span><span class=n>signal</span><span class=o>-&gt;</span><span class=n>rlim</span><span class=p>[</span><span class=n>RLIMIT_NPROC</span><span class=p>].</span><span class=n>rlim_cur</span> <span class=o>=</span> <span class=n>max_threads</span><span class=o>/</span><span class=mi>2</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=n>init_task</span><span class=p>.</span><span class=n>signal</span><span class=o>-&gt;</span><span class=n>rlim</span><span class=p>[</span><span class=n>RLIMIT_NPROC</span><span class=p>].</span><span class=n>rlim_max</span> <span class=o>=</span> <span class=n>max_threads</span><span class=o>/</span><span class=mi>2</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>用户空间可通过 <code>ulimit -u</code> 查看/修改。</p><h3 id=83-pid-空间耗尽>8.3 PID 空间耗尽</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/pid.c:234
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=n>nr</span> <span class=o>=</span> <span class=nf>idr_alloc_cyclic</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tmp</span><span class=o>-&gt;</span><span class=n>idr</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span> <span class=n>pid_min</span><span class=p>,</span> <span class=n>pid_max</span><span class=p>,</span> <span class=n>GFP_ATOMIC</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=c1>// 分配失败时返回 -ENOSPC → copy_process 返回 -EAGAIN
+</span></span></span></code></pre></td></tr></table></div></div><hr><h2 id=9-进程-vs-线程全景对比>9. 进程 vs 线程全景对比</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-gdscript3 data-lang=gdscript3><span class=line><span class=cl><span class=err>┌─────────────────────────────────────────────────────────────────────────┐</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>                      <span class=n>fork</span><span class=p>()</span> <span class=err>创建进程</span>                                     <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>                                                                         <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>   <span class=err>父进程</span>                              <span class=err>子进程</span>                             <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>┌──────────┐</span>                        <span class=err>┌──────────┐</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span><span class=n>task_struct</span><span class=err>│</span>                        <span class=err>│</span><span class=n>task_struct</span><span class=err>│</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├──────────┤</span>                        <span class=err>├──────────┤</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>mm</span> <span class=err>──────┼───→</span> <span class=n>mm_struct</span> <span class=n>A</span>        <span class=err>│</span> <span class=n>mm</span> <span class=err>──────┼───→</span> <span class=n>mm_struct</span> <span class=n>B</span> <span class=p>(</span><span class=n>COW</span><span class=p>)</span><span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>files</span> <span class=err>───┼───→</span> <span class=n>files_struct</span> <span class=n>A</span>     <span class=err>│</span> <span class=n>files</span> <span class=err>───┼───→</span> <span class=n>files_struct</span> <span class=n>B</span>   <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>fs</span> <span class=err>──────┼───→</span> <span class=n>fs_struct</span> <span class=n>A</span>        <span class=err>│</span> <span class=n>fs</span> <span class=err>──────┼───→</span> <span class=n>fs_struct</span> <span class=n>B</span>      <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=k>signal</span> <span class=err>──┼───→</span> <span class=n>signal_struct</span> <span class=n>A</span>    <span class=err>│</span> <span class=k>signal</span> <span class=err>──┼───→</span> <span class=n>signal_struct</span> <span class=n>B</span>  <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>stack</span> <span class=err>───┼───→</span> <span class=err>内核栈</span> <span class=n>A</span>            <span class=err>│</span> <span class=n>stack</span> <span class=err>───┼───→</span> <span class=err>内核栈</span> <span class=n>B</span>         <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>pid</span><span class=o>=</span><span class=mi>100</span>  <span class=err>│</span>                        <span class=err>│</span> <span class=n>pid</span><span class=o>=</span><span class=mi>200</span>  <span class=err>│</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>tgid</span><span class=o>=</span><span class=mi>100</span> <span class=err>│</span>                        <span class=err>│</span> <span class=n>tgid</span><span class=o>=</span><span class=mi>200</span> <span class=err>│</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>└──────────┘</span>                        <span class=err>└──────────┘</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>每个资源独立复制（或</span> <span class=n>COW</span> <span class=err>延迟复制）</span>                                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>├─────────────────────────────────────────────────────────────────────────┤</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>                  <span class=n>pthread_create</span><span class=p>()</span> <span class=err>创建线程</span>                               <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>                                                                         <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>   <span class=err>主线程</span>                              <span class=err>新线程</span>                             <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>┌──────────┐</span>                        <span class=err>┌──────────┐</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span><span class=n>task_struct</span><span class=err>│</span>                        <span class=err>│</span><span class=n>task_struct</span><span class=err>│</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>├──────────┤</span>                        <span class=err>├──────────┤</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>mm</span> <span class=err>──────┼──┐</span>                     <span class=err>│</span> <span class=n>mm</span> <span class=err>──────┼──┐</span>                    <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>files</span> <span class=err>───┼──┤</span>                     <span class=err>│</span> <span class=n>files</span> <span class=err>───┼──┤</span>                    <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>fs</span> <span class=err>──────┼──┼──→</span> <span class=err>同一个对象</span>       <span class=err>│</span> <span class=n>fs</span> <span class=err>──────┼──┤</span>                    <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=k>signal</span> <span class=err>──┼──┤</span>    <span class=p>(</span><span class=err>引用计数</span><span class=o>+</span><span class=mi>1</span><span class=p>)</span>     <span class=err>│</span> <span class=k>signal</span> <span class=err>──┼──┘</span>                    <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>stack</span> <span class=err>───┼──┼───→</span> <span class=err>内核栈</span> <span class=n>A</span>        <span class=err>│</span> <span class=n>stack</span> <span class=err>───┼───→</span> <span class=err>内核栈</span> <span class=n>B</span> <span class=p>(</span><span class=err>独立</span><span class=p>)</span>   <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>pid</span><span class=o>=</span><span class=mi>100</span>  <span class=err>│</span>  <span class=err>└───→</span> <span class=err>共享区域</span>        <span class=err>│</span> <span class=n>pid</span><span class=o>=</span><span class=mi>101</span>  <span class=err>│</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>│</span> <span class=n>tgid</span><span class=o>=</span><span class=mi>100</span> <span class=err>│</span>                        <span class=err>│</span> <span class=n>tgid</span><span class=o>=</span><span class=mi>100</span> <span class=err>│</span>  <span class=err>←</span> <span class=n>tgid</span> <span class=err>相同</span>         <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>└──────────┘</span>                        <span class=err>└──────────┘</span>                       <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>│</span>  <span class=err>资源共享（指针指向同一对象），仅内核栈和调度实体独立</span>                        <span class=err>│</span>
+</span></span><span class=line><span class=cl><span class=err>└─────────────────────────────────────────────────────────────────────────┘</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=附录相关内核参数速查>附录：相关内核参数速查</h2><div class=table-wrapper><table><thead><tr><th>参数</th><th>路径/命令</th><th>说明</th></tr></thead><tbody><tr><td>系统全局线程上限</td><td><code>/proc/sys/kernel/threads-max</code></td><td>对应 <code>max_threads</code></td></tr><tr><td>PID 上限</td><td><code>/proc/sys/kernel/pid_max</code></td><td>默认 32768，64 位可调到 4M</td></tr><tr><td>per-user 进程上限</td><td><code>ulimit -u</code> / <code>RLIMIT_NPROC</code></td><td>默认 <code>max_threads/2</code></td></tr><tr><td>当前线程总数</td><td>第一列 <code>/proc/loadavg</code> 的分母</td><td>对应 <code>nr_threads</code></td></tr><tr><td>某进程线程数</td><td><code>/proc/&lt;pid>/status</code> 中 <code>Threads:</code></td><td></td></tr><tr><td>内核栈大小</td><td>固定 16KB (x86-64)</td><td><code>THREAD_SIZE = PAGE_SIZE &lt;&lt; 2</code></td></tr><tr><td>用户栈默认大小</td><td><code>ulimit -s</code></td><td>默认 8MB</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/%E8%BF%9B%E7%A8%8B/>进程</a>
+<a href=/tags/%E7%BA%BF%E7%A8%8B/>线程</a>
+<a href=/tags/task_struct/>Task_struct</a>
+<a href=/tags/clone/>Clone</a>
+<a href=/tags/clone_vm/>CLONE_VM</a>
+<a href=/tags/clone_thread/>CLONE_THREAD</a>
+<a href=/tags/copy_process/>Copy_process</a>
+<a href=/tags/%E7%BA%BF%E7%A8%8B%E6%95%B0%E9%99%90%E5%88%B6/>线程数限制</a>
+<a href=/tags/copy_thread/>Copy_thread</a>
+<a href=/tags/%E7%BA%BF%E7%A8%8B%E6%A0%88/>线程栈</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/linux-%E8%BF%9B%E7%A8%8B/%E7%BA%BF%E7%A8%8B%E5%88%9B%E5%BB%BA%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 进程/线程创建源码分析</h2></div></a></article><article><a href=/p/%E8%BF%9B%E7%A8%8B%E5%86%85%E6%A0%B8%E7%BB%93%E6%9E%84%E5%85%B3%E7%B3%BB-task_struct-%E5%8F%8A%E5%85%B6%E5%85%B3%E8%81%94%E5%AD%90%E7%B3%BB%E7%BB%9F/><div class=article-details><h2 class=article-title>进程内核结构关系 — task_struct 及其关联子系统</h2></div></a></article><article><a href=/p/%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8%E6%9C%BA%E5%88%B6/><div class=article-details><h2 class=article-title>系统调用机制</h2></div></a></article><article><a href=/p/cpu-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E4%B8%8E%E5%86%85%E6%A0%B8%E6%A0%88%E8%BF%9B%E7%A8%8B%E6%98%AF%E6%80%8E%E4%B9%88%E8%A2%AB-cpu-%E6%89%A7%E8%A1%8C%E7%9A%84/><div class=article-details><h2 class=article-title>CPU 上下文切换与内核栈——进程是怎么被 CPU 执行的</h2></div></a></article><article><a href=/p/linux-%E8%B0%83%E5%BA%A6%E5%99%A8%E6%89%A7%E8%A1%8C%E6%97%B6%E6%9C%BA%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 调度器执行时机深度分析</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

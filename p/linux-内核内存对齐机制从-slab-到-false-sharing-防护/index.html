@@ -1,0 +1,452 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='Linux 内核内存对齐机制 基于 Linux 5.15.78 内核源码分析\n前置阅读：内存管理完全指南 — slab 分配器基础；CPU 页表与缓存机制 — cache line、MESI 协议\n目录 一、对齐的三个维度 二、宏定义体系 三、Slab/SLUB 分配器中的对齐处理 四、DMA 对齐：不是性能问题，是正确性问题 五、原子操作的硬件对齐要求 六、False Sharing 防护实战 七、对齐的空间代价与权衡设计 八、设计思考 九、源码位置速查表 一、对齐的三个维度 内核中的对齐不仅仅是"让访问快一点"，它服务于三个完全不同的目标：\n维度 核心诉求 不满足的后果 正确性 DMA buffer 满足 cache line 边界；原子指令满足操作数对齐 数据损坏、CPU 异常 性能 热数据独占 cache line；消除 false sharing 多核场景性能下降 10x 可移植性 满足架构最小对齐约束（如 ARM 不支持未对齐访问） 运行时 fault 澄清：不对齐导致的是"多访问一条 cache line"，不是 cache 失效 一个常见误解是"字节不对齐会导致 cache 失效"。错。 Cache 失效（Invalidate）只由 MESI 协议的一致性消息、容量驱逐、或软件显式刷新触发，与对齐无关。\n'><title>Linux 内核内存对齐机制——从 Slab 到 False Sharing 防护</title><link rel=canonical href=https://1bit2.github.io/p/linux-%E5%86%85%E6%A0%B8%E5%86%85%E5%AD%98%E5%AF%B9%E9%BD%90%E6%9C%BA%E5%88%B6%E4%BB%8E-slab-%E5%88%B0-false-sharing-%E9%98%B2%E6%8A%A4/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Linux 内核内存对齐机制——从 Slab 到 False Sharing 防护"><meta property='og:description' content='Linux 内核内存对齐机制 基于 Linux 5.15.78 内核源码分析\n前置阅读：内存管理完全指南 — slab 分配器基础；CPU 页表与缓存机制 — cache line、MESI 协议\n目录 一、对齐的三个维度 二、宏定义体系 三、Slab/SLUB 分配器中的对齐处理 四、DMA 对齐：不是性能问题，是正确性问题 五、原子操作的硬件对齐要求 六、False Sharing 防护实战 七、对齐的空间代价与权衡设计 八、设计思考 九、源码位置速查表 一、对齐的三个维度 内核中的对齐不仅仅是"让访问快一点"，它服务于三个完全不同的目标：\n维度 核心诉求 不满足的后果 正确性 DMA buffer 满足 cache line 边界；原子指令满足操作数对齐 数据损坏、CPU 异常 性能 热数据独占 cache line；消除 false sharing 多核场景性能下降 10x 可移植性 满足架构最小对齐约束（如 ARM 不支持未对齐访问） 运行时 fault 澄清：不对齐导致的是"多访问一条 cache line"，不是 cache 失效 一个常见误解是"字节不对齐会导致 cache 失效"。错。 Cache 失效（Invalidate）只由 MESI 协议的一致性消息、容量驱逐、或软件显式刷新触发，与对齐无关。\n'><meta property='og:url' content='https://1bit2.github.io/p/linux-%E5%86%85%E6%A0%B8%E5%86%85%E5%AD%98%E5%AF%B9%E9%BD%90%E6%9C%BA%E5%88%B6%E4%BB%8E-slab-%E5%88%B0-false-sharing-%E9%98%B2%E6%8A%A4/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='对齐'><meta property='article:tag' content='alignment'><meta property='article:tag' content='cache line'><meta property='article:tag' content='false sharing'><meta property='article:tag' content='slab'><meta property='article:tag' content='SLUB'><meta property='article:tag' content='DMA'><meta property='article:tag' content='ARCH_KMALLOC_MINALIGN'><meta property='article:tag' content='SLAB_HWCACHE_ALIGN'><meta property='article:tag' content='cmpxchg'><meta property='article:published_time' content='2026-05-29T00:00:00+00:00'><meta property='article:modified_time' content='2026-05-29T00:00:00+00:00'><meta name=twitter:title content="Linux 内核内存对齐机制——从 Slab 到 False Sharing 防护"><meta name=twitter:description content='Linux 内核内存对齐机制 基于 Linux 5.15.78 内核源码分析\n前置阅读：内存管理完全指南 — slab 分配器基础；CPU 页表与缓存机制 — cache line、MESI 协议\n目录 一、对齐的三个维度 二、宏定义体系 三、Slab/SLUB 分配器中的对齐处理 四、DMA 对齐：不是性能问题，是正确性问题 五、原子操作的硬件对齐要求 六、False Sharing 防护实战 七、对齐的空间代价与权衡设计 八、设计思考 九、源码位置速查表 一、对齐的三个维度 内核中的对齐不仅仅是"让访问快一点"，它服务于三个完全不同的目标：\n维度 核心诉求 不满足的后果 正确性 DMA buffer 满足 cache line 边界；原子指令满足操作数对齐 数据损坏、CPU 异常 性能 热数据独占 cache line；消除 false sharing 多核场景性能下降 10x 可移植性 满足架构最小对齐约束（如 ARM 不支持未对齐访问） 运行时 fault 澄清：不对齐导致的是"多访问一条 cache line"，不是 cache 失效 一个常见误解是"字节不对齐会导致 cache 失效"。错。 Cache 失效（Invalidate）只由 MESI 协议的一致性消息、容量驱逐、或软件显式刷新触发，与对齐无关。\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#目录>目录</a></li><li><a href=#一对齐的三个维度>一、对齐的三个维度</a><ol><li><a href=#澄清不对齐导致的是多访问一条-cache-line不是-cache-失效>澄清：不对齐导致的是"多访问一条 cache line"，不是 cache 失效</a></li></ol></li><li><a href=#二宏定义体系>二、宏定义体系</a><ol><li><a href=#21-cache-line-对齐宏>2.1 Cache Line 对齐宏</a></li><li><a href=#22-架构-cache-line-大小>2.2 架构 Cache Line 大小</a></li><li><a href=#23-slab-最小对齐保证>2.3 Slab 最小对齐保证</a></li></ol></li><li><a href=#三slabslub-分配器中的对齐处理>三、Slab/SLUB 分配器中的对齐处理</a><ol><li><a href=#31-calculate_alignment对齐计算核心逻辑>3.1 calculate_alignment()：对齐计算核心逻辑</a></li><li><a href=#32-slub-对象布局>3.2 SLUB 对象布局</a></li><li><a href=#33-kmem_cache-宏结构体对齐属性自动传递>3.3 KMEM_CACHE 宏：结构体对齐属性自动传递</a></li><li><a href=#34-kmalloc-cache2-的幂自然对齐>3.4 kmalloc cache：2 的幂自然对齐</a></li><li><a href=#35-cache-合并时的对齐兼容检查>3.5 Cache 合并时的对齐兼容检查</a></li></ol></li><li><a href=#四dma-对齐不是性能问题是正确性问题>四、DMA 对齐：不是性能问题，是正确性问题</a><ol><li><a href=#问题本质>问题本质</a></li><li><a href=#arm64-的处理>ARM64 的处理</a></li><li><a href=#usb-子系统的依赖>USB 子系统的依赖</a></li></ol></li><li><a href=#五原子操作的硬件对齐要求>五、原子操作的硬件对齐要求</a><ol><li><a href=#struct-page-的-16-字节对齐>struct page 的 16 字节对齐</a></li><li><a href=#per-cpu-slab-数据的双字对齐>per-CPU slab 数据的双字对齐</a></li></ol></li><li><a href=#六false-sharing-防护实战>六、False Sharing 防护实战</a><ol><li><a href=#为什么有了自然对齐还需要手动写对齐>为什么有了自然对齐还需要手动写对齐？</a></li><li><a href=#对齐在-false-sharing-语境下的含义>&ldquo;对齐"在 false sharing 语境下的含义</a></li><li><a href=#mesi-状态转换false-sharing-的微观过程>MESI 状态转换：false sharing 的微观过程</a></li><li><a href=#案例1xdp-环形队列spsc-的经典设计>案例1：XDP 环形队列——SPSC 的经典设计</a></li><li><a href=#案例2tcp-time_wait-计数器手动-padding>案例2：TCP TIME_WAIT 计数器——手动 padding</a></li><li><a href=#案例3bpf-map-引用计数隔离高频写>案例3：BPF map 引用计数——隔离高频写</a></li><li><a href=#案例4htb-流控读写分区布局>案例4：HTB 流控——读写分区布局</a></li><li><a href=#案例5网络哈希表锁扩展锁数量覆盖-cache-line>案例5：网络哈希表锁——扩展锁数量覆盖 cache line</a></li></ol></li><li><a href=#七对齐的空间代价与权衡设计>七、对齐的空间代价与权衡设计</a><ol><li><a href=#1-小对象减半对齐>1. 小对象减半对齐</a></li><li><a href=#2-up-下消除-smp-padding>2. UP 下消除 SMP padding</a></li><li><a href=#3-slub-元数据自身-cache-line-对齐>3. SLUB 元数据自身 cache line 对齐</a></li><li><a href=#4-合并策略>4. 合并策略</a></li></ol></li><li><a href=#八设计思考>八、设计思考</a><ol><li><a href=#1-为什么-arm64-的-arch_dma_minalign-是-128-而不是-64>1. 为什么 ARM64 的 ARCH_DMA_MINALIGN 是 128 而不是 64？</a></li><li><a href=#2-为什么-x86-不需要那么大的-dma-对齐>2. 为什么 x86 不需要那么大的 DMA 对齐？</a></li><li><a href=#3-对齐的三层递进>3. 对齐的三层递进</a></li><li><a href=#4-何时该用对齐>4. 何时该用对齐</a></li></ol></li><li><a href=#九源码位置速查表>九、源码位置速查表</a></li><li><a href=#参考文件>参考文件</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E5%86%85%E5%AD%98/ style=background-color:#4285f4;color:#fff>内存</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/linux-%E5%86%85%E6%A0%B8%E5%86%85%E5%AD%98%E5%AF%B9%E9%BD%90%E6%9C%BA%E5%88%B6%E4%BB%8E-slab-%E5%88%B0-false-sharing-%E9%98%B2%E6%8A%A4/>Linux 内核内存对齐机制——从 Slab 到 False Sharing 防护</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>May 29, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>9 minute read</time></div></footer></div></header><section class=article-content><h1 id=linux-内核内存对齐机制>Linux 内核内存对齐机制</h1><blockquote><p>基于 Linux 5.15.78 内核源码分析</p><p>前置阅读：<a class=link href=%e5%86%85%e5%ad%98%e7%ae%a1%e7%90%86%e5%ae%8c%e5%85%a8%e6%8c%87%e5%8d%97.md>内存管理完全指南</a> — slab 分配器基础；<a class=link href=CPU%e9%a1%b5%e8%a1%a8%e4%b8%8e%e7%bc%93%e5%ad%98%e6%9c%ba%e5%88%b6.md>CPU 页表与缓存机制</a> — cache line、MESI 协议</p></blockquote><hr><h2 id=目录>目录</h2><ul><li><a class=link href=#%e4%b8%80%e5%af%b9%e9%bd%90%e7%9a%84%e4%b8%89%e4%b8%aa%e7%bb%b4%e5%ba%a6>一、对齐的三个维度</a></li><li><a class=link href=#%e4%ba%8c%e5%ae%8f%e5%ae%9a%e4%b9%89%e4%bd%93%e7%b3%bb>二、宏定义体系</a></li><li><a class=link href=#%e4%b8%89slabslub-%e5%88%86%e9%85%8d%e5%99%a8%e4%b8%ad%e7%9a%84%e5%af%b9%e9%bd%90%e5%a4%84%e7%90%86>三、Slab/SLUB 分配器中的对齐处理</a></li><li><a class=link href=#%e5%9b%9bdma-%e5%af%b9%e9%bd%90%e4%b8%8d%e6%98%af%e6%80%a7%e8%83%bd%e9%97%ae%e9%a2%98%e6%98%af%e6%ad%a3%e7%a1%ae%e6%80%a7%e9%97%ae%e9%a2%98>四、DMA 对齐：不是性能问题，是正确性问题</a></li><li><a class=link href=#%e4%ba%94%e5%8e%9f%e5%ad%90%e6%93%8d%e4%bd%9c%e7%9a%84%e7%a1%ac%e4%bb%b6%e5%af%b9%e9%bd%90%e8%a6%81%e6%b1%82>五、原子操作的硬件对齐要求</a></li><li><a class=link href=#%e5%85%adfalse-sharing-%e9%98%b2%e6%8a%a4%e5%ae%9e%e6%88%98>六、False Sharing 防护实战</a></li><li><a class=link href=#%e4%b8%83%e5%af%b9%e9%bd%90%e7%9a%84%e7%a9%ba%e9%97%b4%e4%bb%a3%e4%bb%b7%e4%b8%8e%e6%9d%83%e8%a1%a1%e8%ae%be%e8%ae%a1>七、对齐的空间代价与权衡设计</a></li><li><a class=link href=#%e5%85%ab%e8%ae%be%e8%ae%a1%e6%80%9d%e8%80%83>八、设计思考</a></li><li><a class=link href=#%e4%b9%9d%e6%ba%90%e7%a0%81%e4%bd%8d%e7%bd%ae%e9%80%9f%e6%9f%a5%e8%a1%a8>九、源码位置速查表</a></li></ul><hr><h2 id=一对齐的三个维度>一、对齐的三个维度</h2><p>内核中的对齐不仅仅是"让访问快一点"，它服务于三个完全不同的目标：</p><div class=table-wrapper><table><thead><tr><th>维度</th><th>核心诉求</th><th>不满足的后果</th></tr></thead><tbody><tr><td><strong>正确性</strong></td><td>DMA buffer 满足 cache line 边界；原子指令满足操作数对齐</td><td>数据损坏、CPU 异常</td></tr><tr><td><strong>性能</strong></td><td>热数据独占 cache line；消除 false sharing</td><td>多核场景性能下降 10x</td></tr><tr><td><strong>可移植性</strong></td><td>满足架构最小对齐约束（如 ARM 不支持未对齐访问）</td><td>运行时 fault</td></tr></tbody></table></div><h3 id=澄清不对齐导致的是多访问一条-cache-line不是-cache-失效>澄清：不对齐导致的是"多访问一条 cache line"，不是 cache 失效</h3><p>一个常见误解是"字节不对齐会导致 cache 失效"。<strong>错。</strong> Cache 失效（Invalidate）只由 MESI 协议的一致性消息、容量驱逐、或软件显式刷新触发，与对齐无关。</p><p>不对齐的真正代价是<strong>跨 cache line 访问</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>对齐访问（8 字节 long 在地址 0x40）：
+</span></span><span class=line><span class=cl>┌──────────────── Cache Line 1 (0x40~0x7F) ────────────────┐
+</span></span><span class=line><span class=cl>│  ... │ [long 在这，完整落在一条 line 内] │ ...             │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  → 一次 cache line 访问
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>不对齐访问（8 字节 long 在地址 0x3C，跨越 0x3F/0x40 边界）：
+</span></span><span class=line><span class=cl>┌────── Cache Line 0 (0x00~0x3F) ──────┐┌────── Cache Line 1 (0x40~0x7F) ───────┐
+</span></span><span class=line><span class=cl>│                       │ [前4字节]      ││ [后4字节] │                            │
+</span></span><span class=line><span class=cl>└────────────────────────────────────────┘└───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  → 两次 cache line 访问 + CPU 内部拼接
+</span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>场景</th><th>代价</th></tr></thead><tbody><tr><td>跨 line 访问（x86）</td><td>延迟翻倍（如果第二条 line miss 则更糟）；占用两个 cache line 空间</td></tr><tr><td>跨 line 访问（ARM/MIPS）</td><td>部分架构直接触发对齐异常，由软件模拟（极慢）或 fault</td></tr></tbody></table></div><p>Cache 失效（Invalidate）的真正触发条件：</p><div class=table-wrapper><table><thead><tr><th>触发条件</th><th>机制</th></tr></thead><tbody><tr><td>其他核写了同一物理地址</td><td>MESI: Shared → 收到 Invalidate → Invalid</td></tr><tr><td>容量/冲突驱逐</td><td>LRU 淘汰旧 line</td></tr><tr><td>软件显式刷新</td><td><code>clflush</code>/<code>wbinvd</code>/<code>invd</code> 指令</td></tr><tr><td>DMA 一致性操作</td><td><code>dma_sync_for_cpu</code> 等</td></tr></tbody></table></div><hr><h2 id=二宏定义体系>二、宏定义体系</h2><h3 id=21-cache-line-对齐宏>2.1 Cache Line 对齐宏</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/cache.h:40
+</span></span></span><span class=line><span class=cl><span class=cp>#define ____cacheline_aligned __attribute__((__aligned__(SMP_CACHE_BYTES)))
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_SMP
+</span></span></span><span class=line><span class=cl><span class=cp>#define ____cacheline_aligned_in_smp ____cacheline_aligned
+</span></span></span><span class=line><span class=cl><span class=cp>#else
+</span></span></span><span class=line><span class=cl><span class=cp>#define ____cacheline_aligned_in_smp   </span><span class=c1>// UP 下为空，不浪费空间
+</span></span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#define __cacheline_aligned \
+</span></span></span><span class=line><span class=cl><span class=cp>  __attribute__((__aligned__(SMP_CACHE_BYTES), \
+</span></span></span><span class=line><span class=cl><span class=cp>                 __section__(&#34;.data..cacheline_aligned&#34;)))
+</span></span></span></code></pre></td></tr></table></div></div><p>设计细节：</p><ul><li><code>____cacheline_aligned_in_smp</code>：SMP 内核下按 cache line 对齐，单处理器内核下为空（因为没有 false sharing 问题）</li><li><code>__cacheline_aligned</code>：额外放入专用段 <code>.data..cacheline_aligned</code>，便于链接器统一布局</li></ul><h3 id=22-架构-cache-line-大小>2.2 架构 Cache Line 大小</h3><p><strong>ARM64</strong>：L1 = 64B，DMA 最小对齐 = 128B</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/arm64/include/asm/cache.h:31
+</span></span></span><span class=line><span class=cl><span class=cp>#define L1_CACHE_SHIFT      (6)
+</span></span></span><span class=line><span class=cl><span class=cp>#define L1_CACHE_BYTES      (1 &lt;&lt; L1_CACHE_SHIFT)   </span><span class=c1>// 64
+</span></span></span><span class=line><span class=cl><span class=cp>#define ARCH_DMA_MINALIGN   (128)
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>x86</strong>：L1 大小由 Kconfig 决定</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/x86/include/asm/cache.h:7
+</span></span></span><span class=line><span class=cl><span class=cp>#define L1_CACHE_SHIFT  (CONFIG_X86_L1_CACHE_SHIFT)
+</span></span></span><span class=line><span class=cl><span class=cp>#define L1_CACHE_BYTES  (1 &lt;&lt; L1_CACHE_SHIFT)
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=23-slab-最小对齐保证>2.3 Slab 最小对齐保证</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/slab.h:202
+</span></span></span><span class=line><span class=cl><span class=cp>#if defined(ARCH_DMA_MINALIGN) &amp;&amp; ARCH_DMA_MINALIGN &gt; 8
+</span></span></span><span class=line><span class=cl><span class=cp>#define ARCH_KMALLOC_MINALIGN ARCH_DMA_MINALIGN      </span><span class=c1>// ARM64: 128
+</span></span></span><span class=line><span class=cl><span class=cp>#define KMALLOC_MIN_SIZE ARCH_DMA_MINALIGN
+</span></span></span><span class=line><span class=cl><span class=cp>#else
+</span></span></span><span class=line><span class=cl><span class=cp>#define ARCH_KMALLOC_MINALIGN __alignof__(unsigned long long)  </span><span class=c1>// x86: 8
+</span></span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=cp>#ifndef ARCH_SLAB_MINALIGN
+</span></span></span><span class=line><span class=cl><span class=cp>#define ARCH_SLAB_MINALIGN __alignof__(unsigned long long)     </span><span class=c1>// 8
+</span></span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span></code></pre></td></tr></table></div></div><p>API 保证：</p><ul><li><code>kmalloc()</code> 返回至少 <code>ARCH_KMALLOC_MINALIGN</code> 对齐的指针</li><li>2 的幂大小额外保证<strong>自然对齐</strong>（size 本身即为对齐边界）</li></ul><hr><h2 id=三slabslub-分配器中的对齐处理>三、Slab/SLUB 分配器中的对齐处理</h2><h3 id=31-calculate_alignment对齐计算核心逻辑>3.1 calculate_alignment()：对齐计算核心逻辑</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/slab_common.c:146
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>unsigned</span> <span class=kt>int</span> <span class=nf>calculate_alignment</span><span class=p>(</span><span class=kt>slab_flags_t</span> <span class=n>flags</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>align</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>size</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=n>SLAB_HWCACHE_ALIGN</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>ralign</span> <span class=o>=</span> <span class=nf>cache_line_size</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 小对象减半对齐：16B 对象不需要占满整条 64B cache line
+</span></span></span><span class=line><span class=cl>        <span class=k>while</span> <span class=p>(</span><span class=n>size</span> <span class=o>&lt;=</span> <span class=n>ralign</span> <span class=o>/</span> <span class=mi>2</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=n>ralign</span> <span class=o>/=</span> <span class=mi>2</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>align</span> <span class=o>=</span> <span class=nf>max</span><span class=p>(</span><span class=n>align</span><span class=p>,</span> <span class=n>ralign</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>align</span> <span class=o>&lt;</span> <span class=n>ARCH_SLAB_MINALIGN</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>align</span> <span class=o>=</span> <span class=n>ARCH_SLAB_MINALIGN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>ALIGN</span><span class=p>(</span><span class=n>align</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=kt>void</span> <span class=o>*</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>规则链：</p><ol><li>用户传入 <code>align</code> 为下限</li><li><code>SLAB_HWCACHE_ALIGN</code> 提升到 cache line 大小（小对象减半）</li><li>不低于 <code>ARCH_SLAB_MINALIGN</code></li><li>最终对齐到指针大小</li></ol><h3 id=32-slub-对象布局>3.2 SLUB 对象布局</h3><p>SLUB 通过将对象 stride 对齐到 <code>s->align</code> 来保证每个对象满足对齐要求：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/slub.c:4101
+</span></span></span><span class=line><span class=cl><span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm> * SLUB stores one object immediately after another beginning from
+</span></span></span><span class=line><span class=cl><span class=cm> * offset 0. In order to align the objects we have to simply size
+</span></span></span><span class=line><span class=cl><span class=cm> * each object to conform to the alignment.
+</span></span></span><span class=line><span class=cl><span class=cm> */</span>
+</span></span><span class=line><span class=cl><span class=n>size</span> <span class=o>=</span> <span class=nf>ALIGN</span><span class=p>(</span><span class=n>size</span><span class=p>,</span> <span class=n>s</span><span class=o>-&gt;</span><span class=n>align</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=n>s</span><span class=o>-&gt;</span><span class=n>size</span> <span class=o>=</span> <span class=n>size</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>对象连续排列，stride 是 <code>align</code> 的倍数 → 每个对象地址自动满足对齐。</p><h3 id=33-kmem_cache-宏结构体对齐属性自动传递>3.3 KMEM_CACHE 宏：结构体对齐属性自动传递</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/slab.h:158
+</span></span></span><span class=line><span class=cl><span class=cp>#define KMEM_CACHE(__struct, __flags) \
+</span></span></span><span class=line><span class=cl><span class=cp>    kmem_cache_create(#__struct, sizeof(struct __struct), \
+</span></span></span><span class=line><span class=cl><span class=cp>        __alignof__(struct __struct), (__flags), NULL)
+</span></span></span></code></pre></td></tr></table></div></div><p>结构体定义中使用 <code>____cacheline_aligned_in_smp</code> → <code>__alignof__</code> 反映 cache line 对齐 → <code>kmem_cache_create</code> 的 <code>align</code> 参数自动满足。</p><h3 id=34-kmalloc-cache2-的幂自然对齐>3.4 kmalloc cache：2 的幂自然对齐</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/slab_common.c:655
+</span></span></span><span class=line><span class=cl><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>align</span> <span class=o>=</span> <span class=n>ARCH_KMALLOC_MINALIGN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>is_power_of_2</span><span class=p>(</span><span class=n>size</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>    <span class=n>align</span> <span class=o>=</span> <span class=nf>max</span><span class=p>(</span><span class=n>align</span><span class=p>,</span> <span class=n>size</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=n>s</span><span class=o>-&gt;</span><span class=n>align</span> <span class=o>=</span> <span class=nf>calculate_alignment</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=n>align</span><span class=p>,</span> <span class=n>size</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>kmalloc-64</code> 返回 64 字节对齐的地址，<code>kmalloc-128</code> 返回 128 字节对齐——这是 DMA 安全使用 <code>kmalloc</code> 缓冲区的基础。</p><h3 id=35-cache-合并时的对齐兼容检查>3.5 Cache 合并时的对齐兼容检查</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/slab_common.c:222
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>((</span><span class=n>s</span><span class=o>-&gt;</span><span class=n>size</span> <span class=o>&amp;</span> <span class=o>~</span><span class=p>(</span><span class=n>align</span> <span class=o>-</span> <span class=mi>1</span><span class=p>))</span> <span class=o>!=</span> <span class=n>s</span><span class=o>-&gt;</span><span class=n>size</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=k>continue</span><span class=p>;</span>  <span class=c1>// stride 不是新对齐的倍数 → 不允许合并
+</span></span></span></code></pre></td></tr></table></div></div><hr><h2 id=四dma-对齐不是性能问题是正确性问题>四、DMA 对齐：不是性能问题，是正确性问题</h2><h3 id=问题本质>问题本质</h3><p>设备 DMA 直接写物理内存，不经过 CPU cache。如果 DMA buffer 与其他数据共享一条 cache line：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>Cache Line [64 bytes]
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────┬──────────────────┐
+</span></span><span class=line><span class=cl>│  DMA buffer (设备正在写入)            │  其他变量 X      │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────┴──────────────────┘
+</span></span><span class=line><span class=cl>                                              ↑
+</span></span><span class=line><span class=cl>                                     CPU 读 X，把整条 line 拉入 cache
+</span></span><span class=line><span class=cl>                                     设备写完 DMA buffer
+</span></span><span class=line><span class=cl>                                     CPU 写回 cache line → 覆盖 DMA 数据！
+</span></span></code></pre></td></tr></table></div></div><h3 id=arm64-的处理>ARM64 的处理</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/arm64/include/asm/cache.h:43
+</span></span></span><span class=line><span class=cl><span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm> * Memory returned by kmalloc() may be used for DMA, so we must make
+</span></span></span><span class=line><span class=cl><span class=cm> * sure that all such allocations are cache aligned. Otherwise,
+</span></span></span><span class=line><span class=cl><span class=cm> * unrelated code may cause parts of the buffer to be read into the
+</span></span></span><span class=line><span class=cl><span class=cm> * cache before the transfer is done, causing old data to be seen by
+</span></span></span><span class=line><span class=cl><span class=cm> * the CPU.
+</span></span></span><span class=line><span class=cl><span class=cm> */</span>
+</span></span><span class=line><span class=cl><span class=cp>#define ARCH_DMA_MINALIGN   (128)
+</span></span></span></code></pre></td></tr></table></div></div><p>ARM64 的 CTR_EL0.CWG（Cache Writeback Granule）可能为 128 字节，因此 <code>ARCH_DMA_MINALIGN</code> = 128。启动时校验：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// arch/arm64/mm/dma-mapping.c:43
+</span></span></span><span class=line><span class=cl><span class=nf>WARN_TAINT</span><span class=p>(</span><span class=o>!</span><span class=n>coherent</span> <span class=o>&amp;&amp;</span> <span class=n>cls</span> <span class=o>&gt;</span> <span class=n>ARCH_DMA_MINALIGN</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=n>TAINT_CPU_OUT_OF_SPEC</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=s>&#34;ARCH_DMA_MINALIGN smaller than CTR_EL0.CWG (%d &lt; %d)&#34;</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=usb-子系统的依赖>USB 子系统的依赖</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// drivers/usb/core/buffer.c:35
+</span></span></span><span class=line><span class=cl><span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm> * The pool_max values must never be smaller than ARCH_KMALLOC_MINALIGN.
+</span></span></span><span class=line><span class=cl><span class=cm> */</span>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>ARCH_KMALLOC_MINALIGN</span> <span class=o>&lt;=</span> <span class=mi>32</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=k>else</span> <span class=nf>if</span> <span class=p>(</span><span class=n>ARCH_KMALLOC_MINALIGN</span> <span class=o>&lt;=</span> <span class=mi>64</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>pool_max</span><span class=p>[</span><span class=mi>0</span><span class=p>]</span> <span class=o>=</span> <span class=mi>64</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=k>else</span> <span class=nf>if</span> <span class=p>(</span><span class=n>ARCH_KMALLOC_MINALIGN</span> <span class=o>&lt;=</span> <span class=mi>128</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>pool_max</span><span class=p>[</span><span class=mi>0</span><span class=p>]</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// ARM64: 最小 pool 已经 &gt;= 128，不需要小 pool
+</span></span></span></code></pre></td></tr></table></div></div><hr><h2 id=五原子操作的硬件对齐要求>五、原子操作的硬件对齐要求</h2><h3 id=struct-page-的-16-字节对齐>struct page 的 16 字节对齐</h3><p>SLUB 快速路径使用双字 cmpxchg 原子更新 <code>freelist</code> + <code>counters</code>，x86 的 <code>CMPXCHG16B</code> 要求操作数 16 字节对齐：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/mm_types.h:67
+</span></span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_HAVE_ALIGNED_STRUCT_PAGE
+</span></span></span><span class=line><span class=cl><span class=cp>#define _struct_page_alignment  __aligned(2 * sizeof(unsigned long))
+</span></span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span></code></pre></td></tr></table></div></div><p>使用处：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/slub.c:463
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=nf>cmpxchg_double</span><span class=p>(</span><span class=o>&amp;</span><span class=n>page</span><span class=o>-&gt;</span><span class=n>freelist</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>page</span><span class=o>-&gt;</span><span class=n>counters</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                   <span class=n>freelist_old</span><span class=p>,</span> <span class=n>counters_old</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                   <span class=n>freelist_new</span><span class=p>,</span> <span class=n>counters_new</span><span class=p>))</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=per-cpu-slab-数据的双字对齐>per-CPU slab 数据的双字对齐</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/slub.c:3854
+</span></span></span><span class=line><span class=cl><span class=cm>/*
+</span></span></span><span class=line><span class=cl><span class=cm> * Must align to double word boundary for the double cmpxchg
+</span></span></span><span class=line><span class=cl><span class=cm> * instructions to work; see __pcpu_double_call_return_bool().
+</span></span></span><span class=line><span class=cl><span class=cm> */</span>
+</span></span><span class=line><span class=cl><span class=n>s</span><span class=o>-&gt;</span><span class=n>cpu_slab</span> <span class=o>=</span> <span class=nf>__alloc_percpu</span><span class=p>(</span><span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>kmem_cache_cpu</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>                             <span class=mi>2</span> <span class=o>*</span> <span class=k>sizeof</span><span class=p>(</span><span class=kt>void</span> <span class=o>*</span><span class=p>));</span>
+</span></span></code></pre></td></tr></table></div></div><p>不满足对齐 → x86 上触发 #GP（General Protection fault），ARM 上结果不确定。</p><hr><h2 id=六false-sharing-防护实战>六、False Sharing 防护实战</h2><blockquote><p><strong>视角分工</strong>：本节只讲<strong>内核侧</strong>的 false sharing 防护实例（XDP 环形队列、TCP TIME_WAIT 计数器、BPF map 引用计数、HTB 流控、网络哈希表锁）。</p><p>关于 MESI 状态机层面的原理、用户态矩阵遍历案例、<code>perf c2c</code> 定位方法等<strong>软件视角</strong>内容，详见 <a class=link href=CPU%e9%a1%b5%e8%a1%a8%e4%b8%8e%e7%bc%93%e5%ad%98%e6%9c%ba%e5%88%b6.md>CPU 页表与缓存机制 §19</a>。</p></blockquote><p>False sharing：不同 CPU 修改同一 cache line 内的不同变量，导致 cache line 在核间反复失效，实际独立的操作变成了串行。</p><h3 id=为什么有了自然对齐还需要手动写对齐>为什么有了自然对齐还需要手动写对齐？</h3><p>编译器的自然对齐（N 字节类型对齐到 N 的倍数）解决的是<strong>单个变量不跨 cache line</strong>；手动对齐解决的是<strong>不同核写的变量不在同一条 cache line</strong>。两者目标完全不同：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>自然对齐（编译器自动保证）:
+</span></span><span class=line><span class=cl>  ┌──────────── 64 字节 Cache Line ─────────────┐
+</span></span><span class=line><span class=cl>  │ [int_a] [int_b] [int_c] ... [int_d]         │
+</span></span><span class=line><span class=cl>  └──────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  Core 0 写 int_a → 整条 line Invalidate → Core 1 读 int_d 被波及
+</span></span><span class=line><span class=cl>  
+</span></span><span class=line><span class=cl>  ✓ 单个 int 不会跨 line（自然对齐的功劳）
+</span></span><span class=line><span class=cl>  ✗ 但多个变量挤在同一 line 内（false sharing）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>手动 cache line 对齐（程序员显式声明）:
+</span></span><span class=line><span class=cl>  ┌── Cache Line 0 ──┐  ┌── Cache Line 1 ──┐
+</span></span><span class=line><span class=cl>  │ int_a + 60B pad   │  │ int_d + 60B pad   │
+</span></span><span class=line><span class=cl>  └───────────────────┘  └───────────────────┘
+</span></span><span class=line><span class=cl>       Core 0 独占             Core 1 独占
+</span></span><span class=line><span class=cl>       
+</span></span><span class=line><span class=cl>  ✓ 各核的写操作互不触发 Invalidate
+</span></span></code></pre></td></tr></table></div></div><p>总结：</p><div class=table-wrapper><table><thead><tr><th></th><th>自然对齐（编译器自动）</th><th>手动 cache line 对齐</th></tr></thead><tbody><tr><td><strong>对齐到</strong></td><td><code>sizeof(type)</code> 字节（int→4, long→8）</td><td>64 字节（整条 cache line）</td></tr><tr><td><strong>保证</strong></td><td>一次访问不跨两条 line</td><td>不同核的写不在同一条 line</td></tr><tr><td><strong>代价</strong></td><td>极小（结构体内部 padding 几字节）</td><td>较大（每个字段浪费最多 60 字节）</td></tr><tr><td><strong>自动 vs 手动</strong></td><td>编译器自动完成</td><td>程序员显式声明 <code>____cacheline_aligned_in_smp</code></td></tr><tr><td><strong>解决的问题类别</strong></td><td>正确性+单核性能</td><td>多核并发性能</td></tr></tbody></table></div><p>关键洞察：4 字节的 <code>u32</code> 自然对齐到 4 的倍数——它永远不可能"跨" 64 字节边界（4 &lt; 64），但它完全可能和另一个高频写变量<strong>共处一条</strong> cache line。手动对齐解决的是后者。</p><h3 id=对齐在-false-sharing-语境下的含义>&ldquo;对齐"在 false sharing 语境下的含义</h3><p>内核中"对齐"用于两个不同目的，容易混淆：</p><div class=table-wrapper><table><thead><tr><th>目的</th><th>手段</th><th>解决的问题</th></tr></thead><tbody><tr><td><strong>自然对齐</strong></td><td>变量起始地址对齐到 <code>sizeof(type)</code> 边界</td><td>避免一次访问跨两条 cache line（多一次加载）</td></tr><tr><td><strong>独占对齐</strong></td><td>变量占满/对齐到整条 cache line（64B）</td><td>避免与其他核的写变量共享 line（MESI Invalidate）</td></tr></tbody></table></div><p><code>____cacheline_aligned_in_smp</code> 做的是<strong>后者</strong>——它不是怕变量"跨 line&rdquo;（4 字节 <code>u32</code> 不可能跨 64B 边界），而是要让这个变量<strong>独占</strong>一整条 line，使不同核的写操作落在不同 line 上。</p><h3 id=mesi-状态转换false-sharing-的微观过程>MESI 状态转换：false sharing 的微观过程</h3><p>假设 <code>producer</code> 和 <code>consumer</code> <strong>没有</strong>对齐（同在一条 cache line）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌────────────── 同一条 Cache Line ──────────────┐
+</span></span><span class=line><span class=cl>│  producer (Core 0 写)  │  consumer (Core 1 写) │
+</span></span><span class=line><span class=cl>└───────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>t1: Core 0 写 producer
+</span></span><span class=line><span class=cl>    → 该 line 在 Core 0 上变为 Modified (M)
+</span></span><span class=line><span class=cl>    → MESI 发 Invalidate 给 Core 1
+</span></span><span class=line><span class=cl>    → Core 1 的这条 line 变为 Invalid (I)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>t2: Core 1 要写 consumer
+</span></span><span class=line><span class=cl>    → 发现自己的 line 是 Invalid → 必须从 Core 0 取最新数据
+</span></span><span class=line><span class=cl>    → Core 0 写回（M→I），Core 1 获得 line（I→M）
+</span></span><span class=line><span class=cl>    → Core 1 写 consumer
+</span></span><span class=line><span class=cl>    → 发 Invalidate 给 Core 0 → Core 0 的 line 变 Invalid
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>t3: Core 0 要写 producer
+</span></span><span class=line><span class=cl>    → 又是 Invalid → 又要从 Core 1 拿回来...
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>→ 每次写操作都要等 30-100ns 的跨核传输（cache-to-cache transfer）
+</span></span><span class=line><span class=cl>→ 本来可以各自 1ns 完成的写，变成串行的 30-100ns
+</span></span></code></pre></td></tr></table></div></div><p>对齐后各自独占一条 line：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌──── Cache Line A ────┐  ┌──── Cache Line B ────┐
+</span></span><span class=line><span class=cl>│ producer + 60B pad    │  │ consumer + 60B pad    │
+</span></span><span class=line><span class=cl>└───────────────────────┘  └───────────────────────┘
+</span></span><span class=line><span class=cl>     Core 0: Modified            Core 1: Modified
+</span></span><span class=line><span class=cl>     
+</span></span><span class=line><span class=cl>互不干扰：Core 0 写 producer 不触发任何 Invalidate
+</span></span><span class=line><span class=cl>         Core 1 写 consumer 不触发任何 Invalidate
+</span></span></code></pre></td></tr></table></div></div><h3 id=案例1xdp-环形队列spsc-的经典设计>案例1：XDP 环形队列——SPSC 的经典设计</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/xdp/xsk_queue.h:16
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>xdp_ring</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>producer</span> <span class=n>____cacheline_aligned_in_smp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=cm>/* Hinder the adjacent cache prefetcher to prefetch the consumer
+</span></span></span><span class=line><span class=cl><span class=cm>     * pointer if the producer pointer is touched and vice versa. */</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>pad1</span> <span class=n>____cacheline_aligned_in_smp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>consumer</span> <span class=n>____cacheline_aligned_in_smp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>pad2</span> <span class=n>____cacheline_aligned_in_smp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>flags</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u32</span> <span class=n>pad3</span> <span class=n>____cacheline_aligned_in_smp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p>4 字节的 <code>producer</code> 独占 64 字节 cache line。为什么？</p><ul><li>内核写 producer，用户空间写 consumer</li><li>若共享 cache line：每次一端写入，另一端的 CPU cache 失效 → 重新加载</li><li>高频路径（数百万包/秒）下，false sharing 可导致吞吐量减半</li></ul><h3 id=案例2tcp-time_wait-计数器手动-padding>案例2：TCP TIME_WAIT 计数器——手动 padding</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/netns/ipv4.h
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>inet_timewait_death_row</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>atomic_t</span>        <span class=n>tw_count</span><span class=p>;</span>                              <span class=c1>// 高频原子操作
+</span></span></span><span class=line><span class=cl>    <span class=kt>char</span>            <span class=n>tw_pad</span><span class=p>[</span><span class=n>L1_CACHE_BYTES</span> <span class=o>-</span> <span class=k>sizeof</span><span class=p>(</span><span class=kt>atomic_t</span><span class=p>)];</span>  <span class=c1>// 填满 cache line
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_hashinfo</span>    <span class=o>*</span><span class=n>hashinfo</span><span class=p>;</span>                     <span class=c1>// 几乎只读
+</span></span></span><span class=line><span class=cl>    <span class=kt>int</span>             <span class=n>sysctl_max_tw_buckets</span><span class=p>;</span>                 <span class=c1>// 几乎只读
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>tw_count</code> 每次 TIME_WAIT 创建/销毁都要原子修改。如果和只读字段共享 cache line，所有读这些字段的 CPU 都会被无谓地 invalidate。</p><h3 id=案例3bpf-map-引用计数隔离高频写>案例3：BPF map 引用计数——隔离高频写</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/bpf.h:186
+</span></span></span><span class=line><span class=cl><span class=cm>/* The 3rd and 4th cacheline with misc members to avoid false sharing
+</span></span></span><span class=line><span class=cl><span class=cm> * particularly with refcounting. */</span>
+</span></span><span class=line><span class=cl><span class=kt>atomic64_t</span> <span class=n>refcnt</span> <span class=n>____cacheline_aligned</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=案例4htb-流控读写分区布局>案例4：HTB 流控——读写分区布局</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/sched/sch_htb.c:90
+</span></span></span><span class=line><span class=cl><span class=cm>/* interior &amp; leaf nodes; props specific to leaves are marked L:
+</span></span></span><span class=line><span class=cl><span class=cm> * To reduce false sharing, place mostly read fields at beginning,
+</span></span></span><span class=line><span class=cl><span class=cm> * and mostly written ones at the end. */</span>
+</span></span><span class=line><span class=cl><span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>drops</span> <span class=n>____cacheline_aligned_in_smp</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=案例5网络哈希表锁扩展锁数量覆盖-cache-line>案例5：网络哈希表锁——扩展锁数量覆盖 cache line</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_hashtables.c:1430
+</span></span></span><span class=line><span class=cl><span class=c1>// 锁数量至少填满 2 个 cache line，减少相邻 bucket 锁的 false sharing
+</span></span></span><span class=line><span class=cl><span class=n>nblocks</span> <span class=o>=</span> <span class=nf>max</span><span class=p>(</span><span class=mi>2U</span> <span class=o>*</span> <span class=n>L1_CACHE_BYTES</span> <span class=o>/</span> <span class=n>locksz</span><span class=p>,</span> <span class=mi>1U</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=n>nblocks</span> <span class=o>=</span> <span class=nf>roundup_pow_of_two</span><span class=p>(</span><span class=n>nblocks</span> <span class=o>*</span> <span class=nf>num_possible_cpus</span><span class=p>());</span>
+</span></span></code></pre></td></tr></table></div></div><p>不是对齐结构体，而是通过增加锁数量让相邻 hash bucket 的锁自然落在不同 cache line。</p><hr><h2 id=七对齐的空间代价与权衡设计>七、对齐的空间代价与权衡设计</h2><p>对齐是有代价的——padding 浪费空间。内核做了精细的权衡：</p><h3 id=1-小对象减半对齐>1. 小对象减半对齐</h3><p><code>calculate_alignment()</code> 中：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>while</span> <span class=p>(</span><span class=n>size</span> <span class=o>&lt;=</span> <span class=n>ralign</span> <span class=o>/</span> <span class=mi>2</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=n>ralign</span> <span class=o>/=</span> <span class=mi>2</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>16 字节对象不需要 64 字节对齐（浪费 75%），对齐到 16 字节即可——一条 cache line 放 4 个对象，命中率不差，空间利用率高。</p><h3 id=2-up-下消除-smp-padding>2. UP 下消除 SMP padding</h3><p><code>____cacheline_aligned_in_smp</code> 在单处理器内核下为空：没有多核就没有 false sharing，不需要浪费空间。</p><h3 id=3-slub-元数据自身-cache-line-对齐>3. SLUB 元数据自身 cache line 对齐</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// mm/slub.c:4796
+</span></span></span><span class=line><span class=cl><span class=nf>create_boot_cache</span><span class=p>(</span><span class=n>kmem_cache_node</span><span class=p>,</span> <span class=s>&#34;kmem_cache_node&#34;</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=k>sizeof</span><span class=p>(</span><span class=k>struct</span> <span class=n>kmem_cache_node</span><span class=p>),</span> <span class=n>SLAB_HWCACHE_ALIGN</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><p>分配器自己的管理结构也 cache line 对齐——这些结构在每次分配/释放时都要访问，是最热的路径。</p><h3 id=4-合并策略>4. 合并策略</h3><p>SLUB 尽量合并相似 cache 以减少碎片。合并条件之一是对齐兼容：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>if</span> <span class=p>((</span><span class=n>s</span><span class=o>-&gt;</span><span class=n>size</span> <span class=o>&amp;</span> <span class=o>~</span><span class=p>(</span><span class=n>align</span> <span class=o>-</span> <span class=mi>1</span><span class=p>))</span> <span class=o>!=</span> <span class=n>s</span><span class=o>-&gt;</span><span class=n>size</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>    <span class=k>continue</span><span class=p>;</span>  <span class=c1>// 对齐不兼容，不合并
+</span></span></span></code></pre></td></tr></table></div></div><hr><h2 id=八设计思考>八、设计思考</h2><h3 id=1-为什么-arm64-的-arch_dma_minalign-是-128-而不是-64>1. 为什么 ARM64 的 ARCH_DMA_MINALIGN 是 128 而不是 64？</h3><p>ARM64 的 Cache Writeback Granule（CWG）可以大于 L1 cache line。CWG 是 CPU 单次写回内存的最小粒度——如果 DMA buffer 不满足 CWG 对齐，CPU 写回相邻数据时可能覆盖 DMA 正在写入的区域。128 是 ARM big.LITTLE 架构中常见的最大 CWG。</p><h3 id=2-为什么-x86-不需要那么大的-dma-对齐>2. 为什么 x86 不需要那么大的 DMA 对齐？</h3><p>x86 有 cache coherent DMA（设备通过 snoop 协议参与 cache 一致性），不存在 CPU 回写覆盖 DMA 数据的问题。因此 <code>ARCH_KMALLOC_MINALIGN</code> 只需要 8 字节（<code>unsigned long long</code> 的自然对齐）。</p><h3 id=3-对齐的三层递进>3. 对齐的三层递进</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>层1：最小正确性对齐（ARCH_SLAB_MINALIGN = 8）
+</span></span><span class=line><span class=cl>  → 保证基本类型访问不触发异常
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>层2：DMA 安全对齐（ARCH_KMALLOC_MINALIGN = 128 on ARM64）
+</span></span><span class=line><span class=cl>  → 保证 kmalloc buffer 可安全用于 DMA
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>层3：性能优化对齐（SLAB_HWCACHE_ALIGN / ____cacheline_aligned_in_smp）
+</span></span><span class=line><span class=cl>  → 消除 false sharing，提升多核并发性能
+</span></span></code></pre></td></tr></table></div></div><h3 id=4-何时该用对齐>4. 何时该用对齐</h3><div class=table-wrapper><table><thead><tr><th>场景</th><th>建议</th></tr></thead><tbody><tr><td>多核高频写字段</td><td><code>____cacheline_aligned_in_smp</code></td></tr><tr><td>slab 缓存的热路径对象</td><td><code>KMEM_CACHE()</code> + 结构体对齐属性</td></tr><tr><td>DMA 缓冲区</td><td>用 <code>kmalloc</code>/<code>dma_alloc_coherent</code>，依赖系统保证</td></tr><tr><td>SPSC 队列的 producer/consumer</td><td>各自独占 cache line</td></tr><tr><td>单核或低频路径</td><td>不需要额外对齐，保持紧凑</td></tr></tbody></table></div><hr><h2 id=九源码位置速查表>九、源码位置速查表</h2><div class=table-wrapper><table><thead><tr><th>功能</th><th>文件</th><th>行号</th></tr></thead><tbody><tr><td><code>____cacheline_aligned_in_smp</code></td><td><code>include/linux/cache.h</code></td><td>44</td></tr><tr><td><code>__cacheline_aligned</code></td><td><code>include/linux/cache.h</code></td><td>52</td></tr><tr><td><code>ARCH_KMALLOC_MINALIGN</code></td><td><code>include/linux/slab.h</code></td><td>207</td></tr><tr><td><code>ARCH_SLAB_MINALIGN</code></td><td><code>include/linux/slab.h</code></td><td>220</td></tr><tr><td><code>calculate_alignment()</code></td><td><code>mm/slab_common.c</code></td><td>146</td></tr><tr><td>SLUB 对象 stride 对齐</td><td><code>mm/slub.c</code></td><td>4101</td></tr><tr><td><code>KMEM_CACHE</code> 宏</td><td><code>include/linux/slab.h</code></td><td>158</td></tr><tr><td>kmalloc 自然对齐</td><td><code>mm/slab_common.c</code></td><td>655</td></tr><tr><td>ARM64 <code>ARCH_DMA_MINALIGN</code></td><td><code>arch/arm64/include/asm/cache.h</code></td><td>50</td></tr><tr><td>x86 <code>L1_CACHE_BYTES</code></td><td><code>arch/x86/include/asm/cache.h</code></td><td>7</td></tr><tr><td><code>struct page</code> 对齐</td><td><code>include/linux/mm_types.h</code></td><td>67</td></tr><tr><td>SLUB cmpxchg_double</td><td><code>mm/slub.c</code></td><td>463</td></tr><tr><td>per-CPU slab 双字对齐</td><td><code>mm/slub.c</code></td><td>3854</td></tr><tr><td>XDP ring false sharing</td><td><code>net/xdp/xsk_queue.h</code></td><td>16</td></tr><tr><td>BPF refcnt 隔离</td><td><code>include/linux/bpf.h</code></td><td>186</td></tr><tr><td>USB DMA pool</td><td><code>drivers/usb/core/buffer.c</code></td><td>35</td></tr></tbody></table></div><hr><h2 id=参考文件>参考文件</h2><div class=table-wrapper><table><thead><tr><th>文件路径</th><th>内容</th></tr></thead><tbody><tr><td><code>mm/slub.c</code></td><td>SLUB 分配器：对象布局、对齐 stride、cmpxchg_double</td></tr><tr><td><code>mm/slab_common.c</code></td><td>calculate_alignment、kmalloc cache 初始化</td></tr><tr><td><code>include/linux/slab.h</code></td><td>ARCH_KMALLOC_MINALIGN、KMEM_CACHE 宏</td></tr><tr><td><code>include/linux/cache.h</code></td><td>所有 cache line 对齐宏定义</td></tr><tr><td><code>arch/arm64/include/asm/cache.h</code></td><td>ARM64 DMA 对齐约束</td></tr><tr><td><code>net/xdp/xsk_queue.h</code></td><td>SPSC 队列 false sharing 防护经典设计</td></tr><tr><td><code>include/linux/bpf.h</code></td><td>refcnt cache line 隔离</td></tr><tr><td><code>drivers/usb/core/buffer.c</code></td><td>DMA pool 与 KMALLOC_MINALIGN 配合</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/%E5%AF%B9%E9%BD%90/>对齐</a>
+<a href=/tags/alignment/>Alignment</a>
+<a href=/tags/cache-line/>Cache Line</a>
+<a href=/tags/false-sharing/>False Sharing</a>
+<a href=/tags/slab/>Slab</a>
+<a href=/tags/slub/>SLUB</a>
+<a href=/tags/dma/>DMA</a>
+<a href=/tags/arch_kmalloc_minalign/>ARCH_KMALLOC_MINALIGN</a>
+<a href=/tags/slab_hwcache_align/>SLAB_HWCACHE_ALIGN</a>
+<a href=/tags/cmpxchg/>Cmpxchg</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/x86-64-%E9%A1%B5%E8%A1%A8%E9%81%8D%E5%8E%86%E4%B8%8E-cpu-%E7%BC%93%E5%AD%98%E6%9C%BA%E5%88%B6%E4%BB%8E-cr3-%E5%88%B0-cache-miss-%E4%BC%98%E5%8C%96/><div class=article-details><h2 class=article-title>x86-64 页表遍历与 CPU 缓存机制——从 CR3 到 Cache Miss 优化</h2></div></a></article><article><a href=/p/linux-5.15.78-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E5%AE%8C%E5%85%A8%E6%8C%87%E5%8D%97/><div class=article-details><h2 class=article-title>Linux 5.15.78 内存管理完全指南</h2></div></a></article><article><a href=/p/cpu-%E4%B8%8A%E4%B8%8B%E6%96%87%E5%88%87%E6%8D%A2%E4%B8%8E%E5%86%85%E6%A0%B8%E6%A0%88%E8%BF%9B%E7%A8%8B%E6%98%AF%E6%80%8E%E4%B9%88%E8%A2%AB-cpu-%E6%89%A7%E8%A1%8C%E7%9A%84/><div class=article-details><h2 class=article-title>CPU 上下文切换与内核栈——进程是怎么被 CPU 执行的</h2></div></a></article><article><a href=/p/cpu-%E8%AE%BF%E9%97%AE%E5%86%85%E5%AD%98%E7%9A%84%E7%A1%AC%E4%BB%B6%E8%B7%AF%E5%BE%84%E5%9C%B0%E5%9D%80%E6%80%BB%E7%BA%BF%E6%95%B0%E6%8D%AE%E6%80%BB%E7%BA%BF%E4%B8%8E%E7%BC%93%E5%AD%98%E8%A1%8C%E7%AA%81%E5%8F%91%E4%BC%A0%E8%BE%93/><div class=article-details><h2 class=article-title>CPU 访问内存的硬件路径——地址总线、数据总线与缓存行突发传输</h2></div></a></article><article><a href=/p/x86_64-%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%B8%83%E5%B1%80/><div class=article-details><h2 class=article-title>x86_64 虚拟内存布局</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

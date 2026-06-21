@@ -1,0 +1,854 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='Namespace、Cgroup、VRF 机制分析 基于 Linux 5.15.78，分析三大资源管控机制的作用、生效时机、进程归属方式， 以及三者在网络场景下的协作关系。\n一、总体定位 1 2 3 4 5 6 7 8 9 10 11 12 13 ┌──────────────────────────────────────────────────────────────────┐ │ Linux 内核资源管控体系 │ ├──────────────┬───────────────────┬───────────────────────────────┤ │ Namespace │ Cgroup │ VRF │ │ ─────────── │ ─────────────── │ ─────────────────────────── │ │ "看到什么" │ "能用多少" │ "走哪条路" │ │ 资源隔离 │ 资源限制/计量 │ 路由隔离 │ │ (视图层面) │ (配额层面) │ (同一netns内FIB隔离) │ ├──────────────┼───────────────────┼───────────────────────────────┤ │ 层级: 内核 │ 层级: 内核 │ 层级: L3路由 │ │ 粒度: 进程 │ 粒度: 进程 │ 粒度: 网络接口 │ │ 附着: nsproxy│ 附着: css_set │ 附着: net_device(l3mdev_ops) │ └──────────────┴───────────────────┴───────────────────────────────┘ Namespace Cgroup VRF 解决问题 资源隔离(视图) 资源限制(配额) 路由隔离 绑定对象 进程(nsproxy) 进程(css_set) 网络接口(net_device) 继承方式 fork时继承/CLONE_NEW*新建 fork时继承父进程cgroup Socket绑定设备 网络影响 完全独立的网络栈 给socket打标签/设优先级 同一网络栈内路由隔离 隔离粒度 全栈隔离(设备/IP/路由/iptables) 仅限制/标记 仅路由表隔离 创建方式 clone(CLONE_NEWNET)/ip netns add mkdir /sys/fs/cgroup/XXX ip link add type vrf 典型场景 容器(Docker/K8s) 资源限制(内存/CPU) 多租户路由(运营商/企业网) 二、Namespace — &ldquo;进程看到什么&rdquo; 2.1 八种 Namespace Linux 5.15 支持 8 种命名空间，每种隔离一类系统资源的 可见性：\n'><title>Namespace、Cgroup、VRF 机制分析</title><link rel=canonical href=https://1bit2.github.io/p/namespacecgroupvrf-%E6%9C%BA%E5%88%B6%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Namespace、Cgroup、VRF 机制分析"><meta property='og:description' content='Namespace、Cgroup、VRF 机制分析 基于 Linux 5.15.78，分析三大资源管控机制的作用、生效时机、进程归属方式， 以及三者在网络场景下的协作关系。\n一、总体定位 1 2 3 4 5 6 7 8 9 10 11 12 13 ┌──────────────────────────────────────────────────────────────────┐ │ Linux 内核资源管控体系 │ ├──────────────┬───────────────────┬───────────────────────────────┤ │ Namespace │ Cgroup │ VRF │ │ ─────────── │ ─────────────── │ ─────────────────────────── │ │ "看到什么" │ "能用多少" │ "走哪条路" │ │ 资源隔离 │ 资源限制/计量 │ 路由隔离 │ │ (视图层面) │ (配额层面) │ (同一netns内FIB隔离) │ ├──────────────┼───────────────────┼───────────────────────────────┤ │ 层级: 内核 │ 层级: 内核 │ 层级: L3路由 │ │ 粒度: 进程 │ 粒度: 进程 │ 粒度: 网络接口 │ │ 附着: nsproxy│ 附着: css_set │ 附着: net_device(l3mdev_ops) │ └──────────────┴───────────────────┴───────────────────────────────┘ Namespace Cgroup VRF 解决问题 资源隔离(视图) 资源限制(配额) 路由隔离 绑定对象 进程(nsproxy) 进程(css_set) 网络接口(net_device) 继承方式 fork时继承/CLONE_NEW*新建 fork时继承父进程cgroup Socket绑定设备 网络影响 完全独立的网络栈 给socket打标签/设优先级 同一网络栈内路由隔离 隔离粒度 全栈隔离(设备/IP/路由/iptables) 仅限制/标记 仅路由表隔离 创建方式 clone(CLONE_NEWNET)/ip netns add mkdir /sys/fs/cgroup/XXX ip link add type vrf 典型场景 容器(Docker/K8s) 资源限制(内存/CPU) 多租户路由(运营商/企业网) 二、Namespace — &ldquo;进程看到什么&rdquo; 2.1 八种 Namespace Linux 5.15 支持 8 种命名空间，每种隔离一类系统资源的 可见性：\n'><meta property='og:url' content='https://1bit2.github.io/p/namespacecgroupvrf-%E6%9C%BA%E5%88%B6%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='namespace'><meta property='article:tag' content='cgroup'><meta property='article:tag' content='VRF'><meta property='article:tag' content='nsproxy'><meta property='article:tag' content='css_set'><meta property='article:tag' content='l3mdev'><meta property='article:tag' content='容器'><meta property='article:tag' content='资源隔离'><meta property='article:tag' content='ip-rule'><meta property='article:tag' content='policy-routing'><meta property='article:tag' content='sock_net'><meta property='article:tag' content='dev_net'><meta property='article:published_time' content='2026-04-30T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-30T00:00:00+00:00'><meta name=twitter:title content="Namespace、Cgroup、VRF 机制分析"><meta name=twitter:description content='Namespace、Cgroup、VRF 机制分析 基于 Linux 5.15.78，分析三大资源管控机制的作用、生效时机、进程归属方式， 以及三者在网络场景下的协作关系。\n一、总体定位 1 2 3 4 5 6 7 8 9 10 11 12 13 ┌──────────────────────────────────────────────────────────────────┐ │ Linux 内核资源管控体系 │ ├──────────────┬───────────────────┬───────────────────────────────┤ │ Namespace │ Cgroup │ VRF │ │ ─────────── │ ─────────────── │ ─────────────────────────── │ │ "看到什么" │ "能用多少" │ "走哪条路" │ │ 资源隔离 │ 资源限制/计量 │ 路由隔离 │ │ (视图层面) │ (配额层面) │ (同一netns内FIB隔离) │ ├──────────────┼───────────────────┼───────────────────────────────┤ │ 层级: 内核 │ 层级: 内核 │ 层级: L3路由 │ │ 粒度: 进程 │ 粒度: 进程 │ 粒度: 网络接口 │ │ 附着: nsproxy│ 附着: css_set │ 附着: net_device(l3mdev_ops) │ └──────────────┴───────────────────┴───────────────────────────────┘ Namespace Cgroup VRF 解决问题 资源隔离(视图) 资源限制(配额) 路由隔离 绑定对象 进程(nsproxy) 进程(css_set) 网络接口(net_device) 继承方式 fork时继承/CLONE_NEW*新建 fork时继承父进程cgroup Socket绑定设备 网络影响 完全独立的网络栈 给socket打标签/设优先级 同一网络栈内路由隔离 隔离粒度 全栈隔离(设备/IP/路由/iptables) 仅限制/标记 仅路由表隔离 创建方式 clone(CLONE_NEWNET)/ip netns add mkdir /sys/fs/cgroup/XXX ip link add type vrf 典型场景 容器(Docker/K8s) 资源限制(内存/CPU) 多租户路由(运营商/企业网) 二、Namespace — &ldquo;进程看到什么&rdquo; 2.1 八种 Namespace Linux 5.15 支持 8 种命名空间，每种隔离一类系统资源的 可见性：\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一总体定位>一、总体定位</a></li><li><a href=#二namespace--进程看到什么>二、Namespace — &ldquo;进程看到什么&rdquo;</a><ol><li><a href=#21-八种-namespace>2.1 八种 Namespace</a></li><li><a href=#22-核心数据结构--nsproxy代理模式>2.2 核心数据结构 — <code>nsproxy</code>（代理模式）</a></li><li><a href=#23-进程创建时的-namespace-归属>2.3 进程创建时的 Namespace 归属</a><ol><li><a href=#copy_namespaces-核心逻辑><code>copy_namespaces()</code> 核心逻辑</a></li><li><a href=#create_new_namespaces--逐个检查标志><code>create_new_namespaces()</code> — 逐个检查标志</a></li></ol></li><li><a href=#24-三种进入-namespace-的方式>2.4 三种进入 Namespace 的方式</a><ol><li><a href=#unshare-调用链><code>unshare()</code> 调用链</a></li><li><a href=#setns-调用链><code>setns()</code> 调用链</a></li></ol></li><li><a href=#25-nsproxy-何时起作用每次系统调用>2.5 nsproxy 何时起作用——每次系统调用</a></li><li><a href=#26-network-namespace-对网络栈的影响>2.6 Network Namespace 对网络栈的影响</a></li></ol></li><li><a href=#三cgroup--进程能用多少>三、Cgroup — &ldquo;进程能用多少&rdquo;</a><ol><li><a href=#31-控制器列表>3.1 控制器列表</a></li><li><a href=#32-核心数据结构>3.2 核心数据结构</a></li><li><a href=#33-进程创建时的-cgroup-归属>3.3 进程创建时的 Cgroup 归属</a></li><li><a href=#34-运行时迁移>3.4 运行时迁移</a></li><li><a href=#35-cgroup-对网络的影响>3.5 Cgroup 对网络的影响</a><ol><li><a href=#net_cls--classid-标签>net_cls — classid 标签</a></li><li><a href=#net_prio--优先级>net_prio — 优先级</a></li></ol></li></ol></li><li><a href=#四vrf--同一网络空间内走哪条路>四、VRF — &ldquo;同一网络空间内走哪条路&rdquo;</a><ol><li><a href=#41-设计动机ip-rule-已经能做多路由域为什么还要-vrf>4.1 设计动机——ip rule 已经能做多路由域，为什么还要 VRF？</a><ol><li><a href=#方案一ip-rule-iif--只覆盖转发流量>方案一：ip rule (iif) — 只覆盖转发流量</a></li><li><a href=#方案二bind-真实网口--oif-rule--覆盖本机发包>方案二：bind 真实网口 + oif rule — 覆盖本机发包</a></li><li><a href=#方案三vrf--自动化--简化管理>方案三：VRF — 自动化 + 简化管理</a></li><li><a href=#如何选择>如何选择？</a></li></ol></li><li><a href=#42-vrf-与路由表的关系严格一对一>4.2 VRF 与路由表的关系——严格一对一</a></li><li><a href=#43-核心数据结构>4.3 核心数据结构</a></li><li><a href=#44-vrf-的创建与绑定>4.4 VRF 的创建与绑定</a></li><li><a href=#45-应用程序如何使用-vrf>4.5 应用程序如何使用 VRF</a></li><li><a href=#46-vrf-在内核中的生效路径>4.6 VRF 在内核中的生效路径</a><ol><li><a href=#发送路径--socket-绑定-vrf>发送路径 — Socket 绑定 VRF</a></li><li><a href=#收包路径--vrf-在-l3-层介入>收包路径 — VRF 在 L3 层介入</a></li><li><a href=#socket-匹配--inet_sk_bound_dev_eq非-sk_dev_equal_l3scope>Socket 匹配 — inet_sk_bound_dev_eq（非 sk_dev_equal_l3scope）</a></li></ol></li><li><a href=#47-全景本机如何区分相同网段两个网口的流量>4.7 全景：本机如何区分相同网段两个网口的流量</a></li><li><a href=#48-vrf-与-network-namespace-的关系>4.8 VRF 与 Network Namespace 的关系</a></li><li><a href=#49-三种方案对比>4.9 三种方案对比</a></li><li><a href=#410-实战场景两个网口连相同网段但链路不通的路由器>4.10 实战场景：两个网口连相同网段但链路不通的路由器</a></li></ol></li><li><a href=#五层级关系与协作>五、层级关系与协作</a><ol><li><a href=#51-在收包路径中的生效位置>5.1 在收包路径中的生效位置</a></li><li><a href=#52-典型使用场景>5.2 典型使用场景</a></li><li><a href=#53-类比总结>5.3 类比总结</a></li></ol></li><li><a href=#六相关系统参数>六、相关系统参数</a></li><li><a href=#七调试工具>七、调试工具</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E5%85%B6%E4%BB%96/ style=background-color:#607d8b;color:#fff>其他</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/namespacecgroupvrf-%E6%9C%BA%E5%88%B6%E5%88%86%E6%9E%90/>Namespace、Cgroup、VRF 机制分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 30, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>14 minute read</time></div></footer></div></header><section class=article-content><h1 id=namespacecgroupvrf-机制分析>Namespace、Cgroup、VRF 机制分析</h1><blockquote><p>基于 Linux 5.15.78，分析三大资源管控机制的作用、生效时机、进程归属方式，
+以及三者在网络场景下的协作关系。</p></blockquote><hr><h2 id=一总体定位>一、总体定位</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│                        Linux 内核资源管控体系                      │
+</span></span><span class=line><span class=cl>├──────────────┬───────────────────┬───────────────────────────────┤
+</span></span><span class=line><span class=cl>│  Namespace   │      Cgroup       │            VRF                │
+</span></span><span class=line><span class=cl>│  ─────────── │  ─────────────── │  ───────────────────────────  │
+</span></span><span class=line><span class=cl>│  &#34;看到什么&#34;  │   &#34;能用多少&#34;      │   &#34;走哪条路&#34;                  │
+</span></span><span class=line><span class=cl>│  资源隔离    │   资源限制/计量   │   路由隔离                    │
+</span></span><span class=line><span class=cl>│  (视图层面)  │   (配额层面)      │   (同一netns内FIB隔离)        │
+</span></span><span class=line><span class=cl>├──────────────┼───────────────────┼───────────────────────────────┤
+</span></span><span class=line><span class=cl>│ 层级: 内核   │ 层级: 内核        │ 层级: L3路由                  │
+</span></span><span class=line><span class=cl>│ 粒度: 进程   │ 粒度: 进程        │ 粒度: 网络接口                │
+</span></span><span class=line><span class=cl>│ 附着: nsproxy│ 附着: css_set     │ 附着: net_device(l3mdev_ops)  │
+</span></span><span class=line><span class=cl>└──────────────┴───────────────────┴───────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th></th><th>Namespace</th><th>Cgroup</th><th>VRF</th></tr></thead><tbody><tr><td><strong>解决问题</strong></td><td>资源隔离(视图)</td><td>资源限制(配额)</td><td>路由隔离</td></tr><tr><td><strong>绑定对象</strong></td><td>进程(<code>nsproxy</code>)</td><td>进程(<code>css_set</code>)</td><td>网络接口(<code>net_device</code>)</td></tr><tr><td><strong>继承方式</strong></td><td>fork时继承/<code>CLONE_NEW*</code>新建</td><td>fork时继承父进程cgroup</td><td>Socket绑定设备</td></tr><tr><td><strong>网络影响</strong></td><td>完全独立的网络栈</td><td>给socket打标签/设优先级</td><td>同一网络栈内路由隔离</td></tr><tr><td><strong>隔离粒度</strong></td><td>全栈隔离(设备/IP/路由/iptables)</td><td>仅限制/标记</td><td>仅路由表隔离</td></tr><tr><td><strong>创建方式</strong></td><td><code>clone(CLONE_NEWNET)</code>/<code>ip netns add</code></td><td><code>mkdir /sys/fs/cgroup/XXX</code></td><td><code>ip link add type vrf</code></td></tr><tr><td><strong>典型场景</strong></td><td>容器(Docker/K8s)</td><td>资源限制(内存/CPU)</td><td>多租户路由(运营商/企业网)</td></tr></tbody></table></div><hr><h2 id=二namespace--进程看到什么>二、Namespace — &ldquo;进程看到什么&rdquo;</h2><h3 id=21-八种-namespace>2.1 八种 Namespace</h3><p>Linux 5.15 支持 8 种命名空间，每种隔离一类系统资源的 <strong>可见性</strong>：</p><div class=table-wrapper><table><thead><tr><th>Namespace</th><th>CLONE标志</th><th>隔离内容</th><th>内核结构</th></tr></thead><tbody><tr><td>Mount</td><td><code>CLONE_NEWNS</code></td><td>文件系统挂载点</td><td><code>mnt_namespace</code></td></tr><tr><td>UTS</td><td><code>CLONE_NEWUTS</code></td><td>主机名、域名</td><td><code>uts_namespace</code></td></tr><tr><td>IPC</td><td><code>CLONE_NEWIPC</code></td><td>SystemV IPC、POSIX消息队列</td><td><code>ipc_namespace</code></td></tr><tr><td>PID</td><td><code>CLONE_NEWPID</code></td><td>进程ID编号空间</td><td><code>pid_namespace</code></td></tr><tr><td>Network</td><td><code>CLONE_NEWNET</code></td><td>网络栈(设备、路由、iptables、socket)</td><td><code>struct net</code></td></tr><tr><td>User</td><td><code>CLONE_NEWUSER</code></td><td>UID/GID映射</td><td><code>user_namespace</code></td></tr><tr><td>Cgroup</td><td><code>CLONE_NEWCGROUP</code></td><td>cgroup根视图</td><td><code>cgroup_namespace</code></td></tr><tr><td>Time</td><td><code>CLONE_NEWTIME</code></td><td>单调时钟/启动时钟偏移</td><td><code>time_namespace</code></td></tr></tbody></table></div><h3 id=22-核心数据结构--nsproxy代理模式>2.2 核心数据结构 — <code>nsproxy</code>（代理模式）</h3><p>每个进程通过 <code>task_struct->nsproxy</code> 指向自己的命名空间集合。<code>nsproxy</code> 本质上是<strong>代理模式（Proxy Pattern）</strong>——不同隔离域的进程持有不同的 <code>nsproxy</code> 实例，每个实例内的指针指向各自的 namespace 对象：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/nsproxy.h:31
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>nsproxy</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>atomic_t</span> <span class=n>count</span><span class=p>;</span>                          <span class=c1>// 引用计数
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>uts_namespace</span>  <span class=o>*</span><span class=n>uts_ns</span><span class=p>;</span>            <span class=c1>// 主机名隔离
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>ipc_namespace</span>  <span class=o>*</span><span class=n>ipc_ns</span><span class=p>;</span>            <span class=c1>// IPC隔离
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>mnt_namespace</span>  <span class=o>*</span><span class=n>mnt_ns</span><span class=p>;</span>            <span class=c1>// 挂载点隔离
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>pid_namespace</span>  <span class=o>*</span><span class=n>pid_ns_for_children</span><span class=p>;</span> <span class=c1>// 子进程的PID空间
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>net</span>            <span class=o>*</span><span class=n>net_ns</span><span class=p>;</span>            <span class=c1>// ★ 网络命名空间
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>time_namespace</span> <span class=o>*</span><span class=n>time_ns</span><span class=p>;</span>           <span class=c1>// 当前时间空间
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>time_namespace</span> <span class=o>*</span><span class=n>time_ns_for_children</span><span class=p>;</span> <span class=c1>// 子进程的时间空间
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>cgroup_namespace</span> <span class=o>*</span><span class=n>cgroup_ns</span><span class=p>;</span>       <span class=c1>// cgroup根视图
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>进程A (宿主机)                             进程B (容器)
+</span></span><span class=line><span class=cl>  │                                          │
+</span></span><span class=line><span class=cl>  └→ nsproxy_1                               └→ nsproxy_2
+</span></span><span class=line><span class=cl>       ├── net_ns → init_net                      ├── net_ns → container_net
+</span></span><span class=line><span class=cl>       ├── uts_ns → 宿主机hostname                ├── uts_ns → &#34;container-1&#34;
+</span></span><span class=line><span class=cl>       └── pid_ns → 全局PID空间                   └── pid_ns → 容器PID空间
+</span></span></code></pre></td></tr></table></div></div><p><code>struct net</code> 是 Network Namespace 的实体，包含独立的设备列表、路由表、iptables 规则、socket 哈希表等完整网络栈。</p><h3 id=23-进程创建时的-namespace-归属>2.3 进程创建时的 Namespace 归属</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>clone()/fork()
+</span></span><span class=line><span class=cl>  → kernel_clone()         // kernel/fork.c
+</span></span><span class=line><span class=cl>    → copy_process()
+</span></span><span class=line><span class=cl>      → copy_namespaces(clone_flags, p)   // kernel/nsproxy.c:151
+</span></span></code></pre></td></tr></table></div></div><h4 id=copy_namespaces-核心逻辑><code>copy_namespaces()</code> 核心逻辑</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/nsproxy.c:151
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>copy_namespaces</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>flags</span><span class=p>,</span> <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>tsk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>nsproxy</span> <span class=o>*</span><span class=n>old_ns</span> <span class=o>=</span> <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>nsproxy</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ★ 快速路径：没有任何 CLONE_NEW* 标志
+</span></span></span><span class=line><span class=cl>    <span class=c1>//   → 子进程共享父进程的 nsproxy（引用计数+1）
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>likely</span><span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>flags</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>CLONE_NEWNS</span> <span class=o>|</span> <span class=n>CLONE_NEWUTS</span> <span class=o>|</span> <span class=n>CLONE_NEWIPC</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>                          <span class=n>CLONE_NEWPID</span> <span class=o>|</span> <span class=n>CLONE_NEWNET</span> <span class=o>|</span>
+</span></span><span class=line><span class=cl>                          <span class=n>CLONE_NEWCGROUP</span> <span class=o>|</span> <span class=n>CLONE_NEWTIME</span><span class=p>))))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>get_nsproxy</span><span class=p>(</span><span class=n>old_ns</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 需要 CAP_SYS_ADMIN 权限
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>ns_capable</span><span class=p>(</span><span class=n>user_ns</span><span class=p>,</span> <span class=n>CAP_SYS_ADMIN</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>-</span><span class=n>EPERM</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ★ 慢速路径：创建新 nsproxy
+</span></span></span><span class=line><span class=cl>    <span class=n>new_ns</span> <span class=o>=</span> <span class=nf>create_new_namespaces</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=n>tsk</span><span class=p>,</span> <span class=n>user_ns</span><span class=p>,</span> <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>fs</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>tsk</span><span class=o>-&gt;</span><span class=n>nsproxy</span> <span class=o>=</span> <span class=n>new_ns</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h4 id=create_new_namespaces--逐个检查标志><code>create_new_namespaces()</code> — 逐个检查标志</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// kernel/nsproxy.c:67
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>struct</span> <span class=n>nsproxy</span> <span class=o>*</span><span class=nf>create_new_namespaces</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>flags</span><span class=p>,</span> <span class=p>...)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>new_nsp</span> <span class=o>=</span> <span class=nf>create_nsproxy</span><span class=p>();</span>  <span class=c1>// 分配新 nsproxy
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 每个 copy_xxx 检查对应的 CLONE_NEW* 标志：
+</span></span></span><span class=line><span class=cl>    <span class=c1>//   有标志 → 创建全新的namespace
+</span></span></span><span class=line><span class=cl>    <span class=c1>//   无标志 → 引用父进程的namespace（引用计数+1）
+</span></span></span><span class=line><span class=cl>    <span class=n>new_nsp</span><span class=o>-&gt;</span><span class=n>mnt_ns</span>  <span class=o>=</span> <span class=nf>copy_mnt_ns</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=p>...);</span>     <span class=c1>// CLONE_NEWNS?
+</span></span></span><span class=line><span class=cl>    <span class=n>new_nsp</span><span class=o>-&gt;</span><span class=n>uts_ns</span>  <span class=o>=</span> <span class=nf>copy_utsname</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=p>...);</span>     <span class=c1>// CLONE_NEWUTS?
+</span></span></span><span class=line><span class=cl>    <span class=n>new_nsp</span><span class=o>-&gt;</span><span class=n>ipc_ns</span>  <span class=o>=</span> <span class=nf>copy_ipcs</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=p>...);</span>        <span class=c1>// CLONE_NEWIPC?
+</span></span></span><span class=line><span class=cl>    <span class=n>new_nsp</span><span class=o>-&gt;</span><span class=n>pid_ns_for_children</span> <span class=o>=</span> <span class=nf>copy_pid_ns</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=p>...);</span> <span class=c1>// CLONE_NEWPID?
+</span></span></span><span class=line><span class=cl>    <span class=n>new_nsp</span><span class=o>-&gt;</span><span class=n>cgroup_ns</span> <span class=o>=</span> <span class=nf>copy_cgroup_ns</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=p>...);</span> <span class=c1>// CLONE_NEWCGROUP?
+</span></span></span><span class=line><span class=cl>    <span class=n>new_nsp</span><span class=o>-&gt;</span><span class=n>net_ns</span>  <span class=o>=</span> <span class=nf>copy_net_ns</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=p>...);</span>      <span class=c1>// CLONE_NEWNET?
+</span></span></span><span class=line><span class=cl>    <span class=n>new_nsp</span><span class=o>-&gt;</span><span class=n>time_ns_for_children</span> <span class=o>=</span> <span class=nf>copy_time_ns</span><span class=p>(</span><span class=n>flags</span><span class=p>,</span> <span class=p>...);</span> <span class=c1>// CLONE_NEWTIME?
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>new_nsp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=24-三种进入-namespace-的方式>2.4 三种进入 Namespace 的方式</h3><div class=table-wrapper><table><thead><tr><th>方式</th><th>系统调用</th><th>时机</th><th>内核入口</th></tr></thead><tbody><tr><td><strong>继承</strong></td><td><code>clone(CLONE_NEW*)</code></td><td>子进程创建时</td><td><code>copy_namespaces()</code></td></tr><tr><td><strong>脱离</strong></td><td><code>unshare(CLONE_NEW*)</code></td><td>当前进程运行中</td><td><code>ksys_unshare()</code> → <code>unshare_nsproxy_namespaces()</code></td></tr><tr><td><strong>加入</strong></td><td><code>setns(fd, nstype)</code></td><td>加入已有namespace</td><td><code>SYSCALL_DEFINE2(setns)</code> → <code>commit_nsset()</code></td></tr></tbody></table></div><h4 id=unshare-调用链><code>unshare()</code> 调用链</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>unshare(CLONE_NEWNET)
+</span></span><span class=line><span class=cl>  → ksys_unshare()                    // kernel/fork.c:3621
+</span></span><span class=line><span class=cl>    → unshare_nsproxy_namespaces()    // kernel/nsproxy.c
+</span></span><span class=line><span class=cl>      → create_new_namespaces(flags, ...)
+</span></span><span class=line><span class=cl>    → switch_task_namespaces(current, new_nsproxy)
+</span></span></code></pre></td></tr></table></div></div><h4 id=setns-调用链><code>setns()</code> 调用链</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>setns(fd, CLONE_NEWNET)
+</span></span><span class=line><span class=cl>  → SYSCALL_DEFINE2(setns)            // kernel/nsproxy.c:527
+</span></span><span class=line><span class=cl>    → prepare_nsset()                 // 克隆当前 nsproxy
+</span></span><span class=line><span class=cl>    → validate_ns(&amp;nsset, ns)         // 安装目标 namespace
+</span></span><span class=line><span class=cl>    → commit_nsset()                  // 原子切换
+</span></span><span class=line><span class=cl>      → switch_task_namespaces(current, new_nsproxy)
+</span></span></code></pre></td></tr></table></div></div><h3 id=25-nsproxy-何时起作用每次系统调用>2.5 nsproxy 何时起作用——每次系统调用</h3><p>nsproxy 不是在某个特殊时刻才起作用。<strong>进程每次做系统调用时，内核都通过 <code>current->nsproxy</code> 决定"这个进程看到哪个世界"</strong>。</p><p>关键示例——创建 socket（<code>net/socket.c:1558</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>int</span> <span class=nf>sock_create</span><span class=p>(</span><span class=kt>int</span> <span class=n>family</span><span class=p>,</span> <span class=kt>int</span> <span class=n>type</span><span class=p>,</span> <span class=kt>int</span> <span class=n>protocol</span><span class=p>,</span> <span class=k>struct</span> <span class=n>socket</span> <span class=o>**</span><span class=n>res</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>__sock_create</span><span class=p>(</span><span class=n>current</span><span class=o>-&gt;</span><span class=n>nsproxy</span><span class=o>-&gt;</span><span class=n>net_ns</span><span class=p>,</span> <span class=n>family</span><span class=p>,</span> <span class=n>type</span><span class=p>,</span> <span class=n>protocol</span><span class=p>,</span> <span class=n>res</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>各 namespace 的典型引用位置：</p><div class=table-wrapper><table><thead><tr><th>进程操作</th><th>内核引用路径</th><th>源码位置</th></tr></thead><tbody><tr><td><code>socket()</code></td><td><code>current->nsproxy->net_ns</code> → 在对应网络栈中创建</td><td><code>net/socket.c:1558</code></td></tr><tr><td><code>gethostname()</code></td><td><code>current->nsproxy->uts_ns</code> → 返回对应 hostname</td><td><code>kernel/sys.c</code></td></tr><tr><td><code>mount()</code></td><td><code>current->nsproxy->mnt_ns</code> → 在对应挂载空间操作</td><td><code>fs/namespace.c</code></td></tr><tr><td><code>fork()</code></td><td><code>current->nsproxy->pid_ns_for_children</code> → 分配 PID</td><td><code>kernel/pid.c</code></td></tr><tr><td><code>shmget()</code></td><td><code>current->nsproxy->ipc_ns</code> → 查找 IPC 对象</td><td><code>ipc/shm.c</code></td></tr></tbody></table></div><p>内核对象创建后会把 <code>net</code> 缓存到自身，后续通过 <code>sock_net(sk)</code> / <code>dev_net(dev)</code> 访问，不再每次查 nsproxy：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/sock.h:2684
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=nf>sock_net</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>read_pnet</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_net</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// include/linux/netdevice.h:2460
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=nf>dev_net</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>net_device</span> <span class=o>*</span><span class=n>dev</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>read_pnet</span><span class=p>(</span><span class=o>&amp;</span><span class=n>dev</span><span class=o>-&gt;</span><span class=n>nd_net</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=26-network-namespace-对网络栈的影响>2.6 Network Namespace 对网络栈的影响</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>struct net 包含：
+</span></span><span class=line><span class=cl>├── dev_base_head        — 独立的网络设备列表
+</span></span><span class=line><span class=cl>├── ipv4.fib_table_hash  — 独立的IPv4路由表
+</span></span><span class=line><span class=cl>├── ipv4.rules_ops       — 独立的路由策略规则
+</span></span><span class=line><span class=cl>├── ipv4.iptable_filter  — 独立的iptables规则
+</span></span><span class=line><span class=cl>├── ipv4.tcp_death_row   — 独立的TIME_WAIT管理
+</span></span><span class=line><span class=cl>├── ipv4.tcp_sk          — 独立的TCP控制socket
+</span></span><span class=line><span class=cl>└── loopback_dev         — 独立的lo设备
+</span></span></code></pre></td></tr></table></div></div><p>每个 Network Namespace 是一个 <strong>完全独立的网络栈实例</strong>。</p><hr><h2 id=三cgroup--进程能用多少>三、Cgroup — &ldquo;进程能用多少&rdquo;</h2><h3 id=31-控制器列表>3.1 控制器列表</h3><p>Cgroup 不隔离资源可见性，而是对进程组施加 <strong>资源限制和统计</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/cgroup_subsys.h — 控制器注册
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>cpuset</span><span class=p>)</span>    <span class=c1>// 绑定CPU核
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>cpu</span><span class=p>)</span>       <span class=c1>// CPU时间配额(CFS带宽)
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>cpuacct</span><span class=p>)</span>   <span class=c1>// CPU使用统计
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>io</span><span class=p>)</span>        <span class=c1>// 块设备I/O带宽
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>memory</span><span class=p>)</span>    <span class=c1>// 内存用量上限(OOM)
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>devices</span><span class=p>)</span>   <span class=c1>// 设备访问白名单
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>freezer</span><span class=p>)</span>   <span class=c1>// 冻结/恢复进程组
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>net_cls</span><span class=p>)</span>   <span class=c1>// 给socket打classid标签
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>net_prio</span><span class=p>)</span>  <span class=c1>// 给socket设优先级
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>perf_event</span><span class=p>)</span><span class=c1>// perf事件
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>hugetlb</span><span class=p>)</span>   <span class=c1>// 大页限制
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>pids</span><span class=p>)</span>      <span class=c1>// 最大进程数
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>rdma</span><span class=p>)</span>      <span class=c1>// RDMA资源限制
+</span></span></span><span class=line><span class=cl><span class=nf>SUBSYS</span><span class=p>(</span><span class=n>misc</span><span class=p>)</span>      <span class=c1>// 杂项资源
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=32-核心数据结构>3.2 核心数据结构</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>task_struct
+</span></span><span class=line><span class=cl>  └── cgroups (RCU指针) ────→ struct css_set
+</span></span><span class=line><span class=cl>                                ├── subsys[CGROUP_SUBSYS_COUNT]
+</span></span><span class=line><span class=cl>                                │    ├── [cpu_cgrp_id]    → cpu 的 cgroup_subsys_state
+</span></span><span class=line><span class=cl>                                │    ├── [memory_cgrp_id] → memory 的 css
+</span></span><span class=line><span class=cl>                                │    ├── [net_cls_cgrp_id]→ net_cls 的 classid
+</span></span><span class=line><span class=cl>                                │    └── ...
+</span></span><span class=line><span class=cl>                                ├── tasks             — 使用此css_set的任务列表
+</span></span><span class=line><span class=cl>                                ├── dfl_cgrp          — 默认层级的cgroup
+</span></span><span class=line><span class=cl>                                └── nr_tasks          — 任务计数
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/sched.h:1203 — task_struct 中的 cgroup 字段
+</span></span></span><span class=line><span class=cl><span class=cp>#ifdef CONFIG_CGROUPS
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>css_set</span> <span class=n>__rcu</span>  <span class=o>*</span><span class=n>cgroups</span><span class=p>;</span>   <span class=c1>// 指向当前cgroup成员关系
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span>      <span class=n>cg_list</span><span class=p>;</span>    <span class=c1>// 链接到css_set-&gt;tasks
+</span></span></span><span class=line><span class=cl><span class=cp>#endif
+</span></span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/cgroup-defs.h:199 — css_set核心字段
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>css_set</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>cgroup_subsys_state</span> <span class=o>*</span><span class=n>subsys</span><span class=p>[</span><span class=n>CGROUP_SUBSYS_COUNT</span><span class=p>];</span> <span class=c1>// 每个控制器的状态
+</span></span></span><span class=line><span class=cl>    <span class=kt>refcount_t</span> <span class=n>refcount</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>css_set</span> <span class=o>*</span><span class=n>dom_cset</span><span class=p>;</span>     <span class=c1>// 域cgroup的css_set
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>cgroup</span> <span class=o>*</span><span class=n>dfl_cgrp</span><span class=p>;</span>      <span class=c1>// 关联的默认cgroup
+</span></span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>nr_tasks</span><span class=p>;</span>                 <span class=c1>// 内部任务计数
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span> <span class=n>tasks</span><span class=p>;</span>       <span class=c1>// 使用此cset的任务链表
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>list_head</span> <span class=n>mg_tasks</span><span class=p>;</span>    <span class=c1>// 正在迁移的任务
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=33-进程创建时的-cgroup-归属>3.3 进程创建时的 Cgroup 归属</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>copy_process()
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├── cgroup_fork(p)              // kernel/cgroup/cgroup.c:6123
+</span></span><span class=line><span class=cl>  │     // 初始化：暂时指向 init_css_set
+</span></span><span class=line><span class=cl>  │     RCU_INIT_POINTER(child-&gt;cgroups, &amp;init_css_set);
+</span></span><span class=line><span class=cl>  │     INIT_LIST_HEAD(&amp;child-&gt;cg_list);
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├── cgroup_can_fork(p, args)    // kernel/cgroup/cgroup.c:6282
+</span></span><span class=line><span class=cl>  │     // 1. cgroup_css_set_fork(): 查找父进程的css_set
+</span></span><span class=line><span class=cl>  │     // 2. 各控制器的 can_fork() 回调（如pids检查进程数上限）
+</span></span><span class=line><span class=cl>  │     // 失败则fork被拒绝
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├── sched_cgroup_fork(p)        // 放到正确的cgroup运行队列
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  └── cgroup_post_fork(p, args)   // kernel/cgroup/cgroup.c:6344
+</span></span><span class=line><span class=cl>        // ★ 最终归属：将子进程移入父进程的css_set
+</span></span><span class=line><span class=cl>        css_set_move_task(child, NULL, cset, false);
+</span></span><span class=line><span class=cl>        // cset 来自 cgroup_css_set_fork()，即父进程的cgroup
+</span></span></code></pre></td></tr></table></div></div><p><strong>核心规则</strong>：子进程 <strong>默认继承父进程所在的 cgroup</strong>。</p><h3 id=34-运行时迁移>3.4 运行时迁移</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=nb>echo</span> <span class=nv>$PID</span> &gt; /sys/fs/cgroup/memory/container1/cgroup.procs
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>→ cgroup_attach_task(dst_cgrp, leader, threadgroup)  // kernel/cgroup/cgroup.c:2824
+</span></span><span class=line><span class=cl>  → cgroup_migrate_add_src()     // 收集源css_set
+</span></span><span class=line><span class=cl>  → cgroup_migrate_prepare_dst() // 准备目标css_set
+</span></span><span class=line><span class=cl>  → cgroup_migrate()             // 原子迁移所有线程
+</span></span></code></pre></td></tr></table></div></div><h3 id=35-cgroup-对网络的影响>3.5 Cgroup 对网络的影响</h3><p>Cgroup 不隔离网络栈，但通过两个控制器给 socket <strong>打标签</strong>：</p><h4 id=net_cls--classid-标签>net_cls — classid 标签</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/core/netclassid_cgroup.c
+</span></span></span><span class=line><span class=cl><span class=c1>// 给进程组的所有socket打上classid
+</span></span></span><span class=line><span class=cl><span class=c1>// tc filter / iptables -m cgroup --cgroup 可以匹配
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>cgrp_attach</span><span class=p>(</span><span class=k>struct</span> <span class=n>cgroup_taskset</span> <span class=o>*</span><span class=n>tset</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>cgroup_taskset_for_each</span><span class=p>(</span><span class=n>p</span><span class=p>,</span> <span class=n>css</span><span class=p>,</span> <span class=n>tset</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 遍历进程的所有fd，给socket设置classid
+</span></span></span><span class=line><span class=cl>        <span class=nf>update_classid_task</span><span class=p>(</span><span class=n>p</span><span class=p>,</span> <span class=nf>css_cls_state</span><span class=p>(</span><span class=n>css</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>classid</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h4 id=net_prio--优先级>net_prio — 优先级</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/core/netprio_cgroup.c
+</span></span></span><span class=line><span class=cl><span class=c1>// 给每个(cgroup, 网卡)组合设定发送优先级
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>net_prio_attach</span><span class=p>(</span><span class=k>struct</span> <span class=n>cgroup_taskset</span> <span class=o>*</span><span class=n>tset</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>cgroup_taskset_for_each</span><span class=p>(</span><span class=n>p</span><span class=p>,</span> <span class=n>css</span><span class=p>,</span> <span class=n>tset</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>iterate_fd</span><span class=p>(</span><span class=n>p</span><span class=o>-&gt;</span><span class=n>files</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=n>update_netprio</span><span class=p>,</span> <span class=p>(</span><span class=kt>void</span> <span class=o>*</span><span class=p>)</span><span class=n>css</span><span class=o>-&gt;</span><span class=n>id</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 遍历进程的所有fd，给socket设置prioidx
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四vrf--同一网络空间内走哪条路>四、VRF — &ldquo;同一网络空间内走哪条路&rdquo;</h2><blockquote><p>VRF = <strong>Virtual Routing and Forwarding</strong>（虚拟路由与转发）。
+概念来自传统路由器厂商（Cisco/Juniper），Linux 4.3 内核通过 L3 master device 机制引入支持（<code>drivers/net/vrf.c</code>）。</p></blockquote><p><strong>本质定位</strong>：VRF 是 <strong>ip rule + 多路由表 + SO_BINDTODEVICE 的自动化封装</strong>，不是新机制。VRF 创建时自动注册一条 <code>FRA_L3MDEV</code> 类型的 fib rule，底层仍依赖 ip rule 机制：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// drivers/net/vrf.c:1564 — vrf_fib_rule()
+</span></span></span><span class=line><span class=cl><span class=c1>// VRF 设备 up 时自动调用，为当前 netns 注册 l3mdev 策略规则
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>vrf_fib_rule</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>net_device</span> <span class=o>*</span><span class=n>dev</span><span class=p>,</span> <span class=n>__u8</span> <span class=n>family</span><span class=p>,</span> <span class=kt>bool</span> <span class=n>add_it</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl>    <span class=n>frh</span><span class=o>-&gt;</span><span class=n>action</span> <span class=o>=</span> <span class=n>FR_ACT_TO_TBL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>nla_put_u8</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>FRA_L3MDEV</span><span class=p>,</span> <span class=mi>1</span><span class=p>);</span>             <span class=c1>// ★ 自动创建的 rule
+</span></span></span><span class=line><span class=cl>    <span class=nf>nla_put_u32</span><span class=p>(</span><span class=n>skb</span><span class=p>,</span> <span class=n>FRA_PRIORITY</span><span class=p>,</span> <span class=n>FIB_RULE_PREF</span><span class=p>);</span> <span class=c1>// 优先级 1000
+</span></span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>这条 rule 等效于用户手动执行 <code>ip rule add l3mdev lookup table ...</code>，区别在于 VRF 让内核自动完成 rule 注册、路由表选择和 socket 绑定。</p><h3 id=41-设计动机ip-rule-已经能做多路由域为什么还要-vrf>4.1 设计动机——ip rule 已经能做多路由域，为什么还要 VRF？</h3><p>Linux 内核本身就支持多路由表 + <code>ip rule</code> 策略路由，<strong>可以实现多个独立路由域</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 创建两张路由表，ip rule 按接口选表——这不需要 VRF</span>
+</span></span><span class=line><span class=cl>ip route add 10.0.0.0/24 via 10.0.0.254 table <span class=m>10</span>
+</span></span><span class=line><span class=cl>ip route add 10.0.0.0/24 via 10.0.0.254 table <span class=m>20</span>
+</span></span><span class=line><span class=cl>ip rule add iif eth1 lookup <span class=m>10</span>
+</span></span><span class=line><span class=cl>ip rule add iif eth2 lookup <span class=m>20</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>转发流量没问题</strong>。那 VRF 到底多做了什么？不同方案解决不同程度的问题：</p><h4 id=方案一ip-rule-iif--只覆盖转发流量>方案一：ip rule (iif) — 只覆盖转发流量</h4><p><code>iif</code> 匹配"包从哪个接口进来"。对路由器转发的流量有效。但本机发起的包（如 <code>ping</code>）没有入接口，<code>iif</code> 规则不匹配——内核不知道该查哪张表。</p><h4 id=方案二bind-真实网口--oif-rule--覆盖本机发包>方案二：bind 真实网口 + oif rule — 覆盖本机发包</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl>ip rule add oif eth1 lookup <span class=m>10</span>    <span class=c1># 本机发包时按出口接口选表</span>
+</span></span><span class=line><span class=cl>ip rule add oif eth2 lookup <span class=m>20</span>
+</span></span><span class=line><span class=cl>setsockopt<span class=o>(</span>fd, SOL_SOCKET, SO_BINDTODEVICE, <span class=s2>&#34;eth1&#34;</span>, 4<span class=o>)</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>大部分场景确实可以工作</strong>，包括转发和本机发包。</p><p>需要注意的是：ehash <strong>桶索引</strong>仅由四元组计算（<code>inet_ehashfn</code>），但 <code>INET_MATCH()</code> 的完整匹配<strong>会检查</strong> <code>sk_bound_dev_if</code>（通过 <code>inet_sk_bound_dev_eq</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/inet_hashtables.h — INET_MATCH()
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>INET_MATCH</span><span class=p>(</span><span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span><span class=p>,</span> <span class=k>const</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                              <span class=k>const</span> <span class=n>__addrpair</span> <span class=n>cookie</span><span class=p>,</span> <span class=k>const</span> <span class=n>__portpair</span> <span class=n>ports</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                              <span class=kt>int</span> <span class=n>dif</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sdif</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>net_eq</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>net</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_portpair</span> <span class=o>!=</span> <span class=n>ports</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_addrpair</span> <span class=o>!=</span> <span class=n>cookie</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// ★ 会检查接口绑定
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>inet_sk_bound_dev_eq</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>),</span> <span class=n>dif</span><span class=p>,</span> <span class=n>sdif</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>所以 <strong>bind 到不同物理网口的 socket，在 ehash 中可以通过接口区分</strong>。这意味着方案二在大部分场景下是可行的。但管理负担较重：每个应用都要 <code>SO_BINDTODEVICE</code>，每对接口都要维护 iif/oif rule。</p><h4 id=方案三vrf--自动化--简化管理>方案三：VRF — 自动化 + 简化管理</h4><p>VRF 相比方案二的主要优势：</p><ol><li><strong>自动路由表选择</strong>：VRF 创建时自动注册 <code>FRA_L3MDEV</code> 策略规则，slave 接口的流量自动走对应路由表，不需要手写 iif/oif rule</li><li><strong>对应用透明</strong>：<code>ip vrf exec</code> 自动设置 <code>SO_BINDTODEVICE</code>，应用无需修改代码</li><li><strong>收包路径一致性</strong>：<code>vrf_ip_rcv()</code> 统一将 <code>skb->dev</code> 改为 VRF master，收包时 <code>dif</code> 和 <code>sdif</code> 都能正确匹配 socket</li></ol><h4 id=如何选择>如何选择？</h4><div class=table-wrapper><table><thead><tr><th>场景</th><th>推荐方案</th></tr></thead><tbody><tr><td>简单的多路由表，网段不重叠</td><td>ip rule 足够</td></tr><tr><td>网段不重叠，但想简化管理</td><td>VRF（省去 rule 维护）</td></tr><tr><td>网段重叠，只有转发流量</td><td>ip rule (iif) 足够</td></tr><tr><td>网段重叠，有本机发起流量</td><td>bind + oif rule 可行，VRF 管理更简单</td></tr><tr><td>大规模多租户/多接口隔离</td><td>VRF（rule/bind 管理成本过高）</td></tr></tbody></table></div><h3 id=42-vrf-与路由表的关系严格一对一>4.2 VRF 与路由表的关系——严格一对一</h3><p><strong>一个 VRF 只绑定一张路由表</strong>。创建 VRF 时通过 <code>table</code> 参数指定，之后不可更改：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl>ip link add vrf-red <span class=nb>type</span> vrf table <span class=m>10</span>    <span class=c1># vrf-red ↔ table 10，一对一</span>
+</span></span></code></pre></td></tr></table></div></div><p>内核中，<code>vrf_fib_table()</code> 直接返回创建时绑定的 <code>tb_id</code>（<code>drivers/net/vrf.c:1225</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>static</span> <span class=n>u32</span> <span class=nf>vrf_fib_table</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>net_device</span> <span class=o>*</span><span class=n>dev</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>net_vrf</span> <span class=o>*</span><span class=n>vrf</span> <span class=o>=</span> <span class=nf>netdev_priv</span><span class=p>(</span><span class=n>dev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>vrf</span><span class=o>-&gt;</span><span class=n>tb_id</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>但一个 VRF 可以挂多个网口</strong>。多个物理接口可以作为同一个 VRF 的 slave，共享同一张路由表：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl>ip link <span class=nb>set</span> eth1 master vrf-red    <span class=c1># eth1 加入 vrf-red，走 table 10</span>
+</span></span><span class=line><span class=cl>ip link <span class=nb>set</span> eth2 master vrf-red    <span class=c1># eth2 也加入 vrf-red，也走 table 10</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>┌─── Network Namespace (struct net) ──────────────────────────┐
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│  ┌── VRF &#34;red&#34; (tb_id=10) ──┐  ┌── VRF &#34;blue&#34; (tb_id=20) ─┐│
+</span></span><span class=line><span class=cl>│  │ eth1 ──→ FIB表 10        │  │ eth3 ──→ FIB表 20         ││
+</span></span><span class=line><span class=cl>│  │ eth2 ──→ FIB表 10        │  │ 10.0.0.0/8 → gateway_b   ││
+</span></span><span class=line><span class=cl>│  │ 10.0.0.0/8 → gateway_a   │  └───────────────────────────┘│
+</span></span><span class=line><span class=cl>│  └───────────────────────────┘                               │
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│  ┌── default (tb_id=254) ───┐                               │
+</span></span><span class=line><span class=cl>│  │ eth0 ──→ main FIB表      │                               │
+</span></span><span class=line><span class=cl>│  └───────────────────────────┘                               │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=43-核心数据结构>4.3 核心数据结构</h3><p>VRF 是一个 <strong>L3 master 虚拟网络设备</strong>，通过 <code>l3mdev_ops</code> 介入路由：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// drivers/net/vrf.c
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>net_vrf</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rtable</span> <span class=n>__rcu</span>  <span class=o>*</span><span class=n>rth</span><span class=p>;</span>    <span class=c1>// IPv4路由缓存
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>rt6_info</span> <span class=n>__rcu</span> <span class=o>*</span><span class=n>rt6</span><span class=p>;</span>   <span class=c1>// IPv6路由缓存
+</span></span></span><span class=line><span class=cl>    <span class=n>u32</span>                  <span class=n>tb_id</span><span class=p>;</span>   <span class=c1>// ★ 关联的FIB路由表ID（一对一）
+</span></span></span><span class=line><span class=cl>    <span class=kt>int</span>                  <span class=n>ifindex</span><span class=p>;</span> <span class=c1>// VRF设备的ifindex
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/l3mdev.h — L3 master device 操作表
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>l3mdev_ops</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>u32</span> <span class=p>(</span><span class=o>*</span><span class=n>l3mdev_fib_table</span><span class=p>)(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>net_device</span> <span class=o>*</span><span class=n>dev</span><span class=p>);</span> <span class=c1>// 返回FIB表ID
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=p>(</span><span class=o>*</span><span class=n>l3mdev_l3_rcv</span><span class=p>)(...);</span>   <span class=c1>// 收包钩子
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=p>(</span><span class=o>*</span><span class=n>l3mdev_l3_out</span><span class=p>)(...);</span>   <span class=c1>// 发包钩子
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// drivers/net/vrf.c — VRF注册的ops
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>const</span> <span class=k>struct</span> <span class=n>l3mdev_ops</span> <span class=n>vrf_l3mdev_ops</span> <span class=o>=</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>l3mdev_fib_table</span>  <span class=o>=</span> <span class=n>vrf_fib_table</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>l3mdev_l3_rcv</span>     <span class=o>=</span> <span class=n>vrf_l3_rcv</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>    <span class=p>.</span><span class=n>l3mdev_l3_out</span>     <span class=o>=</span> <span class=n>vrf_l3_out</span><span class=p>,</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=44-vrf-的创建与绑定>4.4 VRF 的创建与绑定</h3><p>VRF <strong>不绑定到进程</strong>，而是绑定到 <strong>网络接口</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 创建VRF设备并关联路由表</span>
+</span></span><span class=line><span class=cl>ip link add vrf-red <span class=nb>type</span> vrf table <span class=m>10</span>
+</span></span><span class=line><span class=cl>ip link <span class=nb>set</span> vrf-red up
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 将物理接口加入VRF</span>
+</span></span><span class=line><span class=cl>ip link <span class=nb>set</span> eth1 master vrf-red
+</span></span><span class=line><span class=cl><span class=c1># → eth1 成为 vrf-red 的 slave，路由查找走 table 10</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=45-应用程序如何使用-vrf>4.5 应用程序如何使用 VRF</h3><div class=table-wrapper><table><thead><tr><th>方式</th><th>应用程序是否需要修改</th><th>适用场景</th></tr></thead><tbody><tr><td><code>ip vrf exec vrf-a ./app</code></td><td><strong>不需要</strong></td><td>整个进程的所有流量走同一个 VRF</td></tr><tr><td><code>setsockopt(SO_BINDTODEVICE, "vrf-a")</code></td><td>需要知道 VRF 设备名</td><td>一个进程内不同 socket 走不同 VRF</td></tr><tr><td>不做任何处理</td><td>不需要</td><td>流量走默认路由表（不属于任何 VRF）</td></tr></tbody></table></div><p><code>ip vrf exec</code> 在启动进程前设置 <code>SO_BINDTODEVICE</code>，对应用程序完全透明：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 同一个 nginx，不改代码，分别服务两个路由域</span>
+</span></span><span class=line><span class=cl>ip vrf <span class=nb>exec</span> vrf-a nginx -c /etc/nginx/customer_a.conf
+</span></span><span class=line><span class=cl>ip vrf <span class=nb>exec</span> vrf-b nginx -c /etc/nginx/customer_b.conf
+</span></span></code></pre></td></tr></table></div></div><p>一个进程内需要同时访问多个路由域时，用 <code>setsockopt</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>int</span> <span class=n>fd_a</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(</span><span class=n>AF_INET</span><span class=p>,</span> <span class=n>SOCK_STREAM</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>fd_a</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_BINDTODEVICE</span><span class=p>,</span> <span class=s>&#34;vrf-a&#34;</span><span class=p>,</span> <span class=mi>6</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>fd_b</span> <span class=o>=</span> <span class=nf>socket</span><span class=p>(</span><span class=n>AF_INET</span><span class=p>,</span> <span class=n>SOCK_STREAM</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>fd_b</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_BINDTODEVICE</span><span class=p>,</span> <span class=s>&#34;vrf-b&#34;</span><span class=p>,</span> <span class=mi>6</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=c1>// fd_a connect(10.0.0.50) → table 10 → 客户A
+</span></span></span><span class=line><span class=cl><span class=c1>// fd_b connect(10.0.0.50) → table 20 → 客户B
+</span></span></span></code></pre></td></tr></table></div></div><h3 id=46-vrf-在内核中的生效路径>4.6 VRF 在内核中的生效路径</h3><h4 id=发送路径--socket-绑定-vrf>发送路径 — Socket 绑定 VRF</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 用户态
+</span></span></span><span class=line><span class=cl><span class=nf>setsockopt</span><span class=p>(</span><span class=n>fd</span><span class=p>,</span> <span class=n>SOL_SOCKET</span><span class=p>,</span> <span class=n>SO_BINDTODEVICE</span><span class=p>,</span> <span class=s>&#34;vrf-red&#34;</span><span class=p>,</span> <span class=mi>8</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// 内核 net/core/sock.c
+</span></span></span><span class=line><span class=cl><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span> <span class=o>=</span> <span class=n>ifindex</span><span class=p>;</span>  <span class=c1>// 保存VRF设备的ifindex
+</span></span></span></code></pre></td></tr></table></div></div><p>路由查找时，<code>sk_bound_dev_if</code> 决定走哪个 FIB 表：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/fib_rules.c:90 — __fib_lookup()
+</span></span></span><span class=line><span class=cl><span class=nf>l3mdev_update_flow</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=nf>flowi4_to_flowi</span><span class=p>(</span><span class=n>flp</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=c1>// → 如果 flowi4_oif 指向 VRF slave 设备，
+</span></span></span><span class=line><span class=cl><span class=c1>//   替换为 VRF master 的 ifindex
+</span></span></span><span class=line><span class=cl><span class=n>err</span> <span class=o>=</span> <span class=nf>fib_rules_lookup</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>rules_ops</span><span class=p>,</span> <span class=p>...);</span>
+</span></span><span class=line><span class=cl><span class=c1>// → 匹配到 VRF 的路由表
+</span></span></span></code></pre></td></tr></table></div></div><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/l3mdev/l3mdev.c:271 — l3mdev_update_flow()
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>l3mdev_update_flow</span><span class=p>(</span><span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span><span class=p>,</span> <span class=k>struct</span> <span class=n>flowi</span> <span class=o>*</span><span class=n>fl</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>fl</span><span class=o>-&gt;</span><span class=n>flowi_oif</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>dev</span> <span class=o>=</span> <span class=nf>dev_get_by_index_rcu</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>fl</span><span class=o>-&gt;</span><span class=n>flowi_oif</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=n>ifindex</span> <span class=o>=</span> <span class=nf>l3mdev_master_ifindex_rcu</span><span class=p>(</span><span class=n>dev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>ifindex</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>fl</span><span class=o>-&gt;</span><span class=n>flowi_oif</span> <span class=o>=</span> <span class=n>ifindex</span><span class=p>;</span>  <span class=c1>// 替换为VRF master
+</span></span></span><span class=line><span class=cl>            <span class=n>fl</span><span class=o>-&gt;</span><span class=n>flowi_flags</span> <span class=o>|=</span> <span class=n>FLOWI_FLAG_SKIP_NH_OIF</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h4 id=收包路径--vrf-在-l3-层介入>收包路径 — VRF 在 L3 层介入</h4><p>调用链：<code>ip_rcv</code> → <code>ip_rcv_core</code>（<code>IPCB(skb)->iif = skb->skb_iif</code>，保存原始 slave ifindex）→ PREROUTING → <code>ip_rcv_finish</code> → <code>l3mdev_ip_rcv</code> → <code>vrf_ip_rcv</code>。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// drivers/net/vrf.c:1444 — vrf_ip_rcv()
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=nf>vrf_ip_rcv</span><span class=p>(</span><span class=k>struct</span> <span class=n>net_device</span> <span class=o>*</span><span class=n>vrf_dev</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                  <span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>skb</span><span class=o>-&gt;</span><span class=n>dev</span> <span class=o>=</span> <span class=n>vrf_dev</span><span class=p>;</span>                     <span class=c1>// 入接口改为VRF master
+</span></span></span><span class=line><span class=cl>    <span class=n>skb</span><span class=o>-&gt;</span><span class=n>skb_iif</span> <span class=o>=</span> <span class=n>vrf_dev</span><span class=o>-&gt;</span><span class=n>ifindex</span><span class=p>;</span>        <span class=c1>// skb_iif 改为 VRF master
+</span></span></span><span class=line><span class=cl>    <span class=nf>IPCB</span><span class=p>(</span><span class=n>skb</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>flags</span> <span class=o>|=</span> <span class=n>IPSKB_L3SLAVE</span><span class=p>;</span>     <span class=c1>// 标记来自L3 slave
+</span></span></span><span class=line><span class=cl>    <span class=c1>// ★ 注意：IPCB(skb)-&gt;iif 保持不变（仍是原始 slave ifindex）
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 后续 inet_sdif(skb) 依赖 IPSKB_L3SLAVE 标记返回原始 slave ifindex
+</span></span></span><span class=line><span class=cl>    <span class=n>skb</span> <span class=o>=</span> <span class=nf>vrf_rcv_nfhook</span><span class=p>(</span><span class=n>NFPROTO_IPV4</span><span class=p>,</span> <span class=n>NF_INET_PRE_ROUTING</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=n>vrf_dev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>skb</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>vrf_ip_rcv()</code> <strong>不设置路由表 ID</strong>。路由表选择在后续的 <code>__fib_lookup()</code> 中由 <code>l3mdev_update_flow()</code> + <code>l3mdev_fib_rule_match()</code> 配合完成（见发送路径）。</p><h4 id=socket-匹配--inet_sk_bound_dev_eq非-sk_dev_equal_l3scope>Socket 匹配 — inet_sk_bound_dev_eq（非 sk_dev_equal_l3scope）</h4><p>TCP/UDP 收包时的 socket 匹配通过 <code>INET_MATCH()</code> → <code>inet_sk_bound_dev_eq()</code> 完成：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/inet_sock.h:144
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>bool</span> <span class=nf>inet_bound_dev_eq</span><span class=p>(</span><span class=kt>bool</span> <span class=n>l3mdev_accept</span><span class=p>,</span> <span class=kt>int</span> <span class=n>bound_dev_if</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                     <span class=kt>int</span> <span class=n>dif</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sdif</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>bound_dev_if</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=o>!</span><span class=n>sdif</span> <span class=o>||</span> <span class=n>l3mdev_accept</span><span class=p>;</span>      <span class=c1>// 未绑定：非 VRF 包或允许跨域
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>bound_dev_if</span> <span class=o>==</span> <span class=n>dif</span> <span class=o>||</span> <span class=n>bound_dev_if</span> <span class=o>==</span> <span class=n>sdif</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 已绑定：匹配 VRF master ifindex(dif) 或原始 slave ifindex(sdif)
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>收包时参数来源（<code>tcp_v4_rcv</code> 为例）：</p><ul><li><code>dif = inet_iif(skb)</code> → <code>skb->skb_iif</code>（已被 <code>vrf_ip_rcv</code> 改为 <strong>VRF master ifindex</strong>）</li><li><code>sdif = inet_sdif(skb)</code> → 检查 <code>IPSKB_L3SLAVE</code> 后返回 <code>IPCB(skb)->iif</code>（<strong>原始 slave ifindex</strong>）</li></ul><p>所以 socket 绑定 VRF master 设备名时 <code>bound_dev_if == dif</code> 匹配；绑定物理网口名时 <code>bound_dev_if == sdif</code> 匹配。</p><blockquote><p><strong>注意</strong>：<code>sk_dev_equal_l3scope()</code> 是另一个辅助函数，仅用于 <strong>IPv6 connect/setsockopt/sendmsg</strong> 中校验出接口与 socket 绑定设备的 L3 域一致性，<strong>不参与</strong> ehash/listen hash/UDP hash 的收包匹配。</p></blockquote><h3 id=47-全景本机如何区分相同网段两个网口的流量>4.7 全景：本机如何区分相同网段两个网口的流量</h3><p>VRF 的价值在于让路由表选择渗透到内核网络栈的每一个环节，形成完整的隔离链条：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>               eth1 (master=vrf-a)          eth2 (master=vrf-b)
+</span></span><span class=line><span class=cl>                 │                            │
+</span></span><span class=line><span class=cl>                 ▼                            ▼
+</span></span><span class=line><span class=cl>收包      skb-&gt;dev = vrf-a              skb-&gt;dev = vrf-b
+</span></span><span class=line><span class=cl>                 │                            │
+</span></span><span class=line><span class=cl>路由      table 10                       table 20
+</span></span><span class=line><span class=cl>                 │                            │
+</span></span><span class=line><span class=cl>socket    匹配绑定 vrf-a 的 socket       匹配绑定 vrf-b 的 socket
+</span></span><span class=line><span class=cl>                 │                            │
+</span></span><span class=line><span class=cl>应用      app_a (ip vrf exec vrf-a)     app_b (ip vrf exec vrf-b)
+</span></span><span class=line><span class=cl>                 │                            │
+</span></span><span class=line><span class=cl>发包      flowi_oif = vrf-a              flowi_oif = vrf-b
+</span></span><span class=line><span class=cl>                 │                            │
+</span></span><span class=line><span class=cl>出口      table 10 → eth1               table 20 → eth2
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong>收包</strong>：<code>vrf_ip_rcv()</code> 将 <code>skb->dev</code>/<code>skb_iif</code> 改为 VRF master，<code>IPCB->iif</code> 保持原始 slave → 后续 <code>__fib_lookup()</code> 中 <code>l3mdev_update_flow()</code> + <code>l3mdev_fib_rule_match()</code> 选对路由表</li><li><strong>socket 匹配</strong>：<code>inet_sk_bound_dev_eq()</code> 比较 <code>sk_bound_dev_if</code> 与 <code>dif</code>（VRF master）或 <code>sdif</code>（原始 slave），让绑定 VRF 的 socket 只接收对应接口的包</li><li><strong>发包</strong>：<code>l3mdev_update_flow()</code> 将 <code>flowi_oif</code> 替换为 VRF master 的 ifindex → <code>l3mdev_fib_rule_match()</code> 自动选对路由表</li></ul><p>三条路径每一步都通过 VRF 设备来区分流量。VRF 相比手动 ip rule 的核心优势在于：<strong>自动注册 <code>FRA_L3MDEV</code> 策略规则</strong>，将路由表选择从需要人工维护的 iif/oif rule 变成了内核自动完成的逻辑。</p><h3 id=48-vrf-与-network-namespace-的关系>4.8 VRF 与 Network Namespace 的关系</h3><ul><li>VRF 的 per-netns 数据通过 <code>register_pernet_subsys(&amp;vrf_net_ops)</code> 注册</li><li>每个 Network Namespace 有独立的 VRF 映射表 <code>struct netns_vrf</code></li><li>VRF <strong>不替代</strong> Namespace，而是在 Namespace <strong>内部</strong> 细分路由</li></ul><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// drivers/net/vrf.c:102
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>netns_vrf</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>bool</span> <span class=n>add_fib_rules</span><span class=p>;</span>        <span class=c1>// 是否已添加默认FIB规则
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>vrf_map</span> <span class=n>vmap</span><span class=p>;</span>       <span class=c1>// VRF table_id → ifindex 映射
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=49-三种方案对比>4.9 三种方案对比</h3><div class=table-wrapper><table><thead><tr><th>能力</th><th>ip rule (iif)</th><th>bind 真实网口 + oif rule</th><th>VRF</th></tr></thead><tbody><tr><td>转发流量选路由表</td><td><code>iif</code> rule 可做</td><td><code>iif</code> rule 可做</td><td>自动（<code>FRA_L3MDEV</code> rule）</td></tr><tr><td>本机发包选路由表</td><td><strong>不行</strong>（iif 无效）</td><td><code>oif</code> rule + bind 可做</td><td>自动</td></tr><tr><td>listener socket 区分</td><td>不行</td><td><code>sk_bound_dev_if</code> 可做</td><td>自动</td></tr><tr><td>已建立连接 socket 区分</td><td>不行</td><td><code>inet_sk_bound_dev_eq</code> 可做</td><td>自动</td></tr><tr><td>管理复杂度</td><td>N 组 iif rule</td><td>N 组 iif+oif rule + 每个 app bind</td><td>N 个 VRF 设备</td></tr><tr><td>应用程序改动</td><td>不需要</td><td>每个 app 需要 <code>SO_BINDTODEVICE</code></td><td>不需要（<code>ip vrf exec</code> 透明）</td></tr></tbody></table></div><p><strong>说明</strong>：经源码验证，<code>INET_MATCH()</code> 在 ehash 查找时通过 <code>inet_sk_bound_dev_eq()</code> <strong>会检查</strong> <code>sk_bound_dev_if</code>，所以 bind 到不同接口的 socket 在 ehash 中可以区分。VRF 相比方案二的核心优势不在于"解决 ehash 冲突"（方案二已经能做），而在于<strong>自动化和管理成本</strong>——无需手写 rule、无需每个应用都改代码。</p><h3 id=410-实战场景两个网口连相同网段但链路不通的路由器>4.10 实战场景：两个网口连相同网段但链路不通的路由器</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>         ┌──────────┐
+</span></span><span class=line><span class=cl>    eth1──┤  本机    ├──eth2
+</span></span><span class=line><span class=cl>         └──────────┘
+</span></span><span class=line><span class=cl>           │              │
+</span></span><span class=line><span class=cl>     ┌─────┴─────┐  ┌─────┴─────┐
+</span></span><span class=line><span class=cl>     │ 路由器 A   │  │ 路由器 B   │
+</span></span><span class=line><span class=cl>     │10.0.0.0/24│  │10.0.0.0/24│
+</span></span><span class=line><span class=cl>     └───────────┘  └───────────┘
+</span></span><span class=line><span class=cl>         (链路不通)
+</span></span></code></pre></td></tr></table></div></div><p>不用 VRF 时，两条 <code>10.0.0.0/24</code> 路由在 main 表中冲突。VRF 方案：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># 1. 创建两个 VRF</span>
+</span></span><span class=line><span class=cl>ip link add vrf-a <span class=nb>type</span> vrf table <span class=m>10</span>
+</span></span><span class=line><span class=cl>ip link add vrf-b <span class=nb>type</span> vrf table <span class=m>20</span>
+</span></span><span class=line><span class=cl>ip link <span class=nb>set</span> vrf-a up
+</span></span><span class=line><span class=cl>ip link <span class=nb>set</span> vrf-b up
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 2. 分别绑定网口</span>
+</span></span><span class=line><span class=cl>ip link <span class=nb>set</span> eth1 master vrf-a
+</span></span><span class=line><span class=cl>ip link <span class=nb>set</span> eth2 master vrf-b
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 3. 各自配置 IP 和路由（可以用相同网段）</span>
+</span></span><span class=line><span class=cl>ip addr add 10.0.0.1/24 dev eth1
+</span></span><span class=line><span class=cl>ip addr add 10.0.0.1/24 dev eth2
+</span></span><span class=line><span class=cl>ip route add default via 10.0.0.254 table <span class=m>10</span>
+</span></span><span class=line><span class=cl>ip route add default via 10.0.0.254 table <span class=m>20</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 4. 本机分别访问两个路由器</span>
+</span></span><span class=line><span class=cl>ip vrf <span class=nb>exec</span> vrf-a ping 10.0.0.100    <span class=c1># → 走 eth1 → 路由器A</span>
+</span></span><span class=line><span class=cl>ip vrf <span class=nb>exec</span> vrf-b ping 10.0.0.100    <span class=c1># → 走 eth2 → 路由器B</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># 5. 应用程序绑定 VRF</span>
+</span></span><span class=line><span class=cl>ip vrf <span class=nb>exec</span> vrf-a ./my_app           <span class=c1># my_app 所有流量走路由器A</span>
+</span></span><span class=line><span class=cl>ip vrf <span class=nb>exec</span> vrf-b ./my_app           <span class=c1># my_app 所有流量走路由器B</span>
+</span></span></code></pre></td></tr></table></div></div><p>路由器 A 的链路故障 <strong>不影响</strong> 通过 vrf-b 到路由器 B 的通信，因为两者走完全不同的路由表。</p><hr><h2 id=五层级关系与协作>五、层级关系与协作</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>Network Namespace (最大的网络隔离边界)
+</span></span><span class=line><span class=cl>  ├── 独立的设备列表、路由表、iptables规则
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  └── VRF (Namespace内部的路由细分)
+</span></span><span class=line><span class=cl>        ├── VRF &#34;red&#34; → FIB表10（可挂多个网口）
+</span></span><span class=line><span class=cl>        └── VRF &#34;blue&#34; → FIB表20（可挂多个网口）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>Cgroup (正交于上面两者，控制&#34;量&#34;而非&#34;可见性&#34;)
+</span></span><span class=line><span class=cl>  ├── net_cls: 给socket打classid → tc/iptables按组限速
+</span></span><span class=line><span class=cl>  └── net_prio: 给socket设优先级 → 网卡按优先级调度
+</span></span></code></pre></td></tr></table></div></div><h3 id=51-在收包路径中的生效位置>5.1 在收包路径中的生效位置</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>网卡 → 硬中断 → NAPI poll
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├── Network Namespace: dev_net(dev) 确定 struct net
+</span></span><span class=line><span class=cl>  │     → 决定进入哪个网络栈(路由表、iptables、socket哈希表)
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├── VRF: l3mdev_l3_rcv() 在 ip_rcv() 之后
+</span></span><span class=line><span class=cl>  │     → 替换 skb-&gt;dev 为 VRF master
+</span></span><span class=line><span class=cl>  │     → 路由查找使用 VRF 关联的 FIB 表
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  └── Cgroup: socket 匹配后
+</span></span><span class=line><span class=cl>        → sk-&gt;sk_cgrp_data 包含 classid/prioidx
+</span></span><span class=line><span class=cl>        → tc/netfilter 使用这些标签做流量控制
+</span></span></code></pre></td></tr></table></div></div><h3 id=52-典型使用场景>5.2 典型使用场景</h3><div class=table-wrapper><table><thead><tr><th>场景</th><th>使用的机制</th><th>原因</th></tr></thead><tbody><tr><td>Docker容器网络</td><td>Network Namespace</td><td>每个容器需要独立IP、路由、端口空间</td></tr><tr><td>K8s Pod资源限制</td><td>Cgroup (memory/cpu/pids)</td><td>限制Pod的CPU/内存/进程数</td></tr><tr><td>容器网络带宽限制</td><td>Cgroup (net_cls) + tc</td><td>classid标记 + tc限速</td></tr><tr><td>简单多路由表（网段不重叠）</td><td>ip rule + 多路由表</td><td>足够简单，不需要 VRF</td></tr><tr><td>运营商多租户路由（网段重叠）</td><td>VRF</td><td>自动路由表选择 + socket L3 scope 隔离</td></tr><tr><td>管理网/业务网分离</td><td>VRF 或 ip rule</td><td>VRF 管理更简单（<code>ip vrf exec</code>）</td></tr><tr><td>双网口连同网段设备</td><td>VRF</td><td>相同IP网段 + 本机发包 + 可能的四元组冲突</td></tr></tbody></table></div><h3 id=53-类比总结>5.3 类比总结</h3><ul><li><strong>Namespace</strong> = 不同的房子（看不到彼此的东西）</li><li><strong>Cgroup</strong> = 同一栋楼的水电配额（限制每户用多少）</li><li><strong>VRF</strong> = 同一座城市的不同道路系统（同一个地址走不同的路）</li></ul><hr><h2 id=六相关系统参数>六、相关系统参数</h2><div class=table-wrapper><table><thead><tr><th>参数</th><th>说明</th></tr></thead><tbody><tr><td><code>/proc/$PID/ns/</code></td><td>查看进程的各namespace文件描述符</td></tr><tr><td><code>/proc/$PID/cgroup</code></td><td>查看进程的cgroup归属</td></tr><tr><td><code>/sys/fs/cgroup/</code></td><td>cgroup 文件系统挂载点</td></tr><tr><td><code>ip netns list</code></td><td>列出所有Network Namespace</td></tr><tr><td><code>ip vrf show</code></td><td>列出所有VRF及其路由表</td></tr><tr><td><code>ip link show type vrf</code></td><td>列出VRF设备</td></tr><tr><td><code>/proc/sys/net/ipv4/tcp_l3mdev_accept</code></td><td>允许跨VRF接受TCP连接</td></tr></tbody></table></div><hr><h2 id=七调试工具>七、调试工具</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-bash data-lang=bash><span class=line><span class=cl><span class=c1># Namespace</span>
+</span></span><span class=line><span class=cl>nsenter -t <span class=nv>$PID</span> -n            <span class=c1># 进入进程的网络namespace</span>
+</span></span><span class=line><span class=cl>lsns                          <span class=c1># 列出所有namespace</span>
+</span></span><span class=line><span class=cl>unshare --net bash            <span class=c1># 创建新网络namespace</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># Cgroup</span>
+</span></span><span class=line><span class=cl>cat /proc/<span class=nv>$PID</span>/cgroup         <span class=c1># 查看进程cgroup</span>
+</span></span><span class=line><span class=cl>systemd-cgls                  <span class=c1># 树形显示cgroup层级</span>
+</span></span><span class=line><span class=cl>cat /sys/fs/cgroup/memory/XXX/memory.usage_in_bytes
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1># VRF</span>
+</span></span><span class=line><span class=cl>ip vrf <span class=nb>exec</span> vrf-red ping 10.0.0.1  <span class=c1># 在VRF中执行命令</span>
+</span></span><span class=line><span class=cl>ip route show table <span class=m>10</span>              <span class=c1># 查看VRF路由表</span>
+</span></span><span class=line><span class=cl>ip rule show                        <span class=c1># 查看路由策略规则</span>
+</span></span></code></pre></td></tr></table></div></div></section><footer class=article-footer><section class=article-tags><a href=/tags/namespace/>Namespace</a>
+<a href=/tags/cgroup/>Cgroup</a>
+<a href=/tags/vrf/>VRF</a>
+<a href=/tags/nsproxy/>Nsproxy</a>
+<a href=/tags/css_set/>Css_set</a>
+<a href=/tags/l3mdev/>L3mdev</a>
+<a href=/tags/%E5%AE%B9%E5%99%A8/>容器</a>
+<a href=/tags/%E8%B5%84%E6%BA%90%E9%9A%94%E7%A6%BB/>资源隔离</a>
+<a href=/tags/ip-rule/>Ip-Rule</a>
+<a href=/tags/policy-routing/>Policy-Routing</a>
+<a href=/tags/sock_net/>Sock_net</a>
+<a href=/tags/dev_net/>Dev_net</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/linux-5.15.78-%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E6%9E%B6%E6%9E%84%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>Linux 5.15.78 内核源码架构分析</h2></div></a></article><article><a href=/p/%E8%BF%9B%E7%A8%8B%E5%86%85%E6%A0%B8%E7%BB%93%E6%9E%84%E5%85%B3%E7%B3%BB-task_struct-%E5%8F%8A%E5%85%B6%E5%85%B3%E8%81%94%E5%AD%90%E7%B3%BB%E7%BB%9F/><div class=article-details><h2 class=article-title>进程内核结构关系 — task_struct 及其关联子系统</h2></div></a></article><article><a href=/p/linux-%E5%86%85%E6%A0%B8%E5%A6%82%E4%BD%95%E6%8E%A5%E7%AE%A1-cpu-%E4%B8%8E%E5%86%85%E5%AD%98%E4%BB%8E%E4%B8%8A%E7%94%B5%E5%88%B0%E5%AE%8C%E5%85%A8%E6%8E%8C%E6%8E%A7%E7%A1%AC%E4%BB%B6/><div class=article-details><h2 class=article-title>Linux 内核如何接管 CPU 与内存——从上电到完全掌控硬件</h2></div></a></article><article><a href=/p/rcu-%E4%B8%8E%E9%94%81%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>RCU 与锁机制源码深度分析</h2></div></a></article><article><a href=/p/ebpf-%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E5%88%86%E6%9E%90%E5%9F%BA%E4%BA%8E-linux-5.15.78-%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81/><div class=article-details><h2 class=article-title>eBPF 实现原理分析（基于 Linux 5.15.78 内核源码）</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

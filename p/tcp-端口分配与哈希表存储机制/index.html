@@ -1,0 +1,1397 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content='TCP 端口分配与哈希表存储机制 基于 Linux 5.15.78 源码\n本文从数据结构出发，先介绍 TCP 哈希表的整体架构和 socket 类型体系，再沿 connect() 调用链分析端口分配的完整流程，最后说明 TIME_WAIT 复用机制。每个环节紧密衔接，对应源码中的实际实现。\n1. TCP 哈希表架构 🎨 可视化：tcp_hashinfo 四表存储结构（交互式 SVG：ehash / bhash / lhash2 / listening_hash 的数组-链表层级对比 + nulls 哨兵演示）\nTCP 协议通过全局变量 tcp_hashinfo（类型 struct inet_hashinfo）管理所有 socket，其中包含 4 个哈希表，分别服务于不同的查找场景。\n1.1 为什么需要四个哈希表？——从问题出发 内核需要在不同场景下快速查找 socket，每个场景的"搜索条件"不同：\n1 2 3 4 5 6 7 8 场景1：收到一个数据包 [SrcIP:SrcPort → DstIP:DstPort] → 需要找到哪个 socket 在处理这条连接 → 按四元组查找 → ehash 场景2：用户调用 bind(port=80) → 需要检查端口80是否已被占用 → 按端口查找 → bhash 场景3：收到一个 SYN 包 [→ DstIP:DstPort] → 需要找到哪个 socket 在 listen 这个端口 → 按IP+端口查找 → lhash2 / listening_hash 一个哈希表无法同时满足这三种查询模式，所以内核用四个哈希表各司其职：\n'><title>TCP 端口分配与哈希表存储机制</title><link rel=canonical href=https://1bit2.github.io/p/tcp-%E7%AB%AF%E5%8F%A3%E5%88%86%E9%85%8D%E4%B8%8E%E5%93%88%E5%B8%8C%E8%A1%A8%E5%AD%98%E5%82%A8%E6%9C%BA%E5%88%B6/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP 端口分配与哈希表存储机制"><meta property='og:description' content='TCP 端口分配与哈希表存储机制 基于 Linux 5.15.78 源码\n本文从数据结构出发，先介绍 TCP 哈希表的整体架构和 socket 类型体系，再沿 connect() 调用链分析端口分配的完整流程，最后说明 TIME_WAIT 复用机制。每个环节紧密衔接，对应源码中的实际实现。\n1. TCP 哈希表架构 🎨 可视化：tcp_hashinfo 四表存储结构（交互式 SVG：ehash / bhash / lhash2 / listening_hash 的数组-链表层级对比 + nulls 哨兵演示）\nTCP 协议通过全局变量 tcp_hashinfo（类型 struct inet_hashinfo）管理所有 socket，其中包含 4 个哈希表，分别服务于不同的查找场景。\n1.1 为什么需要四个哈希表？——从问题出发 内核需要在不同场景下快速查找 socket，每个场景的"搜索条件"不同：\n1 2 3 4 5 6 7 8 场景1：收到一个数据包 [SrcIP:SrcPort → DstIP:DstPort] → 需要找到哪个 socket 在处理这条连接 → 按四元组查找 → ehash 场景2：用户调用 bind(port=80) → 需要检查端口80是否已被占用 → 按端口查找 → bhash 场景3：收到一个 SYN 包 [→ DstIP:DstPort] → 需要找到哪个 socket 在 listen 这个端口 → 按IP+端口查找 → lhash2 / listening_hash 一个哈希表无法同时满足这三种查询模式，所以内核用四个哈希表各司其职：\n'><meta property='og:url' content='https://1bit2.github.io/p/tcp-%E7%AB%AF%E5%8F%A3%E5%88%86%E9%85%8D%E4%B8%8E%E5%93%88%E5%B8%8C%E8%A1%A8%E5%AD%98%E5%82%A8%E6%9C%BA%E5%88%B6/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='端口'><meta property='article:tag' content='bhash'><meta property='article:tag' content='ehash'><meta property='article:tag' content='inet_bind_bucket'><meta property='article:published_time' content='2026-04-29T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-29T00:00:00+00:00'><meta name=twitter:title content="TCP 端口分配与哈希表存储机制"><meta name=twitter:description content='TCP 端口分配与哈希表存储机制 基于 Linux 5.15.78 源码\n本文从数据结构出发，先介绍 TCP 哈希表的整体架构和 socket 类型体系，再沿 connect() 调用链分析端口分配的完整流程，最后说明 TIME_WAIT 复用机制。每个环节紧密衔接，对应源码中的实际实现。\n1. TCP 哈希表架构 🎨 可视化：tcp_hashinfo 四表存储结构（交互式 SVG：ehash / bhash / lhash2 / listening_hash 的数组-链表层级对比 + nulls 哨兵演示）\nTCP 协议通过全局变量 tcp_hashinfo（类型 struct inet_hashinfo）管理所有 socket，其中包含 4 个哈希表，分别服务于不同的查找场景。\n1.1 为什么需要四个哈希表？——从问题出发 内核需要在不同场景下快速查找 socket，每个场景的"搜索条件"不同：\n1 2 3 4 5 6 7 8 场景1：收到一个数据包 [SrcIP:SrcPort → DstIP:DstPort] → 需要找到哪个 socket 在处理这条连接 → 按四元组查找 → ehash 场景2：用户调用 bind(port=80) → 需要检查端口80是否已被占用 → 按端口查找 → bhash 场景3：收到一个 SYN 包 [→ DstIP:DstPort] → 需要找到哪个 socket 在 listen 这个端口 → 按IP+端口查找 → lhash2 / listening_hash 一个哈希表无法同时满足这三种查询模式，所以内核用四个哈希表各司其职：\n'><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#1-tcp-哈希表架构>1. TCP 哈希表架构</a><ol><li><a href=#11-为什么需要四个哈希表从问题出发>1.1 为什么需要四个哈希表？——从问题出发</a></li><li><a href=#12-四个哈希表的物理结构内存布局>1.2 四个哈希表的物理结构（内存布局）</a><ol><li><a href=#ehash已建立连接查找表>ehash：已建立连接查找表</a></li><li><a href=#bhash端口绑定管理表>bhash：端口绑定管理表</a></li><li><a href=#listening_hash-与-lhash2监听查找表>listening_hash 与 lhash2：监听查找表</a></li></ol></li><li><a href=#13-socket-在各哈希表中的存在关系>1.3 socket 在各哈希表中的存在关系</a></li><li><a href=#14-socket-类型体系与强转机制>1.4 socket 类型体系与强转机制</a><ol><li><a href=#sock_common-伪继承>sock_common 伪继承</a></li><li><a href=#inet_timewait_sock-存在的意义>inet_timewait_sock 存在的意义</a></li><li><a href=#inet_timewait_death_row>inet_timewait_death_row</a></li></ol></li></ol></li><li><a href=#2-connect-端口分配流程>2. connect() 端口分配流程</a><ol><li><a href=#21-调用链>2.1 调用链</a></li><li><a href=#22-__inet_hash_connect-完整流程>2.2 __inet_hash_connect 完整流程</a><ol><li><a href=#图形化流程自动分配端口全过程>图形化流程：自动分配端口全过程</a></li><li><a href=#关键设计意图>关键设计意图</a></li></ol></li><li><a href=#23-端口选择的安全性设计>2.3 端口选择的安全性设计</a></li></ol></li><li><a href=#3-__inet_check_established四元组冲突检查>3. __inet_check_established：四元组冲突检查</a><ol><li><a href=#31-这个函数解决什么问题>3.1 这个函数解决什么问题？</a></li><li><a href=#32-执行流程图>3.2 执行流程图</a></li><li><a href=#33-完整源码>3.3 完整源码</a></li><li><a href=#34-举例说明>3.4 举例说明</a></li></ol></li><li><a href=#4-time_wait-复用机制>4. TIME_WAIT 复用机制</a><ol><li><a href=#41-为什么-time_wait-需要复用>4.1 为什么 TIME_WAIT 需要复用？</a></li><li><a href=#42-time_wait-的创建与销毁>4.2 TIME_WAIT 的创建与销毁</a></li><li><a href=#43-复用的安全性问题为什么不能无条件复用>4.3 复用的安全性问题——为什么不能无条件复用？</a></li><li><a href=#44-tcp_twsk_unique-复用条件源码>4.4 tcp_twsk_unique 复用条件源码</a></li><li><a href=#45-复用的完整流程时序>4.5 复用的完整流程时序</a></li></ol></li><li><a href=#5-端口复用三机制对比so_reuseaddr--so_reuseport--tcp_tw_reuse>5. 端口复用三机制对比：SO_REUSEADDR / SO_REUSEPORT / tcp_tw_reuse</a><ol><li><a href=#51-三者对比>5.1 三者对比</a></li><li><a href=#52-so_reuseaddr-的源码路径>5.2 SO_REUSEADDR 的源码路径</a></li><li><a href=#53-so_reuseport-的源码路径>5.3 SO_REUSEPORT 的源码路径</a></li><li><a href=#54-tcp_tw_reuse-的源码路径>5.4 tcp_tw_reuse 的源码路径</a></li><li><a href=#55-三者互不干扰的原因>5.5 三者互不干扰的原因</a></li></ol></li><li><a href=#6-socket-在哈希表中的生命周期>6. socket 在哈希表中的生命周期</a><ol><li><a href=#61-单个-socket-的双哈希表链接>6.1 单个 socket 的双哈希表链接</a></li><li><a href=#62-连接生命周期中的哈希表迁移>6.2 连接生命周期中的哈希表迁移</a></li></ol></li><li><a href=#附录-a-spin_lock_bh-与-spin_lock-的使用>附录 A. spin_lock_bh 与 spin_lock 的使用</a><ol><li><a href=#先理解背景谁会访问哈希表>先理解背景：谁会访问哈希表？</a></li><li><a href=#如果只用普通-spin_lock-会怎样死锁场景>如果只用普通 spin_lock 会怎样？——死锁场景</a></li><li><a href=#spin_lock_bh-的解决方案>spin_lock_bh 的解决方案</a></li><li><a href=#为什么-__inet_check_established-内部只用-spin_lock>为什么 __inet_check_established 内部只用 spin_lock？</a></li></ol></li><li><a href=#附录-b-源码文件索引>附录 B. 源码文件索引</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-%E7%AB%AF%E5%8F%A3%E5%88%86%E9%85%8D%E4%B8%8E%E5%93%88%E5%B8%8C%E8%A1%A8%E5%AD%98%E5%82%A8%E6%9C%BA%E5%88%B6/>TCP 端口分配与哈希表存储机制</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 29, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>20 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp-端口分配与哈希表存储机制>TCP 端口分配与哈希表存储机制</h1><blockquote><p>基于 Linux 5.15.78 源码</p></blockquote><p>本文从数据结构出发，先介绍 TCP 哈希表的整体架构和 socket 类型体系，再沿 <code>connect()</code> 调用链分析端口分配的完整流程，最后说明 TIME_WAIT 复用机制。每个环节紧密衔接，对应源码中的实际实现。</p><hr><h2 id=1-tcp-哈希表架构>1. TCP 哈希表架构</h2><blockquote><p>🎨 <strong>可视化</strong>：<a class=link href=tcp_hashinfo%e5%9b%9b%e8%a1%a8%e5%8f%af%e8%a7%86%e5%8c%96.html>tcp_hashinfo 四表存储结构</a>（交互式 SVG：ehash / bhash / lhash2 / listening_hash 的数组-链表层级对比 + nulls 哨兵演示）</p></blockquote><p>TCP 协议通过全局变量 <code>tcp_hashinfo</code>（类型 <code>struct inet_hashinfo</code>）管理所有 socket，其中包含 4 个哈希表，分别服务于不同的查找场景。</p><h3 id=11-为什么需要四个哈希表从问题出发>1.1 为什么需要四个哈希表？——从问题出发</h3><p>内核需要在不同场景下快速查找 socket，每个场景的"搜索条件"不同：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>场景1：收到一个数据包 [SrcIP:SrcPort → DstIP:DstPort]
+</span></span><span class=line><span class=cl>  → 需要找到哪个 socket 在处理这条连接 → 按四元组查找 → ehash
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>场景2：用户调用 bind(port=80)
+</span></span><span class=line><span class=cl>  → 需要检查端口80是否已被占用 → 按端口查找 → bhash
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>场景3：收到一个 SYN 包 [→ DstIP:DstPort]
+</span></span><span class=line><span class=cl>  → 需要找到哪个 socket 在 listen 这个端口 → 按IP+端口查找 → lhash2 / listening_hash
+</span></span></code></pre></td></tr></table></div></div><p>一个哈希表无法同时满足这三种查询模式，所以内核用四个哈希表各司其职：</p><div class=table-wrapper><table><thead><tr><th>哈希表</th><th>解决什么问题</th><th>哈希键</th><th>类比</th></tr></thead><tbody><tr><td><strong>ehash</strong></td><td>数据包进来，找到对应连接</td><td>四元组(本地IP:端口+远端IP:端口)</td><td>通讯录：按"姓名+电话"精确查人</td></tr><tr><td><strong>bhash</strong></td><td>bind/connect时，检查端口冲突</td><td>本地端口</td><td>车位登记簿：按"车位号"查谁在用</td></tr><tr><td><strong>listening_hash</strong></td><td>SYN包进来，找监听socket(旧)</td><td>本地端口</td><td>前台总机：按"分机号"转接</td></tr><tr><td><strong>lhash2</strong></td><td>SYN包进来，找监听socket(新)</td><td>本地IP+端口</td><td>前台总机升级版：按"楼层+分机号"精确转接</td></tr></tbody></table></div><h3 id=12-四个哈希表的物理结构内存布局>1.2 四个哈希表的物理结构（内存布局）</h3><p>下图展示 <code>tcp_hashinfo</code> 的完整内存布局：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                        tcp_hashinfo (struct inet_hashinfo)
+</span></span><span class=line><span class=cl>                        ┌───────────────────────────────────────┐
+</span></span><span class=line><span class=cl>                        │                                       │
+</span></span><span class=line><span class=cl>  ┌─────────────────────┤  *ehash ──→ 动态分配的桶数组          │
+</span></span><span class=line><span class=cl>  │                     │  *ehash_locks ──→ 分离锁数组          │
+</span></span><span class=line><span class=cl>  │                     │   ehash_mask = 桶数 - 1               │
+</span></span><span class=line><span class=cl>  │                     │   ehash_locks_mask = 锁数 - 1         │
+</span></span><span class=line><span class=cl>  │                     │                                       │
+</span></span><span class=line><span class=cl>  │  ┌──────────────────┤  *bhash ──→ 动态分配的桶数组          │
+</span></span><span class=line><span class=cl>  │  │                  │   bhash_size = 桶数                   │
+</span></span><span class=line><span class=cl>  │  │                  │  *bind_bucket_cachep ──→ slab缓存     │
+</span></span><span class=line><span class=cl>  │  │                  │                                       │
+</span></span><span class=line><span class=cl>  │  │  ┌───────────────┤  *lhash2 ──→ 动态分配的桶数组         │
+</span></span><span class=line><span class=cl>  │  │  │               │   lhash2_mask = 桶数 - 1              │
+</span></span><span class=line><span class=cl>  │  │  │               │                                       │
+</span></span><span class=line><span class=cl>  │  │  │  ┌────────────┤   listening_hash[32] (内联数组)       │
+</span></span><span class=line><span class=cl>  │  │  │  │            └───────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  │  │  │  │
+</span></span><span class=line><span class=cl>  ▼  ▼  ▼  ▼
+</span></span><span class=line><span class=cl>四个哈希表的桶数组 (下文逐一展开)
+</span></span></code></pre></td></tr></table></div></div><h4 id=ehash已建立连接查找表>ehash：已建立连接查找表</h4><p>收到数据包时，内核需要在纳秒级找到对应的 socket。ehash 通过四元组哈希实现 O(1) 查找。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>ehash 桶数组                        ehash_locks 锁数组
+</span></span><span class=line><span class=cl>(inet_ehash_bucket[])               (spinlock_t[])
+</span></span><span class=line><span class=cl>                                    锁和桶是 多对一 关系
+</span></span><span class=line><span class=cl>桶[0]  ─chain→ sk ──→ tw ──→ NULLS(0)     ┐
+</span></span><span class=line><span class=cl>桶[1]  ─chain→ NULLS(1)                     ├─ 共享 lock[0]
+</span></span><span class=line><span class=cl>桶[2]  ─chain→ sk ──→ NULLS(2)             ┘
+</span></span><span class=line><span class=cl>桶[3]  ─chain→ sk ──→ sk ──→ NULLS(3)     ─── lock[1]
+</span></span><span class=line><span class=cl>...
+</span></span><span class=line><span class=cl>桶[N-1]─chain→ NULLS(N-1)                  ─── lock[M-1]
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>桶索引 = inet_ehashfn(net, 本地IP, 本地端口, 远端IP, 远端端口) &amp; ehash_mask
+</span></span><span class=line><span class=cl>锁索引 = 同一个hash值 &amp; ehash_locks_mask
+</span></span></code></pre></td></tr></table></div></div><p><strong>关键设计细节</strong>：</p><ul><li><strong>nulls 链表</strong>：链表尾部不是 NULL，而是编码了桶号的特殊值。RCU 无锁遍历时，如果发现尾部桶号和预期不符，说明节点在遍历过程中被移到了别的桶，需要重新查找。这是一种无锁并发安全保证。</li><li><strong>分离锁</strong>：锁的数量远少于桶的数量（比如 1024 把锁管理 65536 个桶），每把锁保护 64 个桶。这样锁数组只占几 KB，而不是几百 KB。代价是不同桶可能竞争同一把锁，但由于四元组哈希分布均匀，实际冲突率很低。</li><li><strong>桶中混合存放</strong> sock 和 inet_timewait_sock，两者都通过 <code>sock_common</code> 里的 <code>skc_nulls_node</code> 链入。</li></ul><h4 id=bhash端口绑定管理表>bhash：端口绑定管理表</h4><p>bind/connect 时需要检查端口是否可用。bhash 是<strong>两级索引</strong>：先按端口找桶，桶内按端口找 <code>bind_bucket</code>，每个 <code>bind_bucket</code> 挂所有使用该端口的 socket。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>bhash 桶数组 (inet_bind_hashbucket[])
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ 桶[0]: lock + chain                                      │
+</span></span><span class=line><span class=cl>│        chain → bind_bucket(port=80) → bind_bucket(port=8192) → NULL │
+</span></span><span class=line><span class=cl>│                  │ fastreuse=1            │ fastreuse=-1            │
+</span></span><span class=line><span class=cl>│                  │ owners:                │ owners:                 │
+</span></span><span class=line><span class=cl>│                  │  sk_A(LISTEN) → sk_B   │  sk_C(ESTAB)           │
+</span></span><span class=line><span class=cl>│                  │  (两个进程都listen:80)  │  (connect用了8192)     │
+</span></span><span class=line><span class=cl>│                  │                        │                         │
+</span></span><span class=line><span class=cl>│ 注意: port=80 和 port=8192 之所以在同一个桶, 是因为哈希冲突,     │
+</span></span><span class=line><span class=cl>│       不是因为它们有关系                                           │
+</span></span><span class=line><span class=cl>├──────────────────────────────────────────────────────────┤
+</span></span><span class=line><span class=cl>│ 桶[1]: lock + chain → ...                               │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>桶索引 = (port + net_hash_mix(net)) &amp; (bhash_size - 1)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>查找路径:
+</span></span><span class=line><span class=cl>  1. 计算桶索引 → 定位到桶
+</span></span><span class=line><span class=cl>  2. 遍历桶内 chain 链表 → 逐个比较 (net, l3mdev, port)
+</span></span><span class=line><span class=cl>  3. 找到 bind_bucket → 检查 owners 链表中是否有冲突的socket
+</span></span></code></pre></td></tr></table></div></div><p><strong>核心不变量</strong>：每个 <code>(net, l3mdev, port)</code> 三元组最多一个 <code>bind_bucket</code>。所有创建路径（<code>inet_csk_get_port</code>、<code>__inet_hash_connect</code>）都遵循"先查找、不存在才创建"。</p><h4 id=listening_hash-与-lhash2监听查找表>listening_hash 与 lhash2：监听查找表</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>listening_hash (固定32桶, 仅按端口哈希, 旧机制)
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ 桶[80%32=16]: sk(LISTEN 0.0.0.0:80) → sk(LISTEN 10.0.0.1:80)│
+</span></span><span class=line><span class=cl>│               同端口不同地址全在一桶, 需遍历                     │
+</span></span><span class=line><span class=cl>│ 缺点: 同一端口大量虚拟主机时, 链表很长                          │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>lhash2 (动态桶数, 按IP+端口哈希, 新机制)
+</span></span><span class=line><span class=cl>┌─────────────────────────────────┬─────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ 桶[hash(0.0.0.0, 80)]          │ 桶[hash(10.0.0.1, 80)]          │
+</span></span><span class=line><span class=cl>│  → sk(LISTEN 0.0.0.0:80)       │  → sk(LISTEN 10.0.0.1:80)       │
+</span></span><span class=line><span class=cl>│  (通配地址单独一桶)             │  (具体地址单独一桶, O(1)查找)    │
+</span></span><span class=line><span class=cl>└─────────────────────────────────┴─────────────────────────────────┘
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>收包查找策略: 先查 lhash2[hash(具体IP, 端口)] → 没找到 → 再查 lhash2[hash(0.0.0.0, 端口)]
+</span></span></code></pre></td></tr></table></div></div><h3 id=13-socket-在各哈希表中的存在关系>1.3 socket 在各哈希表中的存在关系</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>状态              bhash    ehash    listening_hash + lhash2
+</span></span><span class=line><span class=cl>─────────────────────────────────────────────────────────
+</span></span><span class=line><span class=cl>bind()后            ✓        ✗              ✗
+</span></span><span class=line><span class=cl>listen()后          ✓        ✗              ✓
+</span></span><span class=line><span class=cl>connect()后         ✓        ✓              ✗
+</span></span><span class=line><span class=cl>ESTABLISHED         ✓        ✓              ✗
+</span></span><span class=line><span class=cl>TIME_WAIT           ✓        ✓              ✗
+</span></span><span class=line><span class=cl>close()/超时后     全部移除
+</span></span></code></pre></td></tr></table></div></div><hr><h3 id=14-socket-类型体系与强转机制>1.4 socket 类型体系与强转机制</h3><blockquote><p>理解端口分配流程前，需要先了解 <code>struct sock</code> 和 <code>inet_timewait_sock</code> 的关系，因为它们共存于 ehash 和 bhash 中。</p></blockquote><h4 id=sock_common-伪继承>sock_common 伪继承</h4><p>Linux 内核中不同类型的 socket 结构都以 <code>struct sock_common</code> 作为第一个成员（偏移量 0），形成 C 语言的"伪继承"：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>sock_common (公共基类: 地址、端口、哈希值、链表节点)
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ├── struct sock → inet_sock → inet_connection_sock → tcp_sock
+</span></span><span class=line><span class=cl>    │   (完整socket, ~2KB+, 用于活跃连接)
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    └── struct inet_timewait_sock → tcp_timewait_sock
+</span></span><span class=line><span class=cl>        (轻量socket, 仅保留哈希表+定时器字段, 用于TIME_WAIT状态)
+</span></span></code></pre></td></tr></table></div></div><p><code>sock_common</code> 中包含了哈希表操作所需的全部字段，两种 socket 通过不同别名访问同一偏移：</p><div class=table-wrapper><table><thead><tr><th>sock_common 字段</th><th>sock 别名</th><th>timewait 别名</th><th>用途</th></tr></thead><tbody><tr><td><code>skc_addrpair</code></td><td><code>sk_addrpair</code></td><td>—</td><td>地址对(64位打包, 快速比较)</td></tr><tr><td><code>skc_portpair</code></td><td><code>sk_portpair</code></td><td>—</td><td>端口对(32位打包, 快速比较)</td></tr><tr><td><code>skc_hash</code></td><td><code>sk_hash</code></td><td><code>tw_hash</code></td><td>ehash 哈希值</td></tr><tr><td><code>skc_nulls_node</code></td><td><code>sk_nulls_node</code></td><td><code>tw_node</code></td><td>ehash 链表节点</td></tr><tr><td><code>skc_bind_node</code></td><td><code>sk_bind_node</code></td><td><code>tw_bind_node</code></td><td>bhash 链表节点</td></tr></tbody></table></div><p>因此 <code>inet_twsk()</code> 可以安全地将 <code>struct sock *</code> 强转为 <code>inet_timewait_sock *</code>，<code>INET_MATCH</code> 宏可以同时匹配两种类型。源码中有明确的互相约束注释，禁止在 <code>sock_common</code> 之前添加任何字段。</p><h4 id=inet_timewait_sock-存在的意义>inet_timewait_sock 存在的意义</h4><p>TIME_WAIT 状态需要持续 2MSL（通常 60 秒），但不需要完整 <code>tcp_sock</code> 的全部字段。<code>inet_timewait_sock</code> 只保留最小字段集，专有字段包括：</p><ul><li><code>tw_timer</code>：2MSL 定时器</li><li><code>tw_tb</code>：指向 bhash 中的 <code>inet_bind_bucket</code>（反向指针）</li><li><code>tw_dr</code>：指向 <code>inet_timewait_death_row</code>（TIME_WAIT 全局管理器）</li></ul><h4 id=inet_timewait_death_row>inet_timewait_death_row</h4><p><code>inet_timewait_death_row</code> 管理一个协议中所有 TIME_WAIT socket 的生命周期。TCP 的实例是每个网络命名空间一个（<code>net->ipv4.tcp_death_row</code>）。</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/netns/ipv4.h
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>inet_timewait_death_row</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>atomic_t</span>         <span class=n>tw_count</span><span class=p>;</span>              <span class=c1>// 当前TIME_WAIT总数(高频原子操作)
+</span></span></span><span class=line><span class=cl>    <span class=kt>char</span>             <span class=n>tw_pad</span><span class=p>[...];</span>           <span class=c1>// 缓存行填充, 隔离高频写和低频读
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_hashinfo</span> <span class=o>*</span><span class=n>hashinfo</span><span class=p>;</span>         <span class=c1>// 指向tcp_hashinfo, 用于访问ehash/bhash
+</span></span></span><span class=line><span class=cl>    <span class=kt>int</span>              <span class=n>sysctl_max_tw_buckets</span><span class=p>;</span> <span class=c1>// 上限, 默认=ehash桶数/2
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span></code></pre></td></tr></table></div></div><p>当 <code>tw_count >= sysctl_max_tw_buckets</code> 时，<code>inet_twsk_alloc()</code> 拒绝创建新的 TIME_WAIT，直接关闭连接。</p><hr><hr><h2 id=2-connect-端口分配流程>2. connect() 端口分配流程</h2><h3 id=21-调用链>2.1 调用链</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户空间: connect(sockfd, addr, addrlen)
+</span></span><span class=line><span class=cl>  → __sys_connect()
+</span></span><span class=line><span class=cl>    → tcp_v4_connect(sk, uaddr, addr_len)
+</span></span><span class=line><span class=cl>      // 设置 sk-&gt;inet_daddr, sk-&gt;inet_dport (远端地址和端口)
+</span></span><span class=line><span class=cl>      // 计算 port_offset = secure_ipv4_port_ephemeral(rcv_saddr, daddr, dport)
+</span></span><span class=line><span class=cl>      → inet_hash_connect(&amp;net-&gt;ipv4.tcp_death_row, sk)
+</span></span><span class=line><span class=cl>        → __inet_hash_connect(death_row, sk, port_offset, __inet_check_established)
+</span></span></code></pre></td></tr></table></div></div><h3 id=22-__inet_hash_connect-完整流程>2.2 __inet_hash_connect 完整流程</h3><p><code>__inet_hash_connect()</code> 是端口分配的核心函数（<code>net/ipv4/inet_hashtables.c</code>），分两种情况处理：</p><p><strong>情况一：已通过 bind() 绑定端口</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=kt>int</span> <span class=nf>__inet_hash_connect</span><span class=p>(</span><span class=k>struct</span> <span class=n>inet_timewait_death_row</span> <span class=o>*</span><span class=n>death_row</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>u64</span> <span class=n>port_offset</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=kt>int</span> <span class=p>(</span><span class=o>*</span><span class=n>check_established</span><span class=p>)(...))</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>port</span> <span class=o>=</span> <span class=nf>inet_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>inet_num</span><span class=p>;</span>  <span class=c1>// 已绑定的端口(0表示未绑定)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>port</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 定位 bhash 桶, 获取之前 bind() 时关联的 bind_bucket
+</span></span></span><span class=line><span class=cl>        <span class=n>head</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>hinfo</span><span class=o>-&gt;</span><span class=n>bhash</span><span class=p>[</span><span class=nf>inet_bhashfn</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>port</span><span class=p>,</span> <span class=n>hinfo</span><span class=o>-&gt;</span><span class=n>bhash_size</span><span class=p>)];</span>
+</span></span><span class=line><span class=cl>        <span class=n>tb</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_bind_hash</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=nf>spin_lock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 快速路径: bind_bucket 中只有自己, 无需冲突检查
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>sk_head</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>owners</span><span class=p>)</span> <span class=o>==</span> <span class=n>sk</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bind_node</span><span class=p>.</span><span class=n>next</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=nf>inet_ehash_nolisten</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>  <span class=c1>// 直接加入 ehash
+</span></span></span><span class=line><span class=cl>            <span class=nf>spin_unlock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=nf>spin_unlock</span><span class=p>(</span><span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 慢速路径: 需要检查四元组是否与已建立连接冲突
+</span></span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=nf>check_established</span><span class=p>(</span><span class=n>death_row</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=n>port</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>local_bh_enable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ... 情况二: 自动分配端口
+</span></span></span></code></pre></td></tr></table></div></div><p><strong>情况二：自动分配端口（核心路径）</strong></p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl>    <span class=c1>// 获取临时端口范围, 默认 [32768, 60999]
+</span></span></span><span class=line><span class=cl>    <span class=nf>inet_get_local_port_range</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>low</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>high</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>high</span><span class=o>++</span><span class=p>;</span>                    <span class=c1>// 转为左闭右开 [32768, 61000)
+</span></span></span><span class=line><span class=cl>    <span class=n>remaining</span> <span class=o>=</span> <span class=n>high</span> <span class=o>-</span> <span class=n>low</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>likely</span><span class=p>(</span><span class=n>remaining</span> <span class=o>&gt;</span> <span class=mi>1</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=n>remaining</span> <span class=o>&amp;=</span> <span class=o>~</span><span class=mi>1U</span><span class=p>;</span>     <span class=c1>// 确保偶数(便于奇偶分离)
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 计算起始偏移: 结合扰动表和四元组哈希, 实现端口随机化(RFC 6056)
+</span></span></span><span class=line><span class=cl>    <span class=n>index</span> <span class=o>=</span> <span class=n>port_offset</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>INET_TABLE_PERTURB_SIZE</span> <span class=o>-</span> <span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>offset</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>table_perturb</span><span class=p>[</span><span class=n>index</span><span class=p>])</span> <span class=o>+</span> <span class=p>(</span><span class=n>port_offset</span> <span class=o>&gt;&gt;</span> <span class=mi>32</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>offset</span> <span class=o>%=</span> <span class=n>remaining</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>offset</span> <span class=o>&amp;=</span> <span class=o>~</span><span class=mi>1U</span><span class=p>;</span>            <span class=c1>// connect()优先选偶数端口, bind()优先选奇数, 减少竞争
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>other_parity_scan</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=n>port</span> <span class=o>=</span> <span class=n>low</span> <span class=o>+</span> <span class=n>offset</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>for</span> <span class=p>(</span><span class=n>i</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span> <span class=n>i</span> <span class=o>&lt;</span> <span class=n>remaining</span><span class=p>;</span> <span class=n>i</span> <span class=o>+=</span> <span class=mi>2</span><span class=p>,</span> <span class=n>port</span> <span class=o>+=</span> <span class=mi>2</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>unlikely</span><span class=p>(</span><span class=n>port</span> <span class=o>&gt;=</span> <span class=n>high</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=n>port</span> <span class=o>-=</span> <span class=n>remaining</span><span class=p>;</span>             <span class=c1>// 环绕处理
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>inet_is_local_reserved_port</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>port</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=k>continue</span><span class=p>;</span>                      <span class=c1>// 跳过保留端口
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=n>head</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>hinfo</span><span class=o>-&gt;</span><span class=n>bhash</span><span class=p>[</span><span class=nf>inet_bhashfn</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>port</span><span class=p>,</span> <span class=n>hinfo</span><span class=o>-&gt;</span><span class=n>bhash_size</span><span class=p>)];</span>
+</span></span><span class=line><span class=cl>        <span class=nf>spin_lock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 在 bhash 桶中查找该端口的 bind_bucket
+</span></span></span><span class=line><span class=cl>        <span class=nf>inet_bind_bucket_for_each</span><span class=p>(</span><span class=n>tb</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>chain</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=nf>net_eq</span><span class=p>(</span><span class=nf>ib_net</span><span class=p>(</span><span class=n>tb</span><span class=p>),</span> <span class=n>net</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=n>tb</span><span class=o>-&gt;</span><span class=n>l3mdev</span> <span class=o>==</span> <span class=n>l3mdev</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>                <span class=n>tb</span><span class=o>-&gt;</span><span class=n>port</span> <span class=o>==</span> <span class=n>port</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                <span class=c1>// 找到了: 该端口已被使用
+</span></span></span><span class=line><span class=cl>                <span class=c1>// fastreuse &gt;= 0 表示被 bind() 占用, connect 不能复用
+</span></span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>(</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>fastreuse</span> <span class=o>&gt;=</span> <span class=mi>0</span> <span class=o>||</span> <span class=n>tb</span><span class=o>-&gt;</span><span class=n>fastreuseport</span> <span class=o>&gt;=</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                    <span class=k>goto</span> <span class=n>next_port</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=c1>// fastreuse == -1: 被其他 connect() 使用, 检查四元组是否冲突
+</span></span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>check_established</span><span class=p>(</span><span class=n>death_row</span><span class=p>,</span> <span class=n>sk</span><span class=p>,</span> <span class=n>port</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tw</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>                    <span class=k>goto</span> <span class=n>ok</span><span class=p>;</span>   <span class=c1>// 四元组不同, 可以复用同一端口
+</span></span></span><span class=line><span class=cl>                <span class=k>goto</span> <span class=n>next_port</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 循环结束未找到: 端口全新未使用, 创建新 bind_bucket
+</span></span></span><span class=line><span class=cl>        <span class=n>tb</span> <span class=o>=</span> <span class=nf>inet_bind_bucket_create</span><span class=p>(</span><span class=n>hinfo</span><span class=o>-&gt;</span><span class=n>bind_bucket_cachep</span><span class=p>,</span> <span class=n>net</span><span class=p>,</span> <span class=n>head</span><span class=p>,</span> <span class=n>port</span><span class=p>,</span> <span class=n>l3mdev</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>tb</span><span class=p>)</span> <span class=p>{</span> <span class=nf>spin_unlock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>);</span> <span class=k>return</span> <span class=o>-</span><span class=n>ENOMEM</span><span class=p>;</span> <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=n>tb</span><span class=o>-&gt;</span><span class=n>fastreuse</span> <span class=o>=</span> <span class=o>-</span><span class=mi>1</span><span class=p>;</span>        <span class=c1>// 标记为 connect() 专用
+</span></span></span><span class=line><span class=cl>        <span class=n>tb</span><span class=o>-&gt;</span><span class=n>fastreuseport</span> <span class=o>=</span> <span class=o>-</span><span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>ok</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nl>next_port</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>        <span class=nf>spin_unlock_bh</span><span class=p>(</span><span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>cond_resched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 偶数端口搜完, 尝试奇数端口
+</span></span></span><span class=line><span class=cl>    <span class=n>offset</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>((</span><span class=n>offset</span> <span class=o>&amp;</span> <span class=mi>1</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=n>remaining</span> <span class=o>&gt;</span> <span class=mi>1</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>other_parity_scan</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=o>-</span><span class=n>EADDRNOTAVAIL</span><span class=p>;</span>     <span class=c1>// 端口耗尽
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>ok</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// 更新扰动表, 增加下次选择的随机性
+</span></span></span><span class=line><span class=cl>    <span class=n>i</span> <span class=o>=</span> <span class=kt>max_t</span><span class=p>(</span><span class=kt>int</span><span class=p>,</span> <span class=n>i</span><span class=p>,</span> <span class=p>(</span><span class=nf>prandom_u32</span><span class=p>()</span> <span class=o>&amp;</span> <span class=mi>7</span><span class=p>)</span> <span class=o>*</span> <span class=mi>2</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>WRITE_ONCE</span><span class=p>(</span><span class=n>table_perturb</span><span class=p>[</span><span class=n>index</span><span class=p>],</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>table_perturb</span><span class=p>[</span><span class=n>index</span><span class=p>])</span> <span class=o>+</span> <span class=n>i</span> <span class=o>+</span> <span class=mi>2</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>inet_bind_hash</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>tb</span><span class=p>,</span> <span class=n>port</span><span class=p>);</span>              <span class=c1>// 加入 bhash
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>sk_unhashed</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>inet_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>inet_sport</span> <span class=o>=</span> <span class=nf>htons</span><span class=p>(</span><span class=n>port</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>inet_ehash_nolisten</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tw</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>  <span class=c1>// 加入 ehash
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tw</span><span class=p>)</span> <span class=nf>inet_twsk_bind_unhash</span><span class=p>(</span><span class=n>tw</span><span class=p>,</span> <span class=n>hinfo</span><span class=p>);</span>  <span class=c1>// 复用了TIME_WAIT, 解除其bhash绑定
+</span></span></span><span class=line><span class=cl>    <span class=nf>spin_unlock</span><span class=p>(</span><span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tw</span><span class=p>)</span> <span class=nf>inet_twsk_deschedule_put</span><span class=p>(</span><span class=n>tw</span><span class=p>);</span>       <span class=c1>// 释放TIME_WAIT socket
+</span></span></span><span class=line><span class=cl>    <span class=nf>local_bh_enable</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h4 id=图形化流程自动分配端口全过程>图形化流程：自动分配端口全过程</h4><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>  1
+</span><span class=lnt>  2
+</span><span class=lnt>  3
+</span><span class=lnt>  4
+</span><span class=lnt>  5
+</span><span class=lnt>  6
+</span><span class=lnt>  7
+</span><span class=lnt>  8
+</span><span class=lnt>  9
+</span><span class=lnt> 10
+</span><span class=lnt> 11
+</span><span class=lnt> 12
+</span><span class=lnt> 13
+</span><span class=lnt> 14
+</span><span class=lnt> 15
+</span><span class=lnt> 16
+</span><span class=lnt> 17
+</span><span class=lnt> 18
+</span><span class=lnt> 19
+</span><span class=lnt> 20
+</span><span class=lnt> 21
+</span><span class=lnt> 22
+</span><span class=lnt> 23
+</span><span class=lnt> 24
+</span><span class=lnt> 25
+</span><span class=lnt> 26
+</span><span class=lnt> 27
+</span><span class=lnt> 28
+</span><span class=lnt> 29
+</span><span class=lnt> 30
+</span><span class=lnt> 31
+</span><span class=lnt> 32
+</span><span class=lnt> 33
+</span><span class=lnt> 34
+</span><span class=lnt> 35
+</span><span class=lnt> 36
+</span><span class=lnt> 37
+</span><span class=lnt> 38
+</span><span class=lnt> 39
+</span><span class=lnt> 40
+</span><span class=lnt> 41
+</span><span class=lnt> 42
+</span><span class=lnt> 43
+</span><span class=lnt> 44
+</span><span class=lnt> 45
+</span><span class=lnt> 46
+</span><span class=lnt> 47
+</span><span class=lnt> 48
+</span><span class=lnt> 49
+</span><span class=lnt> 50
+</span><span class=lnt> 51
+</span><span class=lnt> 52
+</span><span class=lnt> 53
+</span><span class=lnt> 54
+</span><span class=lnt> 55
+</span><span class=lnt> 56
+</span><span class=lnt> 57
+</span><span class=lnt> 58
+</span><span class=lnt> 59
+</span><span class=lnt> 60
+</span><span class=lnt> 61
+</span><span class=lnt> 62
+</span><span class=lnt> 63
+</span><span class=lnt> 64
+</span><span class=lnt> 65
+</span><span class=lnt> 66
+</span><span class=lnt> 67
+</span><span class=lnt> 68
+</span><span class=lnt> 69
+</span><span class=lnt> 70
+</span><span class=lnt> 71
+</span><span class=lnt> 72
+</span><span class=lnt> 73
+</span><span class=lnt> 74
+</span><span class=lnt> 75
+</span><span class=lnt> 76
+</span><span class=lnt> 77
+</span><span class=lnt> 78
+</span><span class=lnt> 79
+</span><span class=lnt> 80
+</span><span class=lnt> 81
+</span><span class=lnt> 82
+</span><span class=lnt> 83
+</span><span class=lnt> 84
+</span><span class=lnt> 85
+</span><span class=lnt> 86
+</span><span class=lnt> 87
+</span><span class=lnt> 88
+</span><span class=lnt> 89
+</span><span class=lnt> 90
+</span><span class=lnt> 91
+</span><span class=lnt> 92
+</span><span class=lnt> 93
+</span><span class=lnt> 94
+</span><span class=lnt> 95
+</span><span class=lnt> 96
+</span><span class=lnt> 97
+</span><span class=lnt> 98
+</span><span class=lnt> 99
+</span><span class=lnt>100
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>输入: sk (未 bind)  +  port_offset (四元组哈希)
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ Step 1: 取临时端口范围                                         │
+</span></span><span class=line><span class=cl>│   inet_get_local_port_range(net, &amp;low, &amp;high)                │
+</span></span><span class=line><span class=cl>│   默认: low=32768, high=61000 (左闭右开), remaining=28232    │
+</span></span><span class=line><span class=cl>│   remaining &amp;= ~1U  → 强制偶数 (28232)                        │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ Step 2: 扰动表计算起始偏移 (RFC 6056)                          │
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│   table_perturb[65536] (u32 数组, 256 KB)                    │
+</span></span><span class=line><span class=cl>│   ┌────────────────────────────────────────────────────────┐ │
+</span></span><span class=line><span class=cl>│   │ [0] [1] [2] ... [index] ... [65535]                    │ │
+</span></span><span class=line><span class=cl>│   │                  ↓                                      │ │
+</span></span><span class=line><span class=cl>│   └────────────────────────────────────────────────────────┘ │
+</span></span><span class=line><span class=cl>│   index = port_offset &amp; 0xFFFF  (相同目的地共享 index)       │
+</span></span><span class=line><span class=cl>│   offset = table_perturb[index] + (port_offset &gt;&gt; 32)       │
+</span></span><span class=line><span class=cl>│   offset %= remaining                                        │
+</span></span><span class=line><span class=cl>│   offset &amp;= ~1U          ← 强制偶数 (connect 用偶数端口)     │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ Step 3: 偶数端口扫描循环 (步长 = 2)                            │
+</span></span><span class=line><span class=cl>│   for i in [0, 2, 4, ..., remaining-2]:                      │
+</span></span><span class=line><span class=cl>│     port = low + offset;  if port &gt;= high: port -= remaining │
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│   临时端口范围 (仅示意偶数位)                                  │
+</span></span><span class=line><span class=cl>│   32768  32770  32772  32774  32776  ...  60998              │
+</span></span><span class=line><span class=cl>│    │      │      │      │      │              │               │
+</span></span><span class=line><span class=cl>│    ▼      ▼      ▼      ▼      ▼              ▼               │
+</span></span><span class=line><span class=cl>│   [空闲][占用][保留][占用][空闲]          [空闲]              │
+</span></span><span class=line><span class=cl>│              ↑                                                  │
+</span></span><span class=line><span class=cl>│           inet_is_local_reserved_port 跳过                     │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ Step 4: 查 bhash 桶 → 三种分支                                │
+</span></span><span class=line><span class=cl>│   head = &amp;bhash[inet_bhashfn(net, port, bhash_size)]         │
+</span></span><span class=line><span class=cl>│   在 head-&gt;chain 中找 (net, l3mdev, port) 的 bind_bucket     │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├─── 分支 A: 没找到 tb ──────────────────────────────────────┐
+</span></span><span class=line><span class=cl>  │    端口全新未用                                              │
+</span></span><span class=line><span class=cl>  │    tb = inet_bind_bucket_create(...)                         │
+</span></span><span class=line><span class=cl>  │    tb-&gt;fastreuse = -1      ← 标记为 connect() 专用          │
+</span></span><span class=line><span class=cl>  │    tb-&gt;fastreuseport = -1                                    │
+</span></span><span class=line><span class=cl>  │    ────────────────────────────→ 跳到 ok                    │
+</span></span><span class=line><span class=cl>  │                                                              │
+</span></span><span class=line><span class=cl>  ├─── 分支 B: 找到 tb, 但 fastreuse ≥ 0 或 fastreuseport ≥ 0 │
+</span></span><span class=line><span class=cl>  │    该端口被 bind() 占用 → connect 不能复用                   │
+</span></span><span class=line><span class=cl>  │    goto next_port          ← 释放锁, 尝试下一个偶数端口    │
+</span></span><span class=line><span class=cl>  │                                                              │
+</span></span><span class=line><span class=cl>  └─── 分支 C: 找到 tb, fastreuse == -1                        │
+</span></span><span class=line><span class=cl>       该端口被其他 connect() 使用, 查 ehash 看四元组冲突       │
+</span></span><span class=line><span class=cl>       │                                                         │
+</span></span><span class=line><span class=cl>       ├── check_established() == 0 (无冲突 / TIME_WAIT 可复用) │
+</span></span><span class=line><span class=cl>       │   ───────────────────────→ 跳到 ok                     │
+</span></span><span class=line><span class=cl>       │                                                         │
+</span></span><span class=line><span class=cl>       └── check_established() != 0 (四元组冲突)                │
+</span></span><span class=line><span class=cl>           goto next_port          ← 尝试下一个偶数端口        │
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼ (循环结束仍未找到可用端口)
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ Step 5: 奇偶切换                                              │
+</span></span><span class=line><span class=cl>│   offset++   (偶数 → 奇数)                                    │
+</span></span><span class=line><span class=cl>│   if (offset &amp; 1) &amp;&amp; remaining &gt; 1:                          │
+</span></span><span class=line><span class=cl>│       goto other_parity_scan    ← 重新扫描奇数端口            │
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│   偶数轮: 32768, 32770, 32772, ... (已扫尽)                  │
+</span></span><span class=line><span class=cl>│   奇数轮: 32769, 32771, 32773, ... (再扫一遍)                │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────┘
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ├─── 仍失败 → return -EADDRNOTAVAIL (端口耗尽)
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>  ▼ (ok 标签)
+</span></span><span class=line><span class=cl>┌──────────────────────────────────────────────────────────────┐
+</span></span><span class=line><span class=cl>│ Step 6: 成功收尾                                              │
+</span></span><span class=line><span class=cl>│   ① 更新扰动表:                                                │
+</span></span><span class=line><span class=cl>│      i = max(i, (prandom_u32() &amp; 7) * 2)                     │
+</span></span><span class=line><span class=cl>│      table_perturb[index] += i + 2   ← 让下次起点偏移         │
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│   ② 加入 bhash:                                                │
+</span></span><span class=line><span class=cl>│      inet_bind_hash(sk, tb, port)                              │
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│   ③ 加入 ehash:                                                │
+</span></span><span class=line><span class=cl>│      inet_sk(sk)-&gt;inet_sport = htons(port)                     │
+</span></span><span class=line><span class=cl>│      inet_ehash_nolisten(sk, tw, NULL)                         │
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│   ④ 若复用了 TIME_WAIT:                                        │
+</span></span><span class=line><span class=cl>│      inet_twsk_bind_unhash(tw)         ← 解除 tw 的 bhash 绑定│
+</span></span><span class=line><span class=cl>│      inet_twsk_deschedule_put(tw)      ← 释放 tw              │
+</span></span><span class=line><span class=cl>│                                                              │
+</span></span><span class=line><span class=cl>│   ⑤ return 0  → connect() 成功                                │
+</span></span><span class=line><span class=cl>└──────────────────────────────────────────────────────────────┘
+</span></span></code></pre></td></tr></table></div></div><h4 id=关键设计意图>关键设计意图</h4><div class=table-wrapper><table><thead><tr><th>设计点</th><th>目的</th></tr></thead><tbody><tr><td><strong><code>table_perturb[65536]</code> 扰动表</strong></td><td>相同目的地的连续连接共享 index → 端口递增式分配（减少冲突搜索）；不同目的地用不同 index → 端口完全独立（防预测，RFC 6056 §3.3.4）</td></tr><tr><td><strong><code>offset &= ~1U</code>（connect 优先偶数）</strong></td><td>connect() 用偶数端口，bind() 优先奇数端口 → 两条路径的端口空间物理隔离，减少扫描冲突</td></tr><tr><td><strong><code>fastreuse</code> 三值 (-1/0/1)</strong></td><td>让 bhash 在 O(1) 内判断"该端口是否允许 connect 复用"：<code>-1</code> 表示 connect 专用（可再查 ehash 复用）；<code>≥0</code> 表示 bind 占用（直接跳过）</td></tr><tr><td><strong>先扫偶数、再扫奇数（而非交替）</strong></td><td>偶数端口空间连续，缓存行友好；奇数轮是兜底，多数情况下偶数轮就能找到</td></tr><tr><td><strong><code>i = max(i, prandom*2)</code> 更新扰动表</strong></td><td>低竞争时 <code>i</code> 小，扰动增量大（随机性高）；高竞争时 <code>i</code> 大，扰动增量大（避免反复撞同一端口）</td></tr></tbody></table></div><p><strong>关于遍历 bhash 桶时只比较一次端口的问题</strong>：找到第一个匹配的 <code>inet_bind_bucket</code> 后直接处理而不继续遍历，这不是 bug。因为每个 <code>(net, l3mdev, port)</code> 三元组在 bhash 中最多只有一个 <code>inet_bind_bucket</code>——所有创建路径（<code>inet_csk_get_port</code>、<code>__inet_hash_connect</code>、<code>__inet_inherit_port</code>）都遵循"先查找、不存在才创建"的模式，保证了唯一性。同一桶中的多个 <code>inet_bind_bucket</code> 要么端口不同（哈希冲突），要么网络命名空间不同。</p><h3 id=23-端口选择的安全性设计>2.3 端口选择的安全性设计</h3><p><code>table_perturb</code> 是一个 65536 条目的 u32 数组（256KB），用于防止攻击者预测端口号（RFC 6056 Section 3.3.4）：</p><ul><li>相同目的地的连续连接共享同一扰动表索引，端口递增式分配（减少冲突搜索）</li><li>不同目的地使用不同索引，端口完全独立（攻击者无法从一个连接推断另一个）</li><li>每次成功分配后更新扰动值，低竞争时随机性高，高竞争时递增</li></ul><hr><h2 id=3-__inet_check_established四元组冲突检查>3. __inet_check_established：四元组冲突检查</h2><h3 id=31-这个函数解决什么问题>3.1 这个函数解决什么问题？</h3><p>TCP 连接由四元组唯一标识：<code>(本地IP, 本地端口, 远端IP, 远端端口)</code>。<strong>同一个本地端口可以被多个连接共享</strong>，只要四元组不同。例如：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>连接1: 192.168.1.100:45678 → 10.0.0.1:8080    ← 四元组A
+</span></span><span class=line><span class=cl>连接2: 192.168.1.100:45678 → 10.0.0.2:8080    ← 四元组B（远端IP不同）
+</span></span><span class=line><span class=cl>连接3: 192.168.1.100:45678 → 10.0.0.1:9090    ← 四元组C（远端端口不同）
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>三条连接共享端口45678, 完全合法!
+</span></span></code></pre></td></tr></table></div></div><p>当 <code>__inet_hash_connect</code> 发现端口已被其他 <code>connect()</code> 使用（<code>bind_bucket->fastreuse == -1</code>）时，调用 <code>__inet_check_established</code> 到 ehash 中检查四元组是否真的冲突。</p><h3 id=32-执行流程图>3.2 执行流程图</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>__inet_check_established(death_row, sk, lport, twp)
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>│  ① 计算四元组哈希 → 定位 ehash 桶
+</span></span><span class=line><span class=cl>│     hash = inet_ehashfn(net, 本地IP, lport, 远端IP, 远端端口)
+</span></span><span class=line><span class=cl>│     head = ehash[hash &amp; ehash_mask]
+</span></span><span class=line><span class=cl>│     lock = ehash_locks[hash &amp; ehash_locks_mask]
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>│  ② spin_lock(lock)  (内层锁, softirq已被外层禁用)
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>│  ③ 遍历 ehash 桶中的链表
+</span></span><span class=line><span class=cl>│     for (sk2 in head-&gt;chain):
+</span></span><span class=line><span class=cl>│       ├── sk2-&gt;sk_hash != hash ?  → 跳过 (快速过滤, 哈希值都不同肯定不匹配)
+</span></span><span class=line><span class=cl>│       │
+</span></span><span class=line><span class=cl>│       ├── INET_MATCH(sk2) ?  → 四元组匹配!
+</span></span><span class=line><span class=cl>│       │     │
+</span></span><span class=line><span class=cl>│       │     ├── sk2 是 ESTABLISHED/SYN_SENT 等活跃连接
+</span></span><span class=line><span class=cl>│       │     │     → goto not_unique (冲突, 返回 -EADDRNOTAVAIL)
+</span></span><span class=line><span class=cl>│       │     │
+</span></span><span class=line><span class=cl>│       │     └── sk2 是 TIME_WAIT
+</span></span><span class=line><span class=cl>│       │           → twsk_unique() 检查能否复用
+</span></span><span class=line><span class=cl>│       │              ├── 可复用 → tw = sk2, break
+</span></span><span class=line><span class=cl>│       │              └── 不可复用 → goto not_unique
+</span></span><span class=line><span class=cl>│       │
+</span></span><span class=line><span class=cl>│       └── 不匹配 → 继续下一个
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>│  ④ 循环正常结束 (无冲突) 或 break (TIME_WAIT复用)
+</span></span><span class=line><span class=cl>│     设置端口号: inet_num = lport, inet_sport = htons(lport)
+</span></span><span class=line><span class=cl>│     设置哈希值: sk-&gt;sk_hash = hash
+</span></span><span class=line><span class=cl>│     加入 ehash: __sk_nulls_add_node_rcu(sk, &amp;head-&gt;chain)
+</span></span><span class=line><span class=cl>│     如果复用了 TIME_WAIT:
+</span></span><span class=line><span class=cl>│       从 ehash 删除旧 tw: sk_nulls_del_node_init_rcu(tw)
+</span></span><span class=line><span class=cl>│       (先加后删, 保证任何时刻ehash中都有该四元组的有效条目)
+</span></span><span class=line><span class=cl>│
+</span></span><span class=line><span class=cl>│  ⑤ spin_unlock(lock)
+</span></span><span class=line><span class=cl>│     通过 twp 指针返回 tw (调用者负责后续销毁)
+</span></span><span class=line><span class=cl>│     return 0
+</span></span></code></pre></td></tr></table></div></div><h3 id=33-完整源码>3.3 完整源码</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span><span class=lnt>74
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_hashtables.c
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>__inet_check_established</span><span class=p>(</span><span class=k>struct</span> <span class=n>inet_timewait_death_row</span> <span class=o>*</span><span class=n>death_row</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                    <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=n>__u16</span> <span class=n>lport</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                                    <span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=o>**</span><span class=n>twp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_hashinfo</span> <span class=o>*</span><span class=n>hinfo</span> <span class=o>=</span> <span class=n>death_row</span><span class=o>-&gt;</span><span class=n>hashinfo</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_sock</span> <span class=o>*</span><span class=n>inet</span> <span class=o>=</span> <span class=nf>inet_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>__be32</span> <span class=n>daddr</span> <span class=o>=</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_rcv_saddr</span><span class=p>;</span>  <span class=c1>// 本地IP (ehash命名中叫dest)
+</span></span></span><span class=line><span class=cl>    <span class=n>__be32</span> <span class=n>saddr</span> <span class=o>=</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_daddr</span><span class=p>;</span>      <span class=c1>// 远端IP (ehash命名中叫source)
+</span></span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>dif</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_bound_dev_if</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>sdif</span> <span class=o>=</span> <span class=nf>l3mdev_master_ifindex_by_index</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>dif</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 将地址打包为64位、端口打包为32位, INET_MATCH用一条指令比较而非逐字段比4次
+</span></span></span><span class=line><span class=cl>    <span class=nf>INET_ADDR_COOKIE</span><span class=p>(</span><span class=n>acookie</span><span class=p>,</span> <span class=n>saddr</span><span class=p>,</span> <span class=n>daddr</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=n>__portpair</span> <span class=n>ports</span> <span class=o>=</span> <span class=nf>INET_COMBINED_PORTS</span><span class=p>(</span><span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_dport</span><span class=p>,</span> <span class=n>lport</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 计算四元组哈希 → 定位 ehash 桶和对应的锁
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>int</span> <span class=n>hash</span> <span class=o>=</span> <span class=nf>inet_ehashfn</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>daddr</span><span class=p>,</span> <span class=n>lport</span><span class=p>,</span> <span class=n>saddr</span><span class=p>,</span> <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_dport</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_ehash_bucket</span> <span class=o>*</span><span class=n>head</span> <span class=o>=</span> <span class=nf>inet_ehash_bucket</span><span class=p>(</span><span class=n>hinfo</span><span class=p>,</span> <span class=n>hash</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=kt>spinlock_t</span> <span class=o>*</span><span class=n>lock</span> <span class=o>=</span> <span class=nf>inet_ehash_lockp</span><span class=p>(</span><span class=n>hinfo</span><span class=p>,</span> <span class=n>hash</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk2</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>hlist_nulls_node</span> <span class=o>*</span><span class=n>node</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=o>*</span><span class=n>tw</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 内层锁: 外层__inet_hash_connect已通过spin_lock_bh禁用softirq, 此处无需再禁
+</span></span></span><span class=line><span class=cl>    <span class=nf>spin_lock</span><span class=p>(</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 遍历 ehash 桶中的 nulls 链表, 查找四元组冲突
+</span></span></span><span class=line><span class=cl>    <span class=nf>sk_nulls_for_each</span><span class=p>(</span><span class=n>sk2</span><span class=p>,</span> <span class=n>node</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>chain</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_hash</span> <span class=o>!=</span> <span class=n>hash</span><span class=p>)</span>       <span class=c1>// 哈希值不同 → 四元组必不同, 快速跳过
+</span></span></span><span class=line><span class=cl>            <span class=k>continue</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>likely</span><span class=p>(</span><span class=nf>INET_MATCH</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>sk2</span><span class=p>,</span> <span class=n>acookie</span><span class=p>,</span> <span class=n>ports</span><span class=p>,</span> <span class=n>dif</span><span class=p>,</span> <span class=n>sdif</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=c1>// INET_MATCH: 比较 net + portpair(32位) + addrpair(64位) + 接口绑定
+</span></span></span><span class=line><span class=cl>            <span class=c1>// 四元组完全匹配! 检查对方状态:
+</span></span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_TIME_WAIT</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                <span class=n>tw</span> <span class=o>=</span> <span class=nf>inet_twsk</span><span class=p>(</span><span class=n>sk2</span><span class=p>);</span>    <span class=c1>// 强转为 inet_timewait_sock (sock_common偏移相同)
+</span></span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>(</span><span class=nf>twsk_unique</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>sk2</span><span class=p>,</span> <span class=n>twp</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>                    <span class=k>break</span><span class=p>;</span>              <span class=c1>// TIME_WAIT 可复用 → 带着 tw 跳出循环
+</span></span></span><span class=line><span class=cl>            <span class=p>}</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>not_unique</span><span class=p>;</span>            <span class=c1>// 活跃连接冲突, 或 TIME_WAIT 不可复用
+</span></span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 到达此处: 循环自然结束(四元组唯一) 或 break(TIME_WAIT复用成功)
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 必须先设端口再加入ehash: 加入后其他CPU立即可通过RCU看到, 端口未设会导致INET_MATCH误判
+</span></span></span><span class=line><span class=cl>    <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_num</span> <span class=o>=</span> <span class=n>lport</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>inet</span><span class=o>-&gt;</span><span class=n>inet_sport</span> <span class=o>=</span> <span class=nf>htons</span><span class=p>(</span><span class=n>lport</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_hash</span> <span class=o>=</span> <span class=n>hash</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>WARN_ON</span><span class=p>(</span><span class=o>!</span><span class=nf>sk_unhashed</span><span class=p>(</span><span class=n>sk</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>    <span class=nf>__sk_nulls_add_node_rcu</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>head</span><span class=o>-&gt;</span><span class=n>chain</span><span class=p>);</span>  <span class=c1>// RCU方式插入ehash
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tw</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 原子替换: 先插入新sk再删除旧tw, 确保并发查找不会看到&#34;两者都不在&#34;的空窗口
+</span></span></span><span class=line><span class=cl>        <span class=nf>sk_nulls_del_node_init_rcu</span><span class=p>((</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tw</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=nf>__NET_INC_STATS</span><span class=p>(</span><span class=n>net</span><span class=p>,</span> <span class=n>LINUX_MIB_TIMEWAITRECYCLED</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=nf>spin_unlock</span><span class=p>(</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>sock_prot_inuse_add</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_prot</span><span class=p>,</span> <span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// twp: 调用者传入的输出参数, 用于延迟销毁TIME_WAIT
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 调用者__inet_hash_connect还持有bhash锁, 不能在持锁时销毁tw(销毁需操作bhash)
+</span></span></span><span class=line><span class=cl>    <span class=c1>// 所以通过twp传回去, 调用者释放bhash锁后再调用 inet_twsk_bind_unhash + deschedule_put
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>twp</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=o>*</span><span class=n>twp</span> <span class=o>=</span> <span class=n>tw</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>tw</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=nf>inet_twsk_deschedule_put</span><span class=p>(</span><span class=n>tw</span><span class=p>);</span>   <span class=c1>// 直接调用场景, 没有外层锁, 立即销毁
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>not_unique</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=nf>spin_unlock</span><span class=p>(</span><span class=n>lock</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=o>-</span><span class=n>EADDRNOTAVAIL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=34-举例说明>3.4 举例说明</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>场景: 客户端 192.168.1.100 要连接 10.0.0.1:8080, 被分配端口 45678
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>ehash 桶 [hash(192.168.1.100, 45678, 10.0.0.1, 8080) &amp; mask] 中当前有:
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  sk_A: 192.168.1.100:45678 → 10.0.0.2:8080  (ESTABLISHED)
+</span></span><span class=line><span class=cl>        → sk_hash 不同(远端IP不同, 哈希值不同), 跳过
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  sk_B: 192.168.1.100:45678 → 10.0.0.1:8080  (TIME_WAIT)
+</span></span><span class=line><span class=cl>        → sk_hash 相同, INET_MATCH 匹配!
+</span></span><span class=line><span class=cl>        → 状态是 TIME_WAIT, 调用 twsk_unique() 检查
+</span></span><span class=line><span class=cl>        → tcp_tw_reuse=1, TIME_WAIT已存在3秒 &gt; 1秒, 双方有时间戳
+</span></span><span class=line><span class=cl>        → 可复用! tw = sk_B, break
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>  结果: 新 socket 加入 ehash, sk_B(TIME_WAIT) 从 ehash 删除, 端口 45678 复用成功
+</span></span></code></pre></td></tr></table></div></div><hr><hr><h2 id=4-time_wait-复用机制>4. TIME_WAIT 复用机制</h2><h3 id=41-为什么-time_wait-需要复用>4.1 为什么 TIME_WAIT 需要复用？</h3><p>TIME_WAIT 存在的目的是防止旧连接的延迟报文被新连接错误接收（详见 <code>TCP四次挥手与close.md</code>）。但 TIME_WAIT 持续 60 秒，在高并发场景会产生问题：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>场景: 反向代理(如HAProxy)连接后端服务器
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>HAProxy (192.168.1.100)  →  Backend (10.0.0.1:8080)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>每秒 1000 个短连接, 每个连接完成后进入 TIME_WAIT (60秒)
+</span></span><span class=line><span class=cl>→ 同时存在的 TIME_WAIT = 1000 × 60 = 60,000 个
+</span></span><span class=line><span class=cl>→ 临时端口范围 [32768, 60999] 只有 28,232 个端口
+</span></span><span class=line><span class=cl>→ 端口耗尽! connect() 返回 -EADDRNOTAVAIL
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>而且: 这些 TIME_WAIT 的四元组都是 (192.168.1.100:X → 10.0.0.1:8080)
+</span></span><span class=line><span class=cl>目的地相同, 端口不能在 bhash 层面复用, 必须在 ehash 层面复用四元组
+</span></span></code></pre></td></tr></table></div></div><h3 id=42-time_wait-的创建与销毁>4.2 TIME_WAIT 的创建与销毁</h3><p>当正常连接进入 TIME_WAIT 状态时，<code>inet_twsk_hashdance()</code> 将轻量级的 <code>inet_timewait_sock</code> 替换原始 <code>sock</code> 加入哈希表：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_timewait_sock.c
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>inet_twsk_hashdance</span><span class=p>(</span><span class=k>struct</span> <span class=n>inet_timewait_sock</span> <span class=o>*</span><span class=n>tw</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                         <span class=k>struct</span> <span class=n>inet_hashinfo</span> <span class=o>*</span><span class=n>hashinfo</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// Step 1: 加入 bhash (复用原socket的bind_bucket)
+</span></span></span><span class=line><span class=cl>    <span class=n>tw</span><span class=o>-&gt;</span><span class=n>tw_tb</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_bind_hash</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>inet_twsk_add_bind_node</span><span class=p>(</span><span class=n>tw</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tw</span><span class=o>-&gt;</span><span class=n>tw_tb</span><span class=o>-&gt;</span><span class=n>owners</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// Step 2: 加入 ehash
+</span></span></span><span class=line><span class=cl>    <span class=nf>inet_twsk_add_node_rcu</span><span class=p>(</span><span class=n>tw</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>ehead</span><span class=o>-&gt;</span><span class=n>chain</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// Step 3: 从 ehash 删除原始 socket
+</span></span></span><span class=line><span class=cl>    <span class=nf>__sk_nulls_del_node_init_rcu</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 引用计数 = 3: bhash(1) + ehash(1) + timer(1)
+</span></span></span><span class=line><span class=cl>    <span class=nf>refcount_set</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tw</span><span class=o>-&gt;</span><span class=n>tw_refcnt</span><span class=p>,</span> <span class=mi>3</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>定时器到期后，<code>inet_twsk_kill()</code> 从 ehash 和 bhash 中删除 tw，递减 <code>death_row->tw_count</code>，释放内存。</p><hr><h3 id=43-复用的安全性问题为什么不能无条件复用>4.3 复用的安全性问题——为什么不能无条件复用？</h3><p>TIME_WAIT 的核心作用是防止"旧报文污染新连接"：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>时间线:
+</span></span><span class=line><span class=cl>────────────────────────────────────────────────────
+</span></span><span class=line><span class=cl>旧连接: A:45678 → B:8080, 序列号空间 [1000, 50000]
+</span></span><span class=line><span class=cl>  │  发送了一个数据包 seq=30000, 但它在网络中延迟了
+</span></span><span class=line><span class=cl>  │  连接正常关闭, 进入 TIME_WAIT
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>如果立即复用同一四元组建立新连接:
+</span></span><span class=line><span class=cl>  │
+</span></span><span class=line><span class=cl>新连接: A:45678 → B:8080, 序列号空间 [1, 60000]
+</span></span><span class=line><span class=cl>  │  延迟的旧包 seq=30000 到达!
+</span></span><span class=line><span class=cl>  │  新连接的接收窗口包含 30000 → 接收了旧数据!
+</span></span><span class=line><span class=cl>  │  → 数据损坏 ✗
+</span></span></code></pre></td></tr></table></div></div><p><strong>安全复用的两个条件</strong>：</p><ol><li><p><strong>双方支持 TCP 时间戳</strong>：时间戳单调递增，新连接的时间戳必然大于旧连接。接收方通过 PAWS (Protection Against Wrapped Sequences) 机制，会丢弃时间戳小于当前记录的报文。这样旧连接的延迟报文（时间戳旧）会被新连接自动丢弃。</p></li><li><p><strong>TIME_WAIT 已存在超过 1 秒</strong>：确保对端也观察到了时间戳的前进。如果复用太快（比如 0.1 秒），新旧连接的时间戳可能相同（时间戳精度为秒级），PAWS 无法区分。</p></li></ol><h3 id=44-tcp_twsk_unique-复用条件源码>4.4 tcp_twsk_unique 复用条件源码</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>tcp_twsk_unique</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sktw</span><span class=p>,</span> <span class=kt>void</span> <span class=o>*</span><span class=n>twp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>reuse</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_tw_reuse</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_timewait_sock</span> <span class=o>*</span><span class=n>tcptw</span> <span class=o>=</span> <span class=nf>tcp_twsk</span><span class=p>(</span><span class=n>sktw</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// sysctl开关: 0=禁止(默认), 1=允许, 2=仅loopback
+</span></span></span><span class=line><span class=cl>    <span class=c1>// loopback没有物理网络, 不存在&#34;延迟报文在路由器缓冲&#34;的问题, 所以reuse=2更安全
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>reuse</span> <span class=o>==</span> <span class=mi>2</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>loopback</span><span class=p>)</span> <span class=n>reuse</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// 非loopback → 降级为禁止
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 核心条件:
+</span></span></span><span class=line><span class=cl>    <span class=c1>//   tw_ts_recent_stamp != 0 → 旧连接双方都支持TCP时间戳 (PAWS可以工作)
+</span></span></span><span class=line><span class=cl>    <span class=c1>//   time_after32(now, stamp) → TIME_WAIT已存在超过1秒 (确保对端时间戳前进)
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_ts_recent_stamp</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>        <span class=p>(</span><span class=o>!</span><span class=n>twp</span> <span class=o>||</span> <span class=p>(</span><span class=n>reuse</span> <span class=o>&amp;&amp;</span> <span class=nf>time_after32</span><span class=p>(</span><span class=nf>ktime_get_seconds</span><span class=p>(),</span>
+</span></span><span class=line><span class=cl>                                        <span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_ts_recent_stamp</span><span class=p>))))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>likely</span><span class=p>(</span><span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>repair</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=c1>// 继承序列号: 旧连接最后序列号 + 65535 + 2, 跳过一个完整窗口
+</span></span></span><span class=line><span class=cl>            <span class=c1>// 确保新序列号远大于旧连接的任何在途报文
+</span></span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span> <span class=o>=</span> <span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_snd_nxt</span> <span class=o>+</span> <span class=mi>65535</span> <span class=o>+</span> <span class=mi>2</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>            <span class=c1>// 继承对端时间戳: 作为新连接PAWS检查的起始基线
+</span></span></span><span class=line><span class=cl>            <span class=c1>// 新连接知道&#34;对端的时间戳至少是X&#34;, 小于X的旧报文一律丢弃
+</span></span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>ts_recent</span> <span class=o>=</span> <span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_ts_recent</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rx_opt</span><span class=p>.</span><span class=n>ts_recent_stamp</span> <span class=o>=</span> <span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_ts_recent_stamp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=nf>sock_hold</span><span class=p>(</span><span class=n>sktw</span><span class=p>);</span>  <span class=c1>// 增加tw引用计数, 调用者负责后续销毁
+</span></span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>          <span class=c1>// 可复用
+</span></span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>              <span class=c1>// 不可复用
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=45-复用的完整流程时序>4.5 复用的完整流程时序</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                  __inet_hash_connect
+</span></span><span class=line><span class=cl>                  │
+</span></span><span class=line><span class=cl>                  │  发现端口45678的bind_bucket, fastreuse=-1(被connect占用)
+</span></span><span class=line><span class=cl>                  │  调用 __inet_check_established(death_row, sk, 45678, &amp;tw)
+</span></span><span class=line><span class=cl>                  │
+</span></span><span class=line><span class=cl>                  ▼
+</span></span><span class=line><span class=cl>              __inet_check_established
+</span></span><span class=line><span class=cl>              │
+</span></span><span class=line><span class=cl>              │  ehash中找到匹配四元组, 状态=TIME_WAIT
+</span></span><span class=line><span class=cl>              │  调用 twsk_unique(sk, tw_sk, twp)
+</span></span><span class=line><span class=cl>              │    → tcp_twsk_unique()
+</span></span><span class=line><span class=cl>              │       tcp_tw_reuse=1 ✓
+</span></span><span class=line><span class=cl>              │       tw存在3秒 &gt; 1秒 ✓
+</span></span><span class=line><span class=cl>              │       双方有时间戳 ✓
+</span></span><span class=line><span class=cl>              │       → 复用成功, 继承序列号和时间戳
+</span></span><span class=line><span class=cl>              │
+</span></span><span class=line><span class=cl>              │  新sk加入ehash → 旧tw从ehash删除 (原子替换)
+</span></span><span class=line><span class=cl>              │  return 0, *twp = tw
+</span></span><span class=line><span class=cl>              │
+</span></span><span class=line><span class=cl>              ▼
+</span></span><span class=line><span class=cl>          回到 __inet_hash_connect
+</span></span><span class=line><span class=cl>              │
+</span></span><span class=line><span class=cl>              │  inet_bind_hash(sk, tb, 45678)    → sk加入bhash
+</span></span><span class=line><span class=cl>              │  inet_ehash_nolisten(sk, tw, ...)  → (已在check_established中加入)
+</span></span><span class=line><span class=cl>              │
+</span></span><span class=line><span class=cl>              │  释放 bhash 桶锁
+</span></span><span class=line><span class=cl>              │
+</span></span><span class=line><span class=cl>              │  inet_twsk_bind_unhash(tw, hinfo)  → tw从bhash解除
+</span></span><span class=line><span class=cl>              │  inet_twsk_deschedule_put(tw)       → 取消tw的2MSL定时器 + 释放内存
+</span></span><span class=line><span class=cl>              │
+</span></span><span class=line><span class=cl>              │  return 0  → connect() 成功!
+</span></span></code></pre></td></tr></table></div></div><p><code>sysctl_tcp_tw_reuse</code> 取值：0=禁止复用（默认）、1=允许、2=仅loopback。</p><hr><h2 id=5-端口复用三机制对比so_reuseaddr--so_reuseport--tcp_tw_reuse>5. 端口复用三机制对比：SO_REUSEADDR / SO_REUSEPORT / tcp_tw_reuse</h2><p><code>SO_REUSEADDR</code>、<code>SO_REUSEPORT</code>、<code>tcp_tw_reuse</code> 三者名字相似，但<strong>作用层面、生效时机、解决的问题完全不同</strong>。理解它们的区别是理解 TCP 端口管理的关键：</p><ul><li><code>SO_REUSEADDR</code> / <code>SO_REUSEPORT</code>：在 <strong>bind() 路径</strong>（bhash 层）工作，是<strong>端口级</strong>复用，由 socket 自身通过 <code>setsockopt</code> 设置</li><li><code>tcp_tw_reuse</code>：在 <strong>connect() 路径</strong>（ehash 层）工作，是<strong>四元组级</strong>复用，由 sysctl 全局控制</li></ul><blockquote><p>源码路径分别在 <code>inet_csk_get_port()</code>（bind 路径，详见 <a class=link href=TCP-bind%e6%93%8d%e4%bd%9c.md>TCP-bind操作.md</a> §五）和 <code>__inet_check_established()</code>（connect 路径，详见本文 §3）。本节聚焦<strong>机制对比</strong>，不重复源码细节。</p></blockquote><h3 id=51-三者对比>5.1 三者对比</h3><div class=table-wrapper><table><thead><tr><th>维度</th><th>SO_REUSEADDR</th><th>SO_REUSEPORT</th><th>tcp_tw_reuse</th></tr></thead><tbody><tr><td><strong>设置方式</strong></td><td><code>setsockopt(SO_REUSEADDR)</code></td><td><code>setsockopt(SO_REUSEPORT)</code></td><td><code>sysctl net.ipv4.tcp_tw_reuse</code></td></tr><tr><td><strong>内核字段</strong></td><td><code>sk->sk_reuse</code></td><td><code>sk->sk_reuseport</code></td><td><code>net->ipv4.sysctl_tcp_tw_reuse</code></td></tr><tr><td><strong>生效路径</strong></td><td><code>bind()</code></td><td><code>bind()</code></td><td><code>connect()</code></td></tr><tr><td><strong>检查位置</strong></td><td>bhash（端口绑定表）</td><td>bhash（端口绑定表）</td><td>ehash（已建立连接表）</td></tr><tr><td><strong>比较粒度</strong></td><td>端口</td><td>地址 + 端口</td><td>四元组</td></tr><tr><td><strong>对端要求</strong></td><td>新旧 socket 都需设置</td><td>新旧 socket 都需设置</td><td>单方 sysctl，无需对端配合</td></tr><tr><td><strong>状态限制</strong></td><td>旧 socket 不能是 LISTEN</td><td>无限制（含 LISTEN）</td><td>旧连接必须是 TIME_WAIT</td></tr><tr><td><strong>安全机制</strong></td><td>无</td><td>同 UID 检查</td><td>PAWS 时间戳 + 1秒延迟</td></tr><tr><td><strong>典型场景</strong></td><td>服务器重启快速绑定旧端口</td><td>多进程监听同一端口负载均衡</td><td>高并发客户端临时端口耗尽</td></tr></tbody></table></div><h3 id=52-so_reuseaddr-的源码路径>5.2 SO_REUSEADDR 的源码路径</h3><p>用户调用 <code>setsockopt(SO_REUSEADDR)</code> 时，内核设置 <code>sk->sk_reuse = SK_CAN_REUSE</code>（<code>net/core/sock.c</code>）。</p><p><code>bind()</code> 路径中，<code>inet_csk_get_port()</code> 检查端口是否可复用：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c - inet_csk_get_port()
+</span></span></span><span class=line><span class=cl><span class=kt>bool</span> <span class=n>reuse</span> <span class=o>=</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_reuse</span> <span class=o>&amp;&amp;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_LISTEN</span><span class=p>;</span>  <span class=c1>// LISTEN状态不参与reuse
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>hlist_empty</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>owners</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_reuse</span> <span class=o>==</span> <span class=n>SK_FORCE_REUSE</span><span class=p>)</span>   <span class=c1>// 内核强制复用(如TCP repair)
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>success</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>fastreuse</span> <span class=o>&gt;</span> <span class=mi>0</span> <span class=o>&amp;&amp;</span> <span class=n>reuse</span><span class=p>)</span>       <span class=c1>// 快速路径: 桶内所有socket都可reuse
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>success</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>inet_csk_bind_conflict</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>tb</span><span class=p>,</span> <span class=nb>true</span><span class=p>,</span> <span class=nb>true</span><span class=p>))</span>  <span class=c1>// 慢速路径: 逐一检查冲突
+</span></span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>fail_unlock</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>inet_csk_bind_conflict()</code> 的冲突判定逻辑：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c - inet_csk_bind_conflict()
+</span></span></span><span class=line><span class=cl><span class=nf>sk_for_each_bound</span><span class=p>(</span><span class=n>sk2</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>owners</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>sk</span> <span class=o>!=</span> <span class=n>sk2</span> <span class=o>&amp;&amp;</span> <span class=err>设备匹配</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>reuse</span> <span class=o>&amp;&amp;</span> <span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_reuse</span> <span class=o>&amp;&amp;</span> <span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_LISTEN</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=c1>// 双方都设置了REUSEADDR且都不在LISTEN → 允许(不break, 继续检查)
+</span></span></span><span class=line><span class=cl>            <span class=c1>// 但如果地址完全相同(inet_rcv_saddr_equal)，在非relax模式下仍冲突
+</span></span></span><span class=line><span class=cl>        <span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=c1>// 有一方未设置REUSEADDR → 地址相同则冲突
+</span></span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=nf>inet_rcv_saddr_equal</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>sk2</span><span class=p>,</span> <span class=nb>true</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>                <span class=k>break</span><span class=p>;</span>  <span class=c1>// 冲突
+</span></span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>核心规则：<strong>双方都设置了 <code>SO_REUSEADDR</code>，且旧 socket 不在 LISTEN 状态，且绑定地址不完全相同时，允许复用端口</strong>。典型场景是服务器 crash 后重启，旧连接处于 TIME_WAIT/FIN_WAIT 等状态，新服务器进程可以立即 <code>bind()</code> 同一端口。</p><h3 id=53-so_reuseport-的源码路径>5.3 SO_REUSEPORT 的源码路径</h3><p>用户调用 <code>setsockopt(SO_REUSEPORT)</code> 时，内核设置 <code>sk->sk_reuseport = 1</code>（<code>net/core/sock.c</code>）。</p><p><code>bind()</code> 路径中，<code>inet_csk_get_port()</code> 通过 <code>sk_reuseport_match()</code> 快速检查：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c - sk_reuseport_match()
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>int</span> <span class=nf>sk_reuseport_match</span><span class=p>(</span><span class=k>struct</span> <span class=n>inet_bind_bucket</span> <span class=o>*</span><span class=n>tb</span><span class=p>,</span> <span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>fastreuseport</span> <span class=o>&lt;=</span> <span class=mi>0</span><span class=p>)</span>   <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// 桶内有不支持reuseport的socket
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_reuseport</span><span class=p>)</span>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// 新socket未设置reuseport
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>rcu_access_pointer</span><span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_reuseport_cb</span><span class=p>))</span>  <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// 已有BPF程序
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>uid_eq</span><span class=p>(</span><span class=n>tb</span><span class=o>-&gt;</span><span class=n>fastuid</span><span class=p>,</span> <span class=n>uid</span><span class=p>))</span>  <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>  <span class=c1>// UID不同(安全检查)
+</span></span></span><span class=line><span class=cl>    <span class=c1>// STRICT模式还需比较地址
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>inet_csk_bind_conflict()</code> 中的 reuseport 逻辑：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 双方都设置了reuseport，且UID相同(或对端是TIME_WAIT) → 允许
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>reuseport_ok</span> <span class=o>||</span> <span class=o>!</span><span class=n>reuseport</span> <span class=o>||</span> <span class=o>!</span><span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_reuseport</span> <span class=o>||</span> <span class=o>!</span><span class=n>reuseport_cb_ok</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>    <span class=p>(</span><span class=n>sk2</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_TIME_WAIT</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=nf>uid_eq</span><span class=p>(</span><span class=n>uid</span><span class=p>,</span> <span class=nf>sock_i_uid</span><span class=p>(</span><span class=n>sk2</span><span class=p>))))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>inet_rcv_saddr_equal</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>sk2</span><span class=p>,</span> <span class=nb>true</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>break</span><span class=p>;</span>  <span class=c1>// 冲突
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=c1>// 否则: 不break, 允许复用
+</span></span></span></code></pre></td></tr></table></div></div><p>核心规则：<strong>双方都设置了 <code>SO_REUSEPORT</code>，且属于同一用户（UID 相同），允许绑定完全相同的地址+端口，包括 LISTEN 状态</strong>。典型场景是 Nginx 多 worker 进程各自 <code>bind()</code> + <code>listen()</code> 同一个 80 端口，内核通过 <code>reuseport_cb</code> 实现连接的负载均衡分发。</p><h3 id=54-tcp_tw_reuse-的源码路径>5.4 tcp_tw_reuse 的源码路径</h3><p>管理员通过 <code>sysctl net.ipv4.tcp_tw_reuse=1</code> 设置，内核存储在 <code>net->ipv4.sysctl_tcp_tw_reuse</code>。</p><p><code>connect()</code> 路径中，<code>__inet_hash_connect()</code> → <code>__inet_check_established()</code> → <code>twsk_unique()</code> → <code>tcp_twsk_unique()</code>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c - tcp_twsk_unique()
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=n>reuse</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_tw_reuse</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=c1>// 检查条件: 双方支持时间戳 &amp;&amp; (reuse开启 &amp;&amp; TIME_WAIT已存在&gt;1秒)
+</span></span></span><span class=line><span class=cl><span class=k>if</span> <span class=p>(</span><span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_ts_recent_stamp</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>    <span class=p>(</span><span class=o>!</span><span class=n>twp</span> <span class=o>||</span> <span class=p>(</span><span class=n>reuse</span> <span class=o>&amp;&amp;</span> <span class=nf>time_after32</span><span class=p>(</span><span class=n>now</span><span class=p>,</span> <span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_ts_recent_stamp</span><span class=p>))))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>write_seq</span> <span class=o>=</span> <span class=n>tcptw</span><span class=o>-&gt;</span><span class=n>tw_snd_nxt</span> <span class=o>+</span> <span class=mi>65535</span> <span class=o>+</span> <span class=mi>2</span><span class=p>;</span>  <span class=c1>// 继承序列号
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=mi>1</span><span class=p>;</span>  <span class=c1>// 可复用
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>核心规则：<strong>sysctl 开启，TIME_WAIT 已存在超过 1 秒，双方支持 TCP 时间戳（PAWS 保证安全），允许 <code>connect()</code> 复用 TIME_WAIT 的四元组</strong>。典型场景是反向代理（如 HAProxy）大量短连接到后端，临时端口被 TIME_WAIT 耗尽。</p><h3 id=55-三者互不干扰的原因>5.5 三者互不干扰的原因</h3><p>三个机制在代码中完全独立，不存在交叉影响：</p><ol><li><p><strong><code>connect()</code> 路径不受 SO_REUSEADDR/SO_REUSEPORT 影响</strong>：<code>__inet_hash_connect()</code> 创建 <code>bind_bucket</code> 时将 <code>fastreuse</code> 和 <code>fastreuseport</code> 设为 <code>-1</code>（connect 专用标记）。遍历 bhash 时，如果发现 <code>fastreuse >= 0</code>（被 <code>bind()</code> 占用），直接跳过该端口（<code>goto next_port</code>），不检查 <code>sk_reuse</code> 或 <code>sk_reuseport</code>。</p></li><li><p><strong><code>bind()</code> 路径不受 tcp_tw_reuse 影响</strong>：<code>inet_csk_get_port()</code> 在 bhash 层面检查端口冲突，不调用 <code>tcp_twsk_unique()</code>。即使 <code>tcp_tw_reuse=1</code>，<code>bind()</code> 到一个被 TIME_WAIT 占用的端口仍需要 <code>SO_REUSEADDR</code>。</p></li><li><p><strong>tcp_tw_reuse 在 ehash 层面工作</strong>：它判断的是四元组级别的 TIME_WAIT 复用，而 <code>SO_REUSEADDR/SO_REUSEPORT</code> 在 bhash 层面判断端口级别的绑定冲突。</p></li></ol><hr><h2 id=6-socket-在哈希表中的生命周期>6. socket 在哈希表中的生命周期</h2><p>以客户端 <code>192.168.1.100</code> 连接 <code>10.0.0.1:8080</code>，分配端口 <code>45678</code> 为例：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>分配完成后, socket 同时存在于 bhash 和 ehash:
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>bhash[inet_bhashfn(net, 45678, bhash_size)]:
+</span></span><span class=line><span class=cl>    └── inet_bind_bucket (port=45678, fastreuse=-1)
+</span></span><span class=line><span class=cl>            └── owners: sk
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>ehash[inet_ehashfn(net, 192.168.1.100, 45678, 10.0.0.1, 8080) &amp; ehash_mask]:
+</span></span><span class=line><span class=cl>    └── sk (sk_hash=hash, state=TCP_SYN_SENT)
+</span></span></code></pre></td></tr></table></div></div><p>同一客户端再连接 <code>10.0.0.2:8080</code>，四元组不同，可以复用端口 45678：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>bhash 中同一个 bind_bucket:
+</span></span><span class=line><span class=cl>    └── inet_bind_bucket (port=45678)
+</span></span><span class=line><span class=cl>            └── owners: sk1 → sk2    (两个socket共享端口)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>ehash 中不同的桶(四元组不同, 哈希值不同):
+</span></span><span class=line><span class=cl>    ehash[hash1]: sk1 (192.168.1.100:45678 → 10.0.0.1:8080)
+</span></span><span class=line><span class=cl>    ehash[hash2]: sk2 (192.168.1.100:45678 → 10.0.0.2:8080)
+</span></span></code></pre></td></tr></table></div></div><hr><h3 id=61-单个-socket-的双哈希表链接>6.1 单个 socket 的双哈希表链接</h3><p>一个已建立连接的 socket 通过 <code>sock_common</code> 中的不同字段同时链入 ehash 和 bhash：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>                struct sock
+</span></span><span class=line><span class=cl>                ┌────────────────────────────────────┐
+</span></span><span class=line><span class=cl>                │ sock_common:                       │
+</span></span><span class=line><span class=cl>                │   skc_nulls_node ────────────────┐ │ → ehash_bucket.chain
+</span></span><span class=line><span class=cl>                │   skc_bind_node  ──────────────┐ │ │ → bind_bucket.owners
+</span></span><span class=line><span class=cl>                │   skc_hash, skc_addrpair, ...  │ │ │
+</span></span><span class=line><span class=cl>                │                                │ │ │
+</span></span><span class=line><span class=cl>                │ inet_connection_sock:           │ │ │
+</span></span><span class=line><span class=cl>                │   icsk_bind_hash ──→ bind_bucket│ │ │ (反向指针)
+</span></span><span class=line><span class=cl>                └────────────────────────────────┼─┼─┘
+</span></span><span class=line><span class=cl>                                                 │ │
+</span></span><span class=line><span class=cl>                     bhash                       │ │       ehash
+</span></span><span class=line><span class=cl>                ┌────────────┐                   │ │  ┌────────────┐
+</span></span><span class=line><span class=cl>                │bind_bucket │                   │ │  │ehash_bucket│
+</span></span><span class=line><span class=cl>                │ owners: ───┼───────────────────┘ └──┼── chain    │
+</span></span><span class=line><span class=cl>                │ port: 45678│                        └────────────┘
+</span></span><span class=line><span class=cl>                └────────────┘
+</span></span></code></pre></td></tr></table></div></div><h3 id=62-连接生命周期中的哈希表迁移>6.2 连接生命周期中的哈希表迁移</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>bind()         → bhash: [bind_bucket] → owners: [sk]
+</span></span><span class=line><span class=cl>                 ehash: (不在)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>connect()成功  → bhash: [bind_bucket] → owners: [sk]
+</span></span><span class=line><span class=cl>                 ehash: [ehash_bucket] → chain: [sk]
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>ESTABLISHED    → (同上, 状态变为ESTABLISHED)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>→ TIME_WAIT    → bhash: [bind_bucket] → owners: [tw]  (sk已从owners删除)
+</span></span><span class=line><span class=cl>(hashdance)      ehash: [ehash_bucket] → chain: [tw]  (sk已从chain删除)
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>→ 2MSL超时     → bhash: (tw已删除, bind_bucket可能被销毁)
+</span></span><span class=line><span class=cl>(twsk_kill)      ehash: (tw已删除)
+</span></span></code></pre></td></tr></table></div></div><hr><hr><h2 id=附录-a-spin_lock_bh-与-spin_lock-的使用>附录 A. spin_lock_bh 与 spin_lock 的使用</h2><blockquote><p>本节是并发背景知识，从主线 §2 移出，避免打断 connect 端口分配的叙事。</p></blockquote><h3 id=先理解背景谁会访问哈希表>先理解背景：谁会访问哈希表？</h3><p>Linux 中有两种执行上下文会操作 TCP 哈希表：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>执行上下文1：进程上下文（可被抢占）
+</span></span><span class=line><span class=cl>  用户调用 connect() → 内核在进程上下文中执行 __inet_hash_connect()
+</span></span><span class=line><span class=cl>  → 操作 bhash 和 ehash
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>执行上下文2：软中断上下文（softirq，优先级更高）
+</span></span><span class=line><span class=cl>  网卡收到数据包 → 触发 NET_RX_SOFTIRQ → tcp_v4_rcv()
+</span></span><span class=line><span class=cl>  → __inet_lookup_established() 读取 ehash
+</span></span><span class=line><span class=cl>  → 软中断可以打断进程上下文！
+</span></span></code></pre></td></tr></table></div></div><h3 id=如果只用普通-spin_lock-会怎样死锁场景>如果只用普通 spin_lock 会怎样？——死锁场景</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>            CPU 0 时间线
+</span></span><span class=line><span class=cl>            ─────────────────────────────────────────────
+</span></span><span class=line><span class=cl>时刻1       进程上下文: connect()
+</span></span><span class=line><span class=cl>            │  spin_lock(&amp;bhash_bucket-&gt;lock)  ← 成功获取锁
+</span></span><span class=line><span class=cl>            │  正在操作 bhash...
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>时刻2       ↓ 这时网卡收到一个包，触发软中断！
+</span></span><span class=line><span class=cl>            ┌─ 软中断: tcp_v4_rcv()
+</span></span><span class=line><span class=cl>            │  需要查 ehash，如果恰好也要获取同一把锁...
+</span></span><span class=line><span class=cl>            │  spin_lock(&amp;bhash_bucket-&gt;lock)  ← 永远拿不到！
+</span></span><span class=line><span class=cl>            │  ┌──────────────────────────────────────┐
+</span></span><span class=line><span class=cl>            │  │ 死锁！                                │
+</span></span><span class=line><span class=cl>            │  │ 软中断等锁 → 但锁被进程持有            │
+</span></span><span class=line><span class=cl>            │  │ 进程等软中断结束 → 但软中断在等锁       │
+</span></span><span class=line><span class=cl>            │  │ 同一个 CPU 上，谁也无法前进             │
+</span></span><span class=line><span class=cl>            │  └──────────────────────────────────────┘
+</span></span><span class=line><span class=cl>            └─ (永远不会返回)
+</span></span></code></pre></td></tr></table></div></div><p>关键：<strong>软中断可以在同一个 CPU 上抢占进程上下文</strong>。如果进程持锁时被软中断打断，而软中断又要获取同一把锁，就形成了单 CPU 上的自死锁。</p><h3 id=spin_lock_bh-的解决方案>spin_lock_bh 的解决方案</h3><p><code>spin_lock_bh</code> = <code>local_bh_disable()</code> + <code>spin_lock()</code>，即<strong>先禁止本 CPU 的软中断，再获取锁</strong>：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/linux/spinlock_api_smp.h
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>__raw_spin_lock_bh</span><span class=p>(</span><span class=kt>raw_spinlock_t</span> <span class=o>*</span><span class=n>lock</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>__local_bh_disable_ip</span><span class=p>(</span><span class=n>_RET_IP_</span><span class=p>,</span> <span class=n>SOFTIRQ_LOCK_OFFSET</span><span class=p>);</span>  <span class=c1>// 禁止本CPU软中断
+</span></span></span><span class=line><span class=cl>    <span class=nf>spin_acquire</span><span class=p>(</span><span class=o>&amp;</span><span class=n>lock</span><span class=o>-&gt;</span><span class=n>dep_map</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=mi>0</span><span class=p>,</span> <span class=n>_RET_IP_</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>LOCK_CONTENDED</span><span class=p>(</span><span class=n>lock</span><span class=p>,</span> <span class=n>do_raw_spin_trylock</span><span class=p>,</span> <span class=n>do_raw_spin_lock</span><span class=p>);</span>  <span class=c1>// 获取锁
+</span></span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>加了这层保护后，时序变为：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>            CPU 0 时间线
+</span></span><span class=line><span class=cl>            ─────────────────────────────────────────────
+</span></span><span class=line><span class=cl>时刻1       进程上下文: connect()
+</span></span><span class=line><span class=cl>            │  spin_lock_bh(&amp;bhash_bucket-&gt;lock)
+</span></span><span class=line><span class=cl>            │    ├── local_bh_disable()  ← 本CPU软中断被屏蔽
+</span></span><span class=line><span class=cl>            │    └── spin_lock()  ← 获取锁成功
+</span></span><span class=line><span class=cl>            │  正在操作 bhash...
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>时刻2       ↓ 网卡收到包，想触发软中断
+</span></span><span class=line><span class=cl>            ✗ 软中断被禁止了，暂时挂起，不会执行
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>时刻3       │  spin_unlock_bh(&amp;bhash_bucket-&gt;lock)
+</span></span><span class=line><span class=cl>            │    ├── spin_unlock()  ← 释放锁
+</span></span><span class=line><span class=cl>            │    └── local_bh_enable()  ← 恢复软中断
+</span></span><span class=line><span class=cl>            │
+</span></span><span class=line><span class=cl>时刻4       ┌─ 软中断: tcp_v4_rcv()  ← 现在才执行
+</span></span><span class=line><span class=cl>            │  spin_lock(&amp;ehash_lock)  ← 成功，没有冲突
+</span></span><span class=line><span class=cl>            └─ 正常完成
+</span></span></code></pre></td></tr></table></div></div><h3 id=为什么-__inet_check_established-内部只用-spin_lock>为什么 __inet_check_established 内部只用 spin_lock？</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>调用链:
+</span></span><span class=line><span class=cl>  __inet_hash_connect()
+</span></span><span class=line><span class=cl>    spin_lock_bh(&amp;bhash_bucket-&gt;lock)  ← 外层锁，已禁用softirq
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    ├── __inet_check_established()
+</span></span><span class=line><span class=cl>    │     spin_lock(&amp;ehash_lock)       ← 内层锁，不需要再禁用softirq
+</span></span><span class=line><span class=cl>    │     spin_unlock(&amp;ehash_lock)     （因为外层已经禁用了，这里重复禁用没意义）
+</span></span><span class=line><span class=cl>    │
+</span></span><span class=line><span class=cl>    spin_unlock_bh(&amp;bhash_bucket-&gt;lock) ← 释放外层锁 + 恢复softirq
+</span></span></code></pre></td></tr></table></div></div><p><code>local_bh_disable</code> 是<strong>嵌套计数</strong>的（引用计数机制），但 <code>__inet_check_established</code> 作为内层调用，外层已经保证了 softirq 被禁用，所以用普通 <code>spin_lock</code> 即可，避免不必要的 <code>bh_disable/enable</code> 开销。</p><hr><hr><h2 id=附录-b-源码文件索引>附录 B. 源码文件索引</h2><div class=table-wrapper><table><thead><tr><th>文件</th><th>关键内容</th></tr></thead><tbody><tr><td><code>include/net/inet_hashtables.h</code></td><td><code>inet_hashinfo</code>、<code>inet_bind_bucket</code>、<code>inet_bhashfn</code>、<code>INET_MATCH</code></td></tr><tr><td><code>net/ipv4/inet_hashtables.c</code></td><td><code>__inet_hash_connect</code>、<code>__inet_check_established</code>、<code>inet_bind_hash</code></td></tr><tr><td><code>include/net/inet_sock.h</code></td><td><code>__inet_ehashfn</code> (Jenkins hash)</td></tr><tr><td><code>include/net/sock.h</code></td><td><code>sock_common</code>、<code>struct sock</code></td></tr><tr><td><code>include/net/inet_timewait_sock.h</code></td><td><code>inet_timewait_sock</code></td></tr><tr><td><code>net/ipv4/inet_timewait_sock.c</code></td><td><code>inet_twsk_hashdance</code>、<code>inet_twsk_kill</code></td></tr><tr><td><code>include/net/netns/ipv4.h</code></td><td><code>inet_timewait_death_row</code></td></tr><tr><td><code>net/ipv4/tcp_ipv4.c</code></td><td><code>tcp_twsk_unique</code> (TIME_WAIT复用条件, tcp_tw_reuse实现)</td></tr><tr><td><code>net/core/sock.c</code></td><td><code>setsockopt</code> 处理 <code>SO_REUSEADDR</code>→<code>sk_reuse</code>、<code>SO_REUSEPORT</code>→<code>sk_reuseport</code></td></tr><tr><td><code>include/net/timewait_sock.h</code></td><td><code>twsk_unique</code> (间接调用层)</td></tr><tr><td><code>include/linux/jhash.h</code></td><td><code>jhash_3words</code> (Jenkins哈希算法)</td></tr><tr><td><code>net/ipv4/inet_connection_sock.c</code></td><td><code>inet_csk_get_port</code> (bind路径端口分配)</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/%E7%AB%AF%E5%8F%A3/>端口</a>
+<a href=/tags/bhash/>Bhash</a>
+<a href=/tags/ehash/>Ehash</a>
+<a href=/tags/inet_bind_bucket/>Inet_bind_bucket</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

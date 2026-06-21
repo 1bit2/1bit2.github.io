@@ -1,0 +1,888 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="Select系统调用源码流程分析 一、核心调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 用户态: select(nfds, readfds, writefds, exceptfds, timeout) ↓ SYSCALL_DEFINE5(select) // fs/select.c:871 ↓ kern_select() // fs/select.c:837 ↓ core_sys_select() // fs/select.c:749 ↓ do_select() // fs/select.c:578 ├─→ poll_initwait() // 初始化，设置_qproc = __pollwait ├─→ vfs_poll() // 调用file->f_op->poll() │ └─→ sock_poll() // socket文件的poll │ └─→ tcp_poll() // TCP协议的poll │ └─→ sock_poll_wait() │ └─→ poll_wait() │ └─→ __pollwait() // 注册到等待队列 ├─→ poll_schedule_timeout() // 睡眠等待 └─→ poll_freewait() // 清理 二、系统调用入口 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 // fs/select.c:871-874 SYSCALL_DEFINE5(select, int, n, fd_set __user *, inp, fd_set __user *, outp, fd_set __user *, exp, struct __kernel_old_timeval __user *, tvp) { return kern_select(n, inp, outp, exp, tvp); } // fs/select.c:837-859 static int kern_select(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct __kernel_old_timeval __user *tvp) { struct timespec64 end_time, *to = NULL; struct __kernel_old_timeval tv; int ret; if (tvp) { if (copy_from_user(&amp;tv, tvp, sizeof(tv))) // 复制超时时间到内核 return -EFAULT; to = &amp;end_time; // 转换为绝对超时时间 if (poll_select_set_timeout(to, tv.tv_sec + (tv.tv_usec / USEC_PER_SEC), (tv.tv_usec % USEC_PER_SEC) * NSEC_PER_USEC)) return -EINVAL; } ret = core_sys_select(n, inp, outp, exp, to); return poll_select_finish(&amp;end_time, tvp, PT_TIMEVAL, ret); } 三、核心实现 - core_sys_select 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 // fs/select.c:749-835 int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct timespec64 *end_time) { fd_set_bits fds; void *bits; int ret, max_fds; size_t size, alloc_size; struct fdtable *fdt; long stack_fds[SELECT_STACK_ALLOC/sizeof(long)]; // 栈上预分配空间 ret = -EINVAL; if (n < 0) goto out_nofds; // 获取当前进程的最大fd数，避免竞争 rcu_read_lock(); fdt = files_fdtable(current->files); max_fds = fdt->max_fds; rcu_read_unlock(); if (n > max_fds) n = max_fds; // 计算需要的字节数，需要6个位图（输入3个 + 输出3个） size = FDS_BYTES(n); bits = stack_fds; // 优先使用栈上内存 // 栈上空间不足时使用堆内存 if (size > sizeof(stack_fds) / 6) { ret = -ENOMEM; if (size > (SIZE_MAX / 6)) goto out_nofds; alloc_size = 6 * size; bits = kvmalloc(alloc_size, GFP_KERNEL); if (!bits) goto out_nofds; } // 设置6个位图的指针 fds.in = bits; // 输入：监控可读 fds.out = bits + size; // 输入：监控可写 fds.ex = bits + 2*size; // 输入：监控异常 fds.res_in = bits + 3*size; // 输出：就绪可读 fds.res_out = bits + 4*size; // 输出：就绪可写 fds.res_ex = bits + 5*size; // 输出：就绪异常 // 从用户空间复制输入位图 if ((ret = get_fd_set(n, inp, fds.in)) || (ret = get_fd_set(n, outp, fds.out)) || (ret = get_fd_set(n, exp, fds.ex))) goto out; // 清零输出位图 zero_fd_set(n, fds.res_in); zero_fd_set(n, fds.res_out); zero_fd_set(n, fds.res_ex); // 执行实际的select操作 ret = do_select(n, &amp;fds, end_time); if (ret < 0) goto out; if (!ret) { ret = -ERESTARTNOHAND; if (signal_pending(current)) goto out; ret = 0; } // 将结果位图复制回用户空间 if (set_fd_set(n, inp, fds.res_in) || set_fd_set(n, outp, fds.res_out) || set_fd_set(n, exp, fds.res_ex)) ret = -EFAULT; out: if (bits != stack_fds) kvfree(bits); out_nofds: return ret; } 四、核心轮询逻辑 - do_select 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 129 130 131 132 133 134 135 136 137 138 139 140 141 142 143 144 145 // fs/select.c:578-734 static int do_select(int n, fd_set_bits *fds, struct timespec64 *end_time) { ktime_t expire, *to = NULL; struct poll_wqueues table; poll_table *wait; int retval, i, timed_out = 0; u64 slack = 0; __poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0; unsigned long busy_start = 0; // 获取实际需要检查的最大fd编号 rcu_read_lock(); retval = max_select_fd(n, fds); rcu_read_unlock(); if (retval < 0) return retval; n = retval; // 初始化poll等待队列，设置_qproc = __pollwait poll_initwait(&amp;table); wait = &amp;table.pt; // 超时时间为0表示非阻塞模式 if (end_time && !end_time->tv_sec && !end_time->tv_nsec) { wait->_qproc = NULL; // 不注册回调 timed_out = 1; } if (end_time && !timed_out) slack = select_estimate_accuracy(end_time); retval = 0; // 主循环 for (;;) { unsigned long *rinp, *routp, *rexp, *inp, *outp, *exp; bool can_busy_loop = false; inp = fds->in; outp = fds->out; exp = fds->ex; rinp = fds->res_in; routp = fds->res_out; rexp = fds->res_ex; // 遍历所有位图字（每个long包含BITS_PER_LONG个fd） for (i = 0; i < n; ++rinp, ++routp, ++rexp) { unsigned long in, out, ex, all_bits, bit = 1, j; unsigned long res_in = 0, res_out = 0, res_ex = 0; __poll_t mask; in = *inp++; out = *outp++; ex = *exp++; all_bits = in | out | ex; // 如果这个long中没有任何监控的fd，跳过 if (all_bits == 0) { i += BITS_PER_LONG; continue; } // 遍历long中的每一位 for (j = 0; j < BITS_PER_LONG; ++j, ++i, bit <<= 1) { struct fd f; if (i >= n) break; if (!(bit & all_bits)) continue; mask = EPOLLNVAL; f = fdget(i); if (f.file) { // 设置等待的事件类型 wait_key_set(wait, in, out, bit, busy_flag); // 调用文件的poll函数 mask = vfs_poll(f.file, wait); fdput(f); } // 检查可读事件 if ((mask & POLLIN_SET) && (in & bit)) { res_in |= bit; retval++; wait->_qproc = NULL; // 有就绪fd，不再注册回调 } // 检查可写事件 if ((mask & POLLOUT_SET) && (out & bit)) { res_out |= bit; retval++; wait->_qproc = NULL; } // 检查异常事件 if ((mask & POLLEX_SET) && (ex & bit)) { res_ex |= bit; retval++; wait->_qproc = NULL; } if (retval) { can_busy_loop = false; busy_flag = 0; } else if (busy_flag & mask) can_busy_loop = true; } // 保存本轮结果 if (res_in) *rinp = res_in; if (res_out) *routp = res_out; if (res_ex) *rexp = res_ex; cond_resched(); } // 第一轮后不再注册回调 wait->_qproc = NULL; // 退出条件：有就绪fd、超时、或收到信号 if (retval || timed_out || signal_pending(current)) break; if (table.error) { retval = table.error; break; } // busy loop优化 if (can_busy_loop && !need_resched()) { if (!busy_start) { busy_start = busy_loop_current_time(); continue; } if (!busy_loop_timeout(busy_start)) continue; } busy_flag = 0; // 设置超时 if (end_time && !to) { expire = timespec64_to_ktime(*end_time); to = &amp;expire; } // 进入睡眠等待 if (!poll_schedule_timeout(&amp;table, TASK_INTERRUPTIBLE, to, slack)) timed_out = 1; } // 清理等待队列 poll_freewait(&amp;table); return retval; } 五、等待队列机制 5.1 poll_initwait 1 2 3 4 5 6 7 8 9 10 // fs/select.c:125-134 void poll_initwait(struct poll_wqueues *pwq) { init_poll_funcptr(&amp;pwq->pt, __pollwait); // 设置回调函数 pwq->polling_task = current; // 记录当前任务 pwq->triggered = 0; // 未触发 pwq->error = 0; pwq->table = NULL; pwq->inline_index = 0; } 5.2 __pollwait - 注册到文件的等待队列 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 // fs/select.c:283-299 static void __pollwait(struct file *filp, wait_queue_head_t *wait_address, poll_table *p) { struct poll_wqueues *pwq = container_of(p, struct poll_wqueues, pt); struct poll_table_entry *entry = poll_get_entry(pwq); // 分配条目 if (!entry) return; entry->filp = get_file(filp); // 增加文件引用 entry->wait_address = wait_address; // 记录等待队列头 entry->key = p->_key; // 记录感兴趣的事件 // 设置唤醒回调为pollwake init_waitqueue_func_entry(&amp;entry->wait, pollwake); entry->wait.private = pwq; // 将等待队列项添加到文件的等待队列 add_wait_queue(wait_address, &amp;entry->wait); } 5.3 pollwake - 唤醒回调 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 // fs/select.c:260-269 static int pollwake(wait_queue_entry_t *wait, unsigned mode, int sync, void *key) { struct poll_table_entry *entry; entry = container_of(wait, struct poll_table_entry, wait); // 事件不匹配则不唤醒 if (key && !(key_to_poll(key) & entry->key)) return 0; return __pollwake(wait, mode, sync, key); } // fs/select.c:227-248 static int __pollwake(wait_queue_entry_t *wait, unsigned mode, int sync, void *key) { struct poll_wqueues *pwq = wait->private; DECLARE_WAITQUEUE(dummy_wait, pwq->polling_task); smp_wmb(); pwq->triggered = 1; // 标记已触发 // 唤醒select进程 return default_wake_function(&amp;dummy_wait, mode, sync, key); } 5.4 poll_freewait - 清理资源 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 // fs/select.c:155-177 void poll_freewait(struct poll_wqueues *pwq) { struct poll_table_page *p = pwq->table; int i; // 释放内联条目 for (i = 0; i < pwq->inline_index; i++) free_poll_entry(pwq->inline_entries + i); // 释放页表链表 while (p) { struct poll_table_entry *entry; struct poll_table_page *old; entry = p->entry; do { entry--; free_poll_entry(entry); // 从等待队列移除，释放文件引用 } while (entry > p->entries); old = p; p = p->next; free_page((unsigned long) old); } } 六、vfs_poll调用链（以TCP socket为例） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 vfs_poll(file, wait) // include/linux/poll.h:86 ↓ file->f_op->poll(file, pt) // file->f_op = socket_file_ops ↓ sock_poll(file, wait) // net/socket.c:1293 ↓ sock->ops->poll(file, sock, wait) // sock->ops = inet_stream_ops ↓ tcp_poll(file, sock, wait) // net/ipv4/tcp.c:499 ↓ sock_poll_wait(file, sock, wait) // include/net/sock.h:2263 ↓ poll_wait(file, &amp;sock->wq.wait, wait) // include/linux/poll.h:48 ↓ wait->_qproc(file, &amp;sock->wq.wait, wait) // 对于select: _qproc = __pollwait ↓ __pollwait() // fs/select.c:283 ↓ add_wait_queue(&amp;sock->wq.wait, &amp;entry->wait) // kernel/sched/wait.c:18 七、唤醒流程（数据到达socket时） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 TCP数据到达 ↓ tcp_data_ready(sk) // net/ipv4/tcp_input.c:4992 ↓ sk->sk_data_ready(sk) // = sock_def_readable ↓ sock_def_readable(sk) // net/core/sock.c:3051 ↓ wake_up_interruptible_sync_poll(&amp;wq->wait, EPOLLIN | ...) ↓ __wake_up_common() // kernel/sched/wait.c:103 ↓ curr->func() // = pollwake ↓ pollwake() // fs/select.c:260 ↓ __pollwake() // fs/select.c:227 ├─→ pwq->triggered = 1 └─→ default_wake_function() // kernel/sched/core.c:6753 ↓ try_to_wake_up() // 将进程加入运行队列 八、关键数据结构 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 // 文件描述符位图集合 typedef struct { unsigned long *in; // 输入：监控可读 unsigned long *out; // 输入：监控可写 unsigned long *ex; // 输入：监控异常 unsigned long *res_in; // 输出：就绪可读 unsigned long *res_out; // 输出：就绪可写 unsigned long *res_ex; // 输出：就绪异常 } fd_set_bits; // poll等待队列（include/linux/poll.h:103-111） struct poll_wqueues { poll_table pt; // 包含_qproc回调函数指针 struct poll_table_page *table; struct task_struct *polling_task; int triggered; // 是否被唤醒 int error; int inline_index; struct poll_table_entry inline_entries[N_INLINE_POLL_ENTRIES]; }; // poll table条目（include/linux/poll.h:93-98） struct poll_table_entry { struct file *filp; __poll_t key; // 感兴趣的事件 wait_queue_entry_t wait; // 等待队列项 wait_queue_head_t *wait_address; // 等待队列头 }; // poll table（include/linux/poll.h:43-46） typedef struct poll_table_struct { poll_queue_proc _qproc; // 回调函数（select时为__pollwait） __poll_t _key; // 事件掩码 } poll_table; 九、事件掩码定义 1 2 3 4 // fs/select.c:67-77 #define POLLIN_SET (EPOLLRDNORM | EPOLLRDBAND | EPOLLIN | EPOLLHUP | EPOLLERR) #define POLLOUT_SET (EPOLLWRBAND | EPOLLWRNORM | EPOLLOUT | EPOLLERR) #define POLLEX_SET (EPOLLPRI) 事件类型 含义 EPOLLIN 有数据可读 EPOLLOUT 可以写入数据 EPOLLPRI 有紧急数据 EPOLLHUP 连接挂断 EPOLLERR 发生错误 十、select vs epoll 特性 select epoll 数据结构 位图 红黑树 + 就绪链表 注册方式 每次都重新注册 只注册一次 就绪通知 遍历所有fd 只返回就绪fd 时间复杂度 O(n) O(活跃连接数) fd数量限制 FD_SETSIZE (1024) 无限制 十一、相关源码文件 文件 功能 fs/select.c select/poll实现 include/linux/poll.h poll数据结构和内联函数 net/socket.c sock_poll实现 net/ipv4/tcp.c tcp_poll实现 include/net/sock.h sock_poll_wait实现 kernel/sched/wait.c 等待队列操作 kernel/sched/core.c try_to_wake_up实现 "><title>Select系统调用源码流程分析</title><link rel=canonical href=https://1bit2.github.io/p/select%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8%E6%BA%90%E7%A0%81%E6%B5%81%E7%A8%8B%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="Select系统调用源码流程分析"><meta property='og:description' content="Select系统调用源码流程分析 一、核心调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 用户态: select(nfds, readfds, writefds, exceptfds, timeout) ↓ SYSCALL_DEFINE5(select) // fs/select.c:871 ↓ kern_select() // fs/select.c:837 ↓ core_sys_select() // fs/select.c:749 ↓ do_select() // fs/select.c:578 ├─→ poll_initwait() // 初始化，设置_qproc = __pollwait ├─→ vfs_poll() // 调用file->f_op->poll() │ └─→ sock_poll() // socket文件的poll │ └─→ tcp_poll() // TCP协议的poll │ └─→ sock_poll_wait() │ └─→ poll_wait() │ └─→ __pollwait() // 注册到等待队列 ├─→ poll_schedule_timeout() // 睡眠等待 └─→ poll_freewait() // 清理 二、系统调用入口 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 // fs/select.c:871-874 SYSCALL_DEFINE5(select, int, n, fd_set __user *, inp, fd_set __user *, outp, fd_set __user *, exp, struct __kernel_old_timeval __user *, tvp) { return kern_select(n, inp, outp, exp, tvp); } // fs/select.c:837-859 static int kern_select(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct __kernel_old_timeval __user *tvp) { struct timespec64 end_time, *to = NULL; struct __kernel_old_timeval tv; int ret; if (tvp) { if (copy_from_user(&amp;tv, tvp, sizeof(tv))) // 复制超时时间到内核 return -EFAULT; to = &amp;end_time; // 转换为绝对超时时间 if (poll_select_set_timeout(to, tv.tv_sec + (tv.tv_usec / USEC_PER_SEC), (tv.tv_usec % USEC_PER_SEC) * NSEC_PER_USEC)) return -EINVAL; } ret = core_sys_select(n, inp, outp, exp, to); return poll_select_finish(&amp;end_time, tvp, PT_TIMEVAL, ret); } 三、核心实现 - core_sys_select 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 // fs/select.c:749-835 int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct timespec64 *end_time) { fd_set_bits fds; void *bits; int ret, max_fds; size_t size, alloc_size; struct fdtable *fdt; long stack_fds[SELECT_STACK_ALLOC/sizeof(long)]; // 栈上预分配空间 ret = -EINVAL; if (n < 0) goto out_nofds; // 获取当前进程的最大fd数，避免竞争 rcu_read_lock(); fdt = files_fdtable(current->files); max_fds = fdt->max_fds; rcu_read_unlock(); if (n > max_fds) n = max_fds; // 计算需要的字节数，需要6个位图（输入3个 + 输出3个） size = FDS_BYTES(n); bits = stack_fds; // 优先使用栈上内存 // 栈上空间不足时使用堆内存 if (size > sizeof(stack_fds) / 6) { ret = -ENOMEM; if (size > (SIZE_MAX / 6)) goto out_nofds; alloc_size = 6 * size; bits = kvmalloc(alloc_size, GFP_KERNEL); if (!bits) goto out_nofds; } // 设置6个位图的指针 fds.in = bits; // 输入：监控可读 fds.out = bits + size; // 输入：监控可写 fds.ex = bits + 2*size; // 输入：监控异常 fds.res_in = bits + 3*size; // 输出：就绪可读 fds.res_out = bits + 4*size; // 输出：就绪可写 fds.res_ex = bits + 5*size; // 输出：就绪异常 // 从用户空间复制输入位图 if ((ret = get_fd_set(n, inp, fds.in)) || (ret = get_fd_set(n, outp, fds.out)) || (ret = get_fd_set(n, exp, fds.ex))) goto out; // 清零输出位图 zero_fd_set(n, fds.res_in); zero_fd_set(n, fds.res_out); zero_fd_set(n, fds.res_ex); // 执行实际的select操作 ret = do_select(n, &amp;fds, end_time); if (ret < 0) goto out; if (!ret) { ret = -ERESTARTNOHAND; if (signal_pending(current)) goto out; ret = 0; } // 将结果位图复制回用户空间 if (set_fd_set(n, inp, fds.res_in) || set_fd_set(n, outp, fds.res_out) || set_fd_set(n, exp, fds.res_ex)) ret = -EFAULT; out: if (bits != stack_fds) kvfree(bits); out_nofds: return ret; } 四、核心轮询逻辑 - do_select 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 129 130 131 132 133 134 135 136 137 138 139 140 141 142 143 144 145 // fs/select.c:578-734 static int do_select(int n, fd_set_bits *fds, struct timespec64 *end_time) { ktime_t expire, *to = NULL; struct poll_wqueues table; poll_table *wait; int retval, i, timed_out = 0; u64 slack = 0; __poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0; unsigned long busy_start = 0; // 获取实际需要检查的最大fd编号 rcu_read_lock(); retval = max_select_fd(n, fds); rcu_read_unlock(); if (retval < 0) return retval; n = retval; // 初始化poll等待队列，设置_qproc = __pollwait poll_initwait(&amp;table); wait = &amp;table.pt; // 超时时间为0表示非阻塞模式 if (end_time && !end_time->tv_sec && !end_time->tv_nsec) { wait->_qproc = NULL; // 不注册回调 timed_out = 1; } if (end_time && !timed_out) slack = select_estimate_accuracy(end_time); retval = 0; // 主循环 for (;;) { unsigned long *rinp, *routp, *rexp, *inp, *outp, *exp; bool can_busy_loop = false; inp = fds->in; outp = fds->out; exp = fds->ex; rinp = fds->res_in; routp = fds->res_out; rexp = fds->res_ex; // 遍历所有位图字（每个long包含BITS_PER_LONG个fd） for (i = 0; i < n; ++rinp, ++routp, ++rexp) { unsigned long in, out, ex, all_bits, bit = 1, j; unsigned long res_in = 0, res_out = 0, res_ex = 0; __poll_t mask; in = *inp++; out = *outp++; ex = *exp++; all_bits = in | out | ex; // 如果这个long中没有任何监控的fd，跳过 if (all_bits == 0) { i += BITS_PER_LONG; continue; } // 遍历long中的每一位 for (j = 0; j < BITS_PER_LONG; ++j, ++i, bit <<= 1) { struct fd f; if (i >= n) break; if (!(bit & all_bits)) continue; mask = EPOLLNVAL; f = fdget(i); if (f.file) { // 设置等待的事件类型 wait_key_set(wait, in, out, bit, busy_flag); // 调用文件的poll函数 mask = vfs_poll(f.file, wait); fdput(f); } // 检查可读事件 if ((mask & POLLIN_SET) && (in & bit)) { res_in |= bit; retval++; wait->_qproc = NULL; // 有就绪fd，不再注册回调 } // 检查可写事件 if ((mask & POLLOUT_SET) && (out & bit)) { res_out |= bit; retval++; wait->_qproc = NULL; } // 检查异常事件 if ((mask & POLLEX_SET) && (ex & bit)) { res_ex |= bit; retval++; wait->_qproc = NULL; } if (retval) { can_busy_loop = false; busy_flag = 0; } else if (busy_flag & mask) can_busy_loop = true; } // 保存本轮结果 if (res_in) *rinp = res_in; if (res_out) *routp = res_out; if (res_ex) *rexp = res_ex; cond_resched(); } // 第一轮后不再注册回调 wait->_qproc = NULL; // 退出条件：有就绪fd、超时、或收到信号 if (retval || timed_out || signal_pending(current)) break; if (table.error) { retval = table.error; break; } // busy loop优化 if (can_busy_loop && !need_resched()) { if (!busy_start) { busy_start = busy_loop_current_time(); continue; } if (!busy_loop_timeout(busy_start)) continue; } busy_flag = 0; // 设置超时 if (end_time && !to) { expire = timespec64_to_ktime(*end_time); to = &amp;expire; } // 进入睡眠等待 if (!poll_schedule_timeout(&amp;table, TASK_INTERRUPTIBLE, to, slack)) timed_out = 1; } // 清理等待队列 poll_freewait(&amp;table); return retval; } 五、等待队列机制 5.1 poll_initwait 1 2 3 4 5 6 7 8 9 10 // fs/select.c:125-134 void poll_initwait(struct poll_wqueues *pwq) { init_poll_funcptr(&amp;pwq->pt, __pollwait); // 设置回调函数 pwq->polling_task = current; // 记录当前任务 pwq->triggered = 0; // 未触发 pwq->error = 0; pwq->table = NULL; pwq->inline_index = 0; } 5.2 __pollwait - 注册到文件的等待队列 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 // fs/select.c:283-299 static void __pollwait(struct file *filp, wait_queue_head_t *wait_address, poll_table *p) { struct poll_wqueues *pwq = container_of(p, struct poll_wqueues, pt); struct poll_table_entry *entry = poll_get_entry(pwq); // 分配条目 if (!entry) return; entry->filp = get_file(filp); // 增加文件引用 entry->wait_address = wait_address; // 记录等待队列头 entry->key = p->_key; // 记录感兴趣的事件 // 设置唤醒回调为pollwake init_waitqueue_func_entry(&amp;entry->wait, pollwake); entry->wait.private = pwq; // 将等待队列项添加到文件的等待队列 add_wait_queue(wait_address, &amp;entry->wait); } 5.3 pollwake - 唤醒回调 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 // fs/select.c:260-269 static int pollwake(wait_queue_entry_t *wait, unsigned mode, int sync, void *key) { struct poll_table_entry *entry; entry = container_of(wait, struct poll_table_entry, wait); // 事件不匹配则不唤醒 if (key && !(key_to_poll(key) & entry->key)) return 0; return __pollwake(wait, mode, sync, key); } // fs/select.c:227-248 static int __pollwake(wait_queue_entry_t *wait, unsigned mode, int sync, void *key) { struct poll_wqueues *pwq = wait->private; DECLARE_WAITQUEUE(dummy_wait, pwq->polling_task); smp_wmb(); pwq->triggered = 1; // 标记已触发 // 唤醒select进程 return default_wake_function(&amp;dummy_wait, mode, sync, key); } 5.4 poll_freewait - 清理资源 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 // fs/select.c:155-177 void poll_freewait(struct poll_wqueues *pwq) { struct poll_table_page *p = pwq->table; int i; // 释放内联条目 for (i = 0; i < pwq->inline_index; i++) free_poll_entry(pwq->inline_entries + i); // 释放页表链表 while (p) { struct poll_table_entry *entry; struct poll_table_page *old; entry = p->entry; do { entry--; free_poll_entry(entry); // 从等待队列移除，释放文件引用 } while (entry > p->entries); old = p; p = p->next; free_page((unsigned long) old); } } 六、vfs_poll调用链（以TCP socket为例） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 vfs_poll(file, wait) // include/linux/poll.h:86 ↓ file->f_op->poll(file, pt) // file->f_op = socket_file_ops ↓ sock_poll(file, wait) // net/socket.c:1293 ↓ sock->ops->poll(file, sock, wait) // sock->ops = inet_stream_ops ↓ tcp_poll(file, sock, wait) // net/ipv4/tcp.c:499 ↓ sock_poll_wait(file, sock, wait) // include/net/sock.h:2263 ↓ poll_wait(file, &amp;sock->wq.wait, wait) // include/linux/poll.h:48 ↓ wait->_qproc(file, &amp;sock->wq.wait, wait) // 对于select: _qproc = __pollwait ↓ __pollwait() // fs/select.c:283 ↓ add_wait_queue(&amp;sock->wq.wait, &amp;entry->wait) // kernel/sched/wait.c:18 七、唤醒流程（数据到达socket时） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 TCP数据到达 ↓ tcp_data_ready(sk) // net/ipv4/tcp_input.c:4992 ↓ sk->sk_data_ready(sk) // = sock_def_readable ↓ sock_def_readable(sk) // net/core/sock.c:3051 ↓ wake_up_interruptible_sync_poll(&amp;wq->wait, EPOLLIN | ...) ↓ __wake_up_common() // kernel/sched/wait.c:103 ↓ curr->func() // = pollwake ↓ pollwake() // fs/select.c:260 ↓ __pollwake() // fs/select.c:227 ├─→ pwq->triggered = 1 └─→ default_wake_function() // kernel/sched/core.c:6753 ↓ try_to_wake_up() // 将进程加入运行队列 八、关键数据结构 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 // 文件描述符位图集合 typedef struct { unsigned long *in; // 输入：监控可读 unsigned long *out; // 输入：监控可写 unsigned long *ex; // 输入：监控异常 unsigned long *res_in; // 输出：就绪可读 unsigned long *res_out; // 输出：就绪可写 unsigned long *res_ex; // 输出：就绪异常 } fd_set_bits; // poll等待队列（include/linux/poll.h:103-111） struct poll_wqueues { poll_table pt; // 包含_qproc回调函数指针 struct poll_table_page *table; struct task_struct *polling_task; int triggered; // 是否被唤醒 int error; int inline_index; struct poll_table_entry inline_entries[N_INLINE_POLL_ENTRIES]; }; // poll table条目（include/linux/poll.h:93-98） struct poll_table_entry { struct file *filp; __poll_t key; // 感兴趣的事件 wait_queue_entry_t wait; // 等待队列项 wait_queue_head_t *wait_address; // 等待队列头 }; // poll table（include/linux/poll.h:43-46） typedef struct poll_table_struct { poll_queue_proc _qproc; // 回调函数（select时为__pollwait） __poll_t _key; // 事件掩码 } poll_table; 九、事件掩码定义 1 2 3 4 // fs/select.c:67-77 #define POLLIN_SET (EPOLLRDNORM | EPOLLRDBAND | EPOLLIN | EPOLLHUP | EPOLLERR) #define POLLOUT_SET (EPOLLWRBAND | EPOLLWRNORM | EPOLLOUT | EPOLLERR) #define POLLEX_SET (EPOLLPRI) 事件类型 含义 EPOLLIN 有数据可读 EPOLLOUT 可以写入数据 EPOLLPRI 有紧急数据 EPOLLHUP 连接挂断 EPOLLERR 发生错误 十、select vs epoll 特性 select epoll 数据结构 位图 红黑树 + 就绪链表 注册方式 每次都重新注册 只注册一次 就绪通知 遍历所有fd 只返回就绪fd 时间复杂度 O(n) O(活跃连接数) fd数量限制 FD_SETSIZE (1024) 无限制 十一、相关源码文件 文件 功能 fs/select.c select/poll实现 include/linux/poll.h poll数据结构和内联函数 net/socket.c sock_poll实现 net/ipv4/tcp.c tcp_poll实现 include/net/sock.h sock_poll_wait实现 kernel/sched/wait.c 等待队列操作 kernel/sched/core.c try_to_wake_up实现 "><meta property='og:url' content='https://1bit2.github.io/p/select%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8%E6%BA%90%E7%A0%81%E6%B5%81%E7%A8%8B%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='select'><meta property='article:tag' content='do_select'><meta property='article:tag' content='poll'><meta property='article:tag' content='fd_set'><meta property='article:published_time' content='2026-04-16T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-16T00:00:00+00:00'><meta name=twitter:title content="Select系统调用源码流程分析"><meta name=twitter:description content="Select系统调用源码流程分析 一、核心调用链 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 用户态: select(nfds, readfds, writefds, exceptfds, timeout) ↓ SYSCALL_DEFINE5(select) // fs/select.c:871 ↓ kern_select() // fs/select.c:837 ↓ core_sys_select() // fs/select.c:749 ↓ do_select() // fs/select.c:578 ├─→ poll_initwait() // 初始化，设置_qproc = __pollwait ├─→ vfs_poll() // 调用file->f_op->poll() │ └─→ sock_poll() // socket文件的poll │ └─→ tcp_poll() // TCP协议的poll │ └─→ sock_poll_wait() │ └─→ poll_wait() │ └─→ __pollwait() // 注册到等待队列 ├─→ poll_schedule_timeout() // 睡眠等待 └─→ poll_freewait() // 清理 二、系统调用入口 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 // fs/select.c:871-874 SYSCALL_DEFINE5(select, int, n, fd_set __user *, inp, fd_set __user *, outp, fd_set __user *, exp, struct __kernel_old_timeval __user *, tvp) { return kern_select(n, inp, outp, exp, tvp); } // fs/select.c:837-859 static int kern_select(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct __kernel_old_timeval __user *tvp) { struct timespec64 end_time, *to = NULL; struct __kernel_old_timeval tv; int ret; if (tvp) { if (copy_from_user(&amp;tv, tvp, sizeof(tv))) // 复制超时时间到内核 return -EFAULT; to = &amp;end_time; // 转换为绝对超时时间 if (poll_select_set_timeout(to, tv.tv_sec + (tv.tv_usec / USEC_PER_SEC), (tv.tv_usec % USEC_PER_SEC) * NSEC_PER_USEC)) return -EINVAL; } ret = core_sys_select(n, inp, outp, exp, to); return poll_select_finish(&amp;end_time, tvp, PT_TIMEVAL, ret); } 三、核心实现 - core_sys_select 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 // fs/select.c:749-835 int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct timespec64 *end_time) { fd_set_bits fds; void *bits; int ret, max_fds; size_t size, alloc_size; struct fdtable *fdt; long stack_fds[SELECT_STACK_ALLOC/sizeof(long)]; // 栈上预分配空间 ret = -EINVAL; if (n < 0) goto out_nofds; // 获取当前进程的最大fd数，避免竞争 rcu_read_lock(); fdt = files_fdtable(current->files); max_fds = fdt->max_fds; rcu_read_unlock(); if (n > max_fds) n = max_fds; // 计算需要的字节数，需要6个位图（输入3个 + 输出3个） size = FDS_BYTES(n); bits = stack_fds; // 优先使用栈上内存 // 栈上空间不足时使用堆内存 if (size > sizeof(stack_fds) / 6) { ret = -ENOMEM; if (size > (SIZE_MAX / 6)) goto out_nofds; alloc_size = 6 * size; bits = kvmalloc(alloc_size, GFP_KERNEL); if (!bits) goto out_nofds; } // 设置6个位图的指针 fds.in = bits; // 输入：监控可读 fds.out = bits + size; // 输入：监控可写 fds.ex = bits + 2*size; // 输入：监控异常 fds.res_in = bits + 3*size; // 输出：就绪可读 fds.res_out = bits + 4*size; // 输出：就绪可写 fds.res_ex = bits + 5*size; // 输出：就绪异常 // 从用户空间复制输入位图 if ((ret = get_fd_set(n, inp, fds.in)) || (ret = get_fd_set(n, outp, fds.out)) || (ret = get_fd_set(n, exp, fds.ex))) goto out; // 清零输出位图 zero_fd_set(n, fds.res_in); zero_fd_set(n, fds.res_out); zero_fd_set(n, fds.res_ex); // 执行实际的select操作 ret = do_select(n, &amp;fds, end_time); if (ret < 0) goto out; if (!ret) { ret = -ERESTARTNOHAND; if (signal_pending(current)) goto out; ret = 0; } // 将结果位图复制回用户空间 if (set_fd_set(n, inp, fds.res_in) || set_fd_set(n, outp, fds.res_out) || set_fd_set(n, exp, fds.res_ex)) ret = -EFAULT; out: if (bits != stack_fds) kvfree(bits); out_nofds: return ret; } 四、核心轮询逻辑 - do_select 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 129 130 131 132 133 134 135 136 137 138 139 140 141 142 143 144 145 // fs/select.c:578-734 static int do_select(int n, fd_set_bits *fds, struct timespec64 *end_time) { ktime_t expire, *to = NULL; struct poll_wqueues table; poll_table *wait; int retval, i, timed_out = 0; u64 slack = 0; __poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0; unsigned long busy_start = 0; // 获取实际需要检查的最大fd编号 rcu_read_lock(); retval = max_select_fd(n, fds); rcu_read_unlock(); if (retval < 0) return retval; n = retval; // 初始化poll等待队列，设置_qproc = __pollwait poll_initwait(&amp;table); wait = &amp;table.pt; // 超时时间为0表示非阻塞模式 if (end_time && !end_time->tv_sec && !end_time->tv_nsec) { wait->_qproc = NULL; // 不注册回调 timed_out = 1; } if (end_time && !timed_out) slack = select_estimate_accuracy(end_time); retval = 0; // 主循环 for (;;) { unsigned long *rinp, *routp, *rexp, *inp, *outp, *exp; bool can_busy_loop = false; inp = fds->in; outp = fds->out; exp = fds->ex; rinp = fds->res_in; routp = fds->res_out; rexp = fds->res_ex; // 遍历所有位图字（每个long包含BITS_PER_LONG个fd） for (i = 0; i < n; ++rinp, ++routp, ++rexp) { unsigned long in, out, ex, all_bits, bit = 1, j; unsigned long res_in = 0, res_out = 0, res_ex = 0; __poll_t mask; in = *inp++; out = *outp++; ex = *exp++; all_bits = in | out | ex; // 如果这个long中没有任何监控的fd，跳过 if (all_bits == 0) { i += BITS_PER_LONG; continue; } // 遍历long中的每一位 for (j = 0; j < BITS_PER_LONG; ++j, ++i, bit <<= 1) { struct fd f; if (i >= n) break; if (!(bit & all_bits)) continue; mask = EPOLLNVAL; f = fdget(i); if (f.file) { // 设置等待的事件类型 wait_key_set(wait, in, out, bit, busy_flag); // 调用文件的poll函数 mask = vfs_poll(f.file, wait); fdput(f); } // 检查可读事件 if ((mask & POLLIN_SET) && (in & bit)) { res_in |= bit; retval++; wait->_qproc = NULL; // 有就绪fd，不再注册回调 } // 检查可写事件 if ((mask & POLLOUT_SET) && (out & bit)) { res_out |= bit; retval++; wait->_qproc = NULL; } // 检查异常事件 if ((mask & POLLEX_SET) && (ex & bit)) { res_ex |= bit; retval++; wait->_qproc = NULL; } if (retval) { can_busy_loop = false; busy_flag = 0; } else if (busy_flag & mask) can_busy_loop = true; } // 保存本轮结果 if (res_in) *rinp = res_in; if (res_out) *routp = res_out; if (res_ex) *rexp = res_ex; cond_resched(); } // 第一轮后不再注册回调 wait->_qproc = NULL; // 退出条件：有就绪fd、超时、或收到信号 if (retval || timed_out || signal_pending(current)) break; if (table.error) { retval = table.error; break; } // busy loop优化 if (can_busy_loop && !need_resched()) { if (!busy_start) { busy_start = busy_loop_current_time(); continue; } if (!busy_loop_timeout(busy_start)) continue; } busy_flag = 0; // 设置超时 if (end_time && !to) { expire = timespec64_to_ktime(*end_time); to = &amp;expire; } // 进入睡眠等待 if (!poll_schedule_timeout(&amp;table, TASK_INTERRUPTIBLE, to, slack)) timed_out = 1; } // 清理等待队列 poll_freewait(&amp;table); return retval; } 五、等待队列机制 5.1 poll_initwait 1 2 3 4 5 6 7 8 9 10 // fs/select.c:125-134 void poll_initwait(struct poll_wqueues *pwq) { init_poll_funcptr(&amp;pwq->pt, __pollwait); // 设置回调函数 pwq->polling_task = current; // 记录当前任务 pwq->triggered = 0; // 未触发 pwq->error = 0; pwq->table = NULL; pwq->inline_index = 0; } 5.2 __pollwait - 注册到文件的等待队列 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 // fs/select.c:283-299 static void __pollwait(struct file *filp, wait_queue_head_t *wait_address, poll_table *p) { struct poll_wqueues *pwq = container_of(p, struct poll_wqueues, pt); struct poll_table_entry *entry = poll_get_entry(pwq); // 分配条目 if (!entry) return; entry->filp = get_file(filp); // 增加文件引用 entry->wait_address = wait_address; // 记录等待队列头 entry->key = p->_key; // 记录感兴趣的事件 // 设置唤醒回调为pollwake init_waitqueue_func_entry(&amp;entry->wait, pollwake); entry->wait.private = pwq; // 将等待队列项添加到文件的等待队列 add_wait_queue(wait_address, &amp;entry->wait); } 5.3 pollwake - 唤醒回调 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 // fs/select.c:260-269 static int pollwake(wait_queue_entry_t *wait, unsigned mode, int sync, void *key) { struct poll_table_entry *entry; entry = container_of(wait, struct poll_table_entry, wait); // 事件不匹配则不唤醒 if (key && !(key_to_poll(key) & entry->key)) return 0; return __pollwake(wait, mode, sync, key); } // fs/select.c:227-248 static int __pollwake(wait_queue_entry_t *wait, unsigned mode, int sync, void *key) { struct poll_wqueues *pwq = wait->private; DECLARE_WAITQUEUE(dummy_wait, pwq->polling_task); smp_wmb(); pwq->triggered = 1; // 标记已触发 // 唤醒select进程 return default_wake_function(&amp;dummy_wait, mode, sync, key); } 5.4 poll_freewait - 清理资源 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 // fs/select.c:155-177 void poll_freewait(struct poll_wqueues *pwq) { struct poll_table_page *p = pwq->table; int i; // 释放内联条目 for (i = 0; i < pwq->inline_index; i++) free_poll_entry(pwq->inline_entries + i); // 释放页表链表 while (p) { struct poll_table_entry *entry; struct poll_table_page *old; entry = p->entry; do { entry--; free_poll_entry(entry); // 从等待队列移除，释放文件引用 } while (entry > p->entries); old = p; p = p->next; free_page((unsigned long) old); } } 六、vfs_poll调用链（以TCP socket为例） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 vfs_poll(file, wait) // include/linux/poll.h:86 ↓ file->f_op->poll(file, pt) // file->f_op = socket_file_ops ↓ sock_poll(file, wait) // net/socket.c:1293 ↓ sock->ops->poll(file, sock, wait) // sock->ops = inet_stream_ops ↓ tcp_poll(file, sock, wait) // net/ipv4/tcp.c:499 ↓ sock_poll_wait(file, sock, wait) // include/net/sock.h:2263 ↓ poll_wait(file, &amp;sock->wq.wait, wait) // include/linux/poll.h:48 ↓ wait->_qproc(file, &amp;sock->wq.wait, wait) // 对于select: _qproc = __pollwait ↓ __pollwait() // fs/select.c:283 ↓ add_wait_queue(&amp;sock->wq.wait, &amp;entry->wait) // kernel/sched/wait.c:18 七、唤醒流程（数据到达socket时） 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 TCP数据到达 ↓ tcp_data_ready(sk) // net/ipv4/tcp_input.c:4992 ↓ sk->sk_data_ready(sk) // = sock_def_readable ↓ sock_def_readable(sk) // net/core/sock.c:3051 ↓ wake_up_interruptible_sync_poll(&amp;wq->wait, EPOLLIN | ...) ↓ __wake_up_common() // kernel/sched/wait.c:103 ↓ curr->func() // = pollwake ↓ pollwake() // fs/select.c:260 ↓ __pollwake() // fs/select.c:227 ├─→ pwq->triggered = 1 └─→ default_wake_function() // kernel/sched/core.c:6753 ↓ try_to_wake_up() // 将进程加入运行队列 八、关键数据结构 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 // 文件描述符位图集合 typedef struct { unsigned long *in; // 输入：监控可读 unsigned long *out; // 输入：监控可写 unsigned long *ex; // 输入：监控异常 unsigned long *res_in; // 输出：就绪可读 unsigned long *res_out; // 输出：就绪可写 unsigned long *res_ex; // 输出：就绪异常 } fd_set_bits; // poll等待队列（include/linux/poll.h:103-111） struct poll_wqueues { poll_table pt; // 包含_qproc回调函数指针 struct poll_table_page *table; struct task_struct *polling_task; int triggered; // 是否被唤醒 int error; int inline_index; struct poll_table_entry inline_entries[N_INLINE_POLL_ENTRIES]; }; // poll table条目（include/linux/poll.h:93-98） struct poll_table_entry { struct file *filp; __poll_t key; // 感兴趣的事件 wait_queue_entry_t wait; // 等待队列项 wait_queue_head_t *wait_address; // 等待队列头 }; // poll table（include/linux/poll.h:43-46） typedef struct poll_table_struct { poll_queue_proc _qproc; // 回调函数（select时为__pollwait） __poll_t _key; // 事件掩码 } poll_table; 九、事件掩码定义 1 2 3 4 // fs/select.c:67-77 #define POLLIN_SET (EPOLLRDNORM | EPOLLRDBAND | EPOLLIN | EPOLLHUP | EPOLLERR) #define POLLOUT_SET (EPOLLWRBAND | EPOLLWRNORM | EPOLLOUT | EPOLLERR) #define POLLEX_SET (EPOLLPRI) 事件类型 含义 EPOLLIN 有数据可读 EPOLLOUT 可以写入数据 EPOLLPRI 有紧急数据 EPOLLHUP 连接挂断 EPOLLERR 发生错误 十、select vs epoll 特性 select epoll 数据结构 位图 红黑树 + 就绪链表 注册方式 每次都重新注册 只注册一次 就绪通知 遍历所有fd 只返回就绪fd 时间复杂度 O(n) O(活跃连接数) fd数量限制 FD_SETSIZE (1024) 无限制 十一、相关源码文件 文件 功能 fs/select.c select/poll实现 include/linux/poll.h poll数据结构和内联函数 net/socket.c sock_poll实现 net/ipv4/tcp.c tcp_poll实现 include/net/sock.h sock_poll_wait实现 kernel/sched/wait.c 等待队列操作 kernel/sched/core.c try_to_wake_up实现 "><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一核心调用链>一、核心调用链</a></li><li><a href=#二系统调用入口>二、系统调用入口</a></li><li><a href=#三核心实现---core_sys_select>三、核心实现 - core_sys_select</a></li><li><a href=#四核心轮询逻辑---do_select>四、核心轮询逻辑 - do_select</a></li><li><a href=#五等待队列机制>五、等待队列机制</a><ol><li><a href=#51-poll_initwait>5.1 poll_initwait</a></li><li><a href=#52-__pollwait---注册到文件的等待队列>5.2 __pollwait - 注册到文件的等待队列</a></li><li><a href=#53-pollwake---唤醒回调>5.3 pollwake - 唤醒回调</a></li><li><a href=#54-poll_freewait---清理资源>5.4 poll_freewait - 清理资源</a></li></ol></li><li><a href=#六vfs_poll调用链以tcp-socket为例>六、vfs_poll调用链（以TCP socket为例）</a></li><li><a href=#七唤醒流程数据到达socket时>七、唤醒流程（数据到达socket时）</a></li><li><a href=#八关键数据结构>八、关键数据结构</a></li><li><a href=#九事件掩码定义>九、事件掩码定义</a></li><li><a href=#十select-vs-epoll>十、select vs epoll</a></li><li><a href=#十一相关源码文件>十一、相关源码文件</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/select%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8%E6%BA%90%E7%A0%81%E6%B5%81%E7%A8%8B%E5%88%86%E6%9E%90/>Select系统调用源码流程分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 16, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>9 minute read</time></div></footer></div></header><section class=article-content><h1 id=select系统调用源码流程分析>Select系统调用源码流程分析</h1><h2 id=一核心调用链>一、核心调用链</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>用户态: select(nfds, readfds, writefds, exceptfds, timeout)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>SYSCALL_DEFINE5(select)          // fs/select.c:871
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>kern_select()                    // fs/select.c:837
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>core_sys_select()                // fs/select.c:749
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>do_select()                      // fs/select.c:578
+</span></span><span class=line><span class=cl>    ├─→ poll_initwait()          // 初始化，设置_qproc = __pollwait
+</span></span><span class=line><span class=cl>    ├─→ vfs_poll()               // 调用file-&gt;f_op-&gt;poll()
+</span></span><span class=line><span class=cl>    │   └─→ sock_poll()          // socket文件的poll
+</span></span><span class=line><span class=cl>    │       └─→ tcp_poll()       // TCP协议的poll
+</span></span><span class=line><span class=cl>    │           └─→ sock_poll_wait()
+</span></span><span class=line><span class=cl>    │               └─→ poll_wait()
+</span></span><span class=line><span class=cl>    │                   └─→ __pollwait()  // 注册到等待队列
+</span></span><span class=line><span class=cl>    ├─→ poll_schedule_timeout()  // 睡眠等待
+</span></span><span class=line><span class=cl>    └─→ poll_freewait()          // 清理
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=二系统调用入口>二、系统调用入口</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/select.c:871-874
+</span></span></span><span class=line><span class=cl><span class=nf>SYSCALL_DEFINE5</span><span class=p>(</span><span class=n>select</span><span class=p>,</span> <span class=kt>int</span><span class=p>,</span> <span class=n>n</span><span class=p>,</span> <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=p>,</span> <span class=n>inp</span><span class=p>,</span> <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=p>,</span> <span class=n>outp</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>        <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=p>,</span> <span class=n>exp</span><span class=p>,</span> <span class=k>struct</span> <span class=n>__kernel_old_timeval</span> <span class=n>__user</span> <span class=o>*</span><span class=p>,</span> <span class=n>tvp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>kern_select</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>inp</span><span class=p>,</span> <span class=n>outp</span><span class=p>,</span> <span class=n>exp</span><span class=p>,</span> <span class=n>tvp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// fs/select.c:837-859
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>kern_select</span><span class=p>(</span><span class=kt>int</span> <span class=n>n</span><span class=p>,</span> <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=n>inp</span><span class=p>,</span> <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=n>outp</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>               <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=n>exp</span><span class=p>,</span> <span class=k>struct</span> <span class=n>__kernel_old_timeval</span> <span class=n>__user</span> <span class=o>*</span><span class=n>tvp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>timespec64</span> <span class=n>end_time</span><span class=p>,</span> <span class=o>*</span><span class=n>to</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>__kernel_old_timeval</span> <span class=n>tv</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>tvp</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>copy_from_user</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tv</span><span class=p>,</span> <span class=n>tvp</span><span class=p>,</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>tv</span><span class=p>)))</span>  <span class=c1>// 复制超时时间到内核
+</span></span></span><span class=line><span class=cl>            <span class=k>return</span> <span class=o>-</span><span class=n>EFAULT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=n>to</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>end_time</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=c1>// 转换为绝对超时时间
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>poll_select_set_timeout</span><span class=p>(</span><span class=n>to</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                <span class=n>tv</span><span class=p>.</span><span class=n>tv_sec</span> <span class=o>+</span> <span class=p>(</span><span class=n>tv</span><span class=p>.</span><span class=n>tv_usec</span> <span class=o>/</span> <span class=n>USEC_PER_SEC</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>                <span class=p>(</span><span class=n>tv</span><span class=p>.</span><span class=n>tv_usec</span> <span class=o>%</span> <span class=n>USEC_PER_SEC</span><span class=p>)</span> <span class=o>*</span> <span class=n>NSEC_PER_USEC</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=k>return</span> <span class=o>-</span><span class=n>EINVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>ret</span> <span class=o>=</span> <span class=nf>core_sys_select</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>inp</span><span class=p>,</span> <span class=n>outp</span><span class=p>,</span> <span class=n>exp</span><span class=p>,</span> <span class=n>to</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>poll_select_finish</span><span class=p>(</span><span class=o>&amp;</span><span class=n>end_time</span><span class=p>,</span> <span class=n>tvp</span><span class=p>,</span> <span class=n>PT_TIMEVAL</span><span class=p>,</span> <span class=n>ret</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=三核心实现---core_sys_select>三、核心实现 - core_sys_select</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span><span class=lnt>74
+</span><span class=lnt>75
+</span><span class=lnt>76
+</span><span class=lnt>77
+</span><span class=lnt>78
+</span><span class=lnt>79
+</span><span class=lnt>80
+</span><span class=lnt>81
+</span><span class=lnt>82
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/select.c:749-835
+</span></span></span><span class=line><span class=cl><span class=kt>int</span> <span class=nf>core_sys_select</span><span class=p>(</span><span class=kt>int</span> <span class=n>n</span><span class=p>,</span> <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=n>inp</span><span class=p>,</span> <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=n>outp</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>               <span class=n>fd_set</span> <span class=n>__user</span> <span class=o>*</span><span class=n>exp</span><span class=p>,</span> <span class=k>struct</span> <span class=n>timespec64</span> <span class=o>*</span><span class=n>end_time</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>fd_set_bits</span> <span class=n>fds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>void</span> <span class=o>*</span><span class=n>bits</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>ret</span><span class=p>,</span> <span class=n>max_fds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>size_t</span> <span class=n>size</span><span class=p>,</span> <span class=n>alloc_size</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>fdtable</span> <span class=o>*</span><span class=n>fdt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>long</span> <span class=n>stack_fds</span><span class=p>[</span><span class=n>SELECT_STACK_ALLOC</span><span class=o>/</span><span class=k>sizeof</span><span class=p>(</span><span class=kt>long</span><span class=p>)];</span>  <span class=c1>// 栈上预分配空间
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>ret</span> <span class=o>=</span> <span class=o>-</span><span class=n>EINVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>n</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out_nofds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 获取当前进程的最大fd数，避免竞争
+</span></span></span><span class=line><span class=cl>    <span class=nf>rcu_read_lock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>fdt</span> <span class=o>=</span> <span class=nf>files_fdtable</span><span class=p>(</span><span class=n>current</span><span class=o>-&gt;</span><span class=n>files</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>max_fds</span> <span class=o>=</span> <span class=n>fdt</span><span class=o>-&gt;</span><span class=n>max_fds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>rcu_read_unlock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>n</span> <span class=o>&gt;</span> <span class=n>max_fds</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>n</span> <span class=o>=</span> <span class=n>max_fds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 计算需要的字节数，需要6个位图（输入3个 + 输出3个）
+</span></span></span><span class=line><span class=cl>    <span class=n>size</span> <span class=o>=</span> <span class=nf>FDS_BYTES</span><span class=p>(</span><span class=n>n</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>bits</span> <span class=o>=</span> <span class=n>stack_fds</span><span class=p>;</span>  <span class=c1>// 优先使用栈上内存
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 栈上空间不足时使用堆内存
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>size</span> <span class=o>&gt;</span> <span class=k>sizeof</span><span class=p>(</span><span class=n>stack_fds</span><span class=p>)</span> <span class=o>/</span> <span class=mi>6</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=o>-</span><span class=n>ENOMEM</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>size</span> <span class=o>&gt;</span> <span class=p>(</span><span class=n>SIZE_MAX</span> <span class=o>/</span> <span class=mi>6</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>out_nofds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=n>alloc_size</span> <span class=o>=</span> <span class=mi>6</span> <span class=o>*</span> <span class=n>size</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>bits</span> <span class=o>=</span> <span class=nf>kvmalloc</span><span class=p>(</span><span class=n>alloc_size</span><span class=p>,</span> <span class=n>GFP_KERNEL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>bits</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>out_nofds</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 设置6个位图的指针
+</span></span></span><span class=line><span class=cl>    <span class=n>fds</span><span class=p>.</span><span class=n>in</span>      <span class=o>=</span> <span class=n>bits</span><span class=p>;</span>              <span class=c1>// 输入：监控可读
+</span></span></span><span class=line><span class=cl>    <span class=n>fds</span><span class=p>.</span><span class=n>out</span>     <span class=o>=</span> <span class=n>bits</span> <span class=o>+</span>   <span class=n>size</span><span class=p>;</span>     <span class=c1>// 输入：监控可写
+</span></span></span><span class=line><span class=cl>    <span class=n>fds</span><span class=p>.</span><span class=n>ex</span>      <span class=o>=</span> <span class=n>bits</span> <span class=o>+</span> <span class=mi>2</span><span class=o>*</span><span class=n>size</span><span class=p>;</span>     <span class=c1>// 输入：监控异常
+</span></span></span><span class=line><span class=cl>    <span class=n>fds</span><span class=p>.</span><span class=n>res_in</span>  <span class=o>=</span> <span class=n>bits</span> <span class=o>+</span> <span class=mi>3</span><span class=o>*</span><span class=n>size</span><span class=p>;</span>     <span class=c1>// 输出：就绪可读
+</span></span></span><span class=line><span class=cl>    <span class=n>fds</span><span class=p>.</span><span class=n>res_out</span> <span class=o>=</span> <span class=n>bits</span> <span class=o>+</span> <span class=mi>4</span><span class=o>*</span><span class=n>size</span><span class=p>;</span>     <span class=c1>// 输出：就绪可写
+</span></span></span><span class=line><span class=cl>    <span class=n>fds</span><span class=p>.</span><span class=n>res_ex</span>  <span class=o>=</span> <span class=n>bits</span> <span class=o>+</span> <span class=mi>5</span><span class=o>*</span><span class=n>size</span><span class=p>;</span>     <span class=c1>// 输出：就绪异常
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 从用户空间复制输入位图
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>((</span><span class=n>ret</span> <span class=o>=</span> <span class=nf>get_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>inp</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>in</span><span class=p>))</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=p>(</span><span class=n>ret</span> <span class=o>=</span> <span class=nf>get_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>outp</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>out</span><span class=p>))</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=p>(</span><span class=n>ret</span> <span class=o>=</span> <span class=nf>get_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>exp</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>ex</span><span class=p>)))</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 清零输出位图
+</span></span></span><span class=line><span class=cl>    <span class=nf>zero_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>res_in</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>zero_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>res_out</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>zero_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>res_ex</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 执行实际的select操作
+</span></span></span><span class=line><span class=cl>    <span class=n>ret</span> <span class=o>=</span> <span class=nf>do_select</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>fds</span><span class=p>,</span> <span class=n>end_time</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>ret</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>ret</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=o>-</span><span class=n>ERESTARTNOHAND</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=nf>signal_pending</span><span class=p>(</span><span class=n>current</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 将结果位图复制回用户空间
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=nf>set_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>inp</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>res_in</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=nf>set_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>outp</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>res_out</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>        <span class=nf>set_fd_set</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>exp</span><span class=p>,</span> <span class=n>fds</span><span class=p>.</span><span class=n>res_ex</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=n>ret</span> <span class=o>=</span> <span class=o>-</span><span class=n>EFAULT</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>out</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>bits</span> <span class=o>!=</span> <span class=n>stack_fds</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>kvfree</span><span class=p>(</span><span class=n>bits</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=nl>out_nofds</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>ret</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四核心轮询逻辑---do_select>四、核心轮询逻辑 - do_select</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>  1
+</span><span class=lnt>  2
+</span><span class=lnt>  3
+</span><span class=lnt>  4
+</span><span class=lnt>  5
+</span><span class=lnt>  6
+</span><span class=lnt>  7
+</span><span class=lnt>  8
+</span><span class=lnt>  9
+</span><span class=lnt> 10
+</span><span class=lnt> 11
+</span><span class=lnt> 12
+</span><span class=lnt> 13
+</span><span class=lnt> 14
+</span><span class=lnt> 15
+</span><span class=lnt> 16
+</span><span class=lnt> 17
+</span><span class=lnt> 18
+</span><span class=lnt> 19
+</span><span class=lnt> 20
+</span><span class=lnt> 21
+</span><span class=lnt> 22
+</span><span class=lnt> 23
+</span><span class=lnt> 24
+</span><span class=lnt> 25
+</span><span class=lnt> 26
+</span><span class=lnt> 27
+</span><span class=lnt> 28
+</span><span class=lnt> 29
+</span><span class=lnt> 30
+</span><span class=lnt> 31
+</span><span class=lnt> 32
+</span><span class=lnt> 33
+</span><span class=lnt> 34
+</span><span class=lnt> 35
+</span><span class=lnt> 36
+</span><span class=lnt> 37
+</span><span class=lnt> 38
+</span><span class=lnt> 39
+</span><span class=lnt> 40
+</span><span class=lnt> 41
+</span><span class=lnt> 42
+</span><span class=lnt> 43
+</span><span class=lnt> 44
+</span><span class=lnt> 45
+</span><span class=lnt> 46
+</span><span class=lnt> 47
+</span><span class=lnt> 48
+</span><span class=lnt> 49
+</span><span class=lnt> 50
+</span><span class=lnt> 51
+</span><span class=lnt> 52
+</span><span class=lnt> 53
+</span><span class=lnt> 54
+</span><span class=lnt> 55
+</span><span class=lnt> 56
+</span><span class=lnt> 57
+</span><span class=lnt> 58
+</span><span class=lnt> 59
+</span><span class=lnt> 60
+</span><span class=lnt> 61
+</span><span class=lnt> 62
+</span><span class=lnt> 63
+</span><span class=lnt> 64
+</span><span class=lnt> 65
+</span><span class=lnt> 66
+</span><span class=lnt> 67
+</span><span class=lnt> 68
+</span><span class=lnt> 69
+</span><span class=lnt> 70
+</span><span class=lnt> 71
+</span><span class=lnt> 72
+</span><span class=lnt> 73
+</span><span class=lnt> 74
+</span><span class=lnt> 75
+</span><span class=lnt> 76
+</span><span class=lnt> 77
+</span><span class=lnt> 78
+</span><span class=lnt> 79
+</span><span class=lnt> 80
+</span><span class=lnt> 81
+</span><span class=lnt> 82
+</span><span class=lnt> 83
+</span><span class=lnt> 84
+</span><span class=lnt> 85
+</span><span class=lnt> 86
+</span><span class=lnt> 87
+</span><span class=lnt> 88
+</span><span class=lnt> 89
+</span><span class=lnt> 90
+</span><span class=lnt> 91
+</span><span class=lnt> 92
+</span><span class=lnt> 93
+</span><span class=lnt> 94
+</span><span class=lnt> 95
+</span><span class=lnt> 96
+</span><span class=lnt> 97
+</span><span class=lnt> 98
+</span><span class=lnt> 99
+</span><span class=lnt>100
+</span><span class=lnt>101
+</span><span class=lnt>102
+</span><span class=lnt>103
+</span><span class=lnt>104
+</span><span class=lnt>105
+</span><span class=lnt>106
+</span><span class=lnt>107
+</span><span class=lnt>108
+</span><span class=lnt>109
+</span><span class=lnt>110
+</span><span class=lnt>111
+</span><span class=lnt>112
+</span><span class=lnt>113
+</span><span class=lnt>114
+</span><span class=lnt>115
+</span><span class=lnt>116
+</span><span class=lnt>117
+</span><span class=lnt>118
+</span><span class=lnt>119
+</span><span class=lnt>120
+</span><span class=lnt>121
+</span><span class=lnt>122
+</span><span class=lnt>123
+</span><span class=lnt>124
+</span><span class=lnt>125
+</span><span class=lnt>126
+</span><span class=lnt>127
+</span><span class=lnt>128
+</span><span class=lnt>129
+</span><span class=lnt>130
+</span><span class=lnt>131
+</span><span class=lnt>132
+</span><span class=lnt>133
+</span><span class=lnt>134
+</span><span class=lnt>135
+</span><span class=lnt>136
+</span><span class=lnt>137
+</span><span class=lnt>138
+</span><span class=lnt>139
+</span><span class=lnt>140
+</span><span class=lnt>141
+</span><span class=lnt>142
+</span><span class=lnt>143
+</span><span class=lnt>144
+</span><span class=lnt>145
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/select.c:578-734
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>do_select</span><span class=p>(</span><span class=kt>int</span> <span class=n>n</span><span class=p>,</span> <span class=n>fd_set_bits</span> <span class=o>*</span><span class=n>fds</span><span class=p>,</span> <span class=k>struct</span> <span class=n>timespec64</span> <span class=o>*</span><span class=n>end_time</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>ktime_t</span> <span class=n>expire</span><span class=p>,</span> <span class=o>*</span><span class=n>to</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>poll_wqueues</span> <span class=n>table</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>poll_table</span> <span class=o>*</span><span class=n>wait</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>retval</span><span class=p>,</span> <span class=n>i</span><span class=p>,</span> <span class=n>timed_out</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>u64</span> <span class=n>slack</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>__poll_t</span> <span class=n>busy_flag</span> <span class=o>=</span> <span class=nf>net_busy_loop_on</span><span class=p>()</span> <span class=o>?</span> <span class=nl>POLL_BUSY_LOOP</span> <span class=p>:</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>busy_start</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 获取实际需要检查的最大fd编号
+</span></span></span><span class=line><span class=cl>    <span class=nf>rcu_read_lock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>retval</span> <span class=o>=</span> <span class=nf>max_select_fd</span><span class=p>(</span><span class=n>n</span><span class=p>,</span> <span class=n>fds</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>rcu_read_unlock</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>retval</span> <span class=o>&lt;</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=n>retval</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>n</span> <span class=o>=</span> <span class=n>retval</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 初始化poll等待队列，设置_qproc = __pollwait
+</span></span></span><span class=line><span class=cl>    <span class=nf>poll_initwait</span><span class=p>(</span><span class=o>&amp;</span><span class=n>table</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>wait</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>table</span><span class=p>.</span><span class=n>pt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 超时时间为0表示非阻塞模式
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>end_time</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>end_time</span><span class=o>-&gt;</span><span class=n>tv_sec</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>end_time</span><span class=o>-&gt;</span><span class=n>tv_nsec</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=n>wait</span><span class=o>-&gt;</span><span class=n>_qproc</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>  <span class=c1>// 不注册回调
+</span></span></span><span class=line><span class=cl>        <span class=n>timed_out</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>end_time</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>timed_out</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=n>slack</span> <span class=o>=</span> <span class=nf>select_estimate_accuracy</span><span class=p>(</span><span class=n>end_time</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>retval</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 主循环
+</span></span></span><span class=line><span class=cl>    <span class=k>for</span> <span class=p>(;;)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>rinp</span><span class=p>,</span> <span class=o>*</span><span class=n>routp</span><span class=p>,</span> <span class=o>*</span><span class=n>rexp</span><span class=p>,</span> <span class=o>*</span><span class=n>inp</span><span class=p>,</span> <span class=o>*</span><span class=n>outp</span><span class=p>,</span> <span class=o>*</span><span class=n>exp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=kt>bool</span> <span class=n>can_busy_loop</span> <span class=o>=</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=n>inp</span> <span class=o>=</span> <span class=n>fds</span><span class=o>-&gt;</span><span class=n>in</span><span class=p>;</span> <span class=n>outp</span> <span class=o>=</span> <span class=n>fds</span><span class=o>-&gt;</span><span class=n>out</span><span class=p>;</span> <span class=n>exp</span> <span class=o>=</span> <span class=n>fds</span><span class=o>-&gt;</span><span class=n>ex</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>rinp</span> <span class=o>=</span> <span class=n>fds</span><span class=o>-&gt;</span><span class=n>res_in</span><span class=p>;</span> <span class=n>routp</span> <span class=o>=</span> <span class=n>fds</span><span class=o>-&gt;</span><span class=n>res_out</span><span class=p>;</span> <span class=n>rexp</span> <span class=o>=</span> <span class=n>fds</span><span class=o>-&gt;</span><span class=n>res_ex</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 遍历所有位图字（每个long包含BITS_PER_LONG个fd）
+</span></span></span><span class=line><span class=cl>        <span class=k>for</span> <span class=p>(</span><span class=n>i</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span> <span class=n>i</span> <span class=o>&lt;</span> <span class=n>n</span><span class=p>;</span> <span class=o>++</span><span class=n>rinp</span><span class=p>,</span> <span class=o>++</span><span class=n>routp</span><span class=p>,</span> <span class=o>++</span><span class=n>rexp</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>in</span><span class=p>,</span> <span class=n>out</span><span class=p>,</span> <span class=n>ex</span><span class=p>,</span> <span class=n>all_bits</span><span class=p>,</span> <span class=n>bit</span> <span class=o>=</span> <span class=mi>1</span><span class=p>,</span> <span class=n>j</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>res_in</span> <span class=o>=</span> <span class=mi>0</span><span class=p>,</span> <span class=n>res_out</span> <span class=o>=</span> <span class=mi>0</span><span class=p>,</span> <span class=n>res_ex</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=n>__poll_t</span> <span class=n>mask</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>            <span class=n>in</span> <span class=o>=</span> <span class=o>*</span><span class=n>inp</span><span class=o>++</span><span class=p>;</span> <span class=n>out</span> <span class=o>=</span> <span class=o>*</span><span class=n>outp</span><span class=o>++</span><span class=p>;</span> <span class=n>ex</span> <span class=o>=</span> <span class=o>*</span><span class=n>exp</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=n>all_bits</span> <span class=o>=</span> <span class=n>in</span> <span class=o>|</span> <span class=n>out</span> <span class=o>|</span> <span class=n>ex</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>            <span class=c1>// 如果这个long中没有任何监控的fd，跳过
+</span></span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=n>all_bits</span> <span class=o>==</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                <span class=n>i</span> <span class=o>+=</span> <span class=n>BITS_PER_LONG</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=k>continue</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>            <span class=c1>// 遍历long中的每一位
+</span></span></span><span class=line><span class=cl>            <span class=k>for</span> <span class=p>(</span><span class=n>j</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span> <span class=n>j</span> <span class=o>&lt;</span> <span class=n>BITS_PER_LONG</span><span class=p>;</span> <span class=o>++</span><span class=n>j</span><span class=p>,</span> <span class=o>++</span><span class=n>i</span><span class=p>,</span> <span class=n>bit</span> <span class=o>&lt;&lt;=</span> <span class=mi>1</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                <span class=k>struct</span> <span class=n>fd</span> <span class=n>f</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>(</span><span class=n>i</span> <span class=o>&gt;=</span> <span class=n>n</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                    <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=p>(</span><span class=n>bit</span> <span class=o>&amp;</span> <span class=n>all_bits</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>                    <span class=k>continue</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>                <span class=n>mask</span> <span class=o>=</span> <span class=n>EPOLLNVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=n>f</span> <span class=o>=</span> <span class=nf>fdget</span><span class=p>(</span><span class=n>i</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>(</span><span class=n>f</span><span class=p>.</span><span class=n>file</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                    <span class=c1>// 设置等待的事件类型
+</span></span></span><span class=line><span class=cl>                    <span class=nf>wait_key_set</span><span class=p>(</span><span class=n>wait</span><span class=p>,</span> <span class=n>in</span><span class=p>,</span> <span class=n>out</span><span class=p>,</span> <span class=n>bit</span><span class=p>,</span> <span class=n>busy_flag</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>                    <span class=c1>// 调用文件的poll函数
+</span></span></span><span class=line><span class=cl>                    <span class=n>mask</span> <span class=o>=</span> <span class=nf>vfs_poll</span><span class=p>(</span><span class=n>f</span><span class=p>.</span><span class=n>file</span><span class=p>,</span> <span class=n>wait</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>                    <span class=nf>fdput</span><span class=p>(</span><span class=n>f</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>                <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>                <span class=c1>// 检查可读事件
+</span></span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>((</span><span class=n>mask</span> <span class=o>&amp;</span> <span class=n>POLLIN_SET</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=p>(</span><span class=n>in</span> <span class=o>&amp;</span> <span class=n>bit</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                    <span class=n>res_in</span> <span class=o>|=</span> <span class=n>bit</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                    <span class=n>retval</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                    <span class=n>wait</span><span class=o>-&gt;</span><span class=n>_qproc</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>  <span class=c1>// 有就绪fd，不再注册回调
+</span></span></span><span class=line><span class=cl>                <span class=p>}</span>
+</span></span><span class=line><span class=cl>                <span class=c1>// 检查可写事件
+</span></span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>((</span><span class=n>mask</span> <span class=o>&amp;</span> <span class=n>POLLOUT_SET</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=p>(</span><span class=n>out</span> <span class=o>&amp;</span> <span class=n>bit</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                    <span class=n>res_out</span> <span class=o>|=</span> <span class=n>bit</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                    <span class=n>retval</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                    <span class=n>wait</span><span class=o>-&gt;</span><span class=n>_qproc</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=p>}</span>
+</span></span><span class=line><span class=cl>                <span class=c1>// 检查异常事件
+</span></span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>((</span><span class=n>mask</span> <span class=o>&amp;</span> <span class=n>POLLEX_SET</span><span class=p>)</span> <span class=o>&amp;&amp;</span> <span class=p>(</span><span class=n>ex</span> <span class=o>&amp;</span> <span class=n>bit</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                    <span class=n>res_ex</span> <span class=o>|=</span> <span class=n>bit</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                    <span class=n>retval</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                    <span class=n>wait</span><span class=o>-&gt;</span><span class=n>_qproc</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>                <span class=k>if</span> <span class=p>(</span><span class=n>retval</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                    <span class=n>can_busy_loop</span> <span class=o>=</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                    <span class=n>busy_flag</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>                <span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>busy_flag</span> <span class=o>&amp;</span> <span class=n>mask</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>                    <span class=n>can_busy_loop</span> <span class=o>=</span> <span class=nb>true</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>            <span class=c1>// 保存本轮结果
+</span></span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=n>res_in</span><span class=p>)</span>  <span class=o>*</span><span class=n>rinp</span> <span class=o>=</span> <span class=n>res_in</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=n>res_out</span><span class=p>)</span> <span class=o>*</span><span class=n>routp</span> <span class=o>=</span> <span class=n>res_out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=n>res_ex</span><span class=p>)</span>  <span class=o>*</span><span class=n>rexp</span> <span class=o>=</span> <span class=n>res_ex</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=nf>cond_resched</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 第一轮后不再注册回调
+</span></span></span><span class=line><span class=cl>        <span class=n>wait</span><span class=o>-&gt;</span><span class=n>_qproc</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 退出条件：有就绪fd、超时、或收到信号
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>retval</span> <span class=o>||</span> <span class=n>timed_out</span> <span class=o>||</span> <span class=nf>signal_pending</span><span class=p>(</span><span class=n>current</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>table</span><span class=p>.</span><span class=n>error</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>retval</span> <span class=o>=</span> <span class=n>table</span><span class=p>.</span><span class=n>error</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// busy loop优化
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>can_busy_loop</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=nf>need_resched</span><span class=p>())</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>busy_start</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>                <span class=n>busy_start</span> <span class=o>=</span> <span class=nf>busy_loop_current_time</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>                <span class=k>continue</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=p>}</span>
+</span></span><span class=line><span class=cl>            <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>busy_loop_timeout</span><span class=p>(</span><span class=n>busy_start</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>                <span class=k>continue</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>        <span class=n>busy_flag</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 设置超时
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=n>end_time</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=n>to</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>expire</span> <span class=o>=</span> <span class=nf>timespec64_to_ktime</span><span class=p>(</span><span class=o>*</span><span class=n>end_time</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>            <span class=n>to</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>expire</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=c1>// 进入睡眠等待
+</span></span></span><span class=line><span class=cl>        <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>poll_schedule_timeout</span><span class=p>(</span><span class=o>&amp;</span><span class=n>table</span><span class=p>,</span> <span class=n>TASK_INTERRUPTIBLE</span><span class=p>,</span> <span class=n>to</span><span class=p>,</span> <span class=n>slack</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>            <span class=n>timed_out</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 清理等待队列
+</span></span></span><span class=line><span class=cl>    <span class=nf>poll_freewait</span><span class=p>(</span><span class=o>&amp;</span><span class=n>table</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=n>retval</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=五等待队列机制>五、等待队列机制</h2><h3 id=51-poll_initwait>5.1 poll_initwait</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/select.c:125-134
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>poll_initwait</span><span class=p>(</span><span class=k>struct</span> <span class=n>poll_wqueues</span> <span class=o>*</span><span class=n>pwq</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>init_poll_funcptr</span><span class=p>(</span><span class=o>&amp;</span><span class=n>pwq</span><span class=o>-&gt;</span><span class=n>pt</span><span class=p>,</span> <span class=n>__pollwait</span><span class=p>);</span>  <span class=c1>// 设置回调函数
+</span></span></span><span class=line><span class=cl>    <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>polling_task</span> <span class=o>=</span> <span class=n>current</span><span class=p>;</span>               <span class=c1>// 记录当前任务
+</span></span></span><span class=line><span class=cl>    <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>triggered</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>                        <span class=c1>// 未触发
+</span></span></span><span class=line><span class=cl>    <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>error</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>table</span> <span class=o>=</span> <span class=nb>NULL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>inline_index</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=52-__pollwait---注册到文件的等待队列>5.2 __pollwait - 注册到文件的等待队列</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/select.c:283-299
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>__pollwait</span><span class=p>(</span><span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>filp</span><span class=p>,</span> <span class=kt>wait_queue_head_t</span> <span class=o>*</span><span class=n>wait_address</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>                <span class=n>poll_table</span> <span class=o>*</span><span class=n>p</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>poll_wqueues</span> <span class=o>*</span><span class=n>pwq</span> <span class=o>=</span> <span class=nf>container_of</span><span class=p>(</span><span class=n>p</span><span class=p>,</span> <span class=k>struct</span> <span class=n>poll_wqueues</span><span class=p>,</span> <span class=n>pt</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>poll_table_entry</span> <span class=o>*</span><span class=n>entry</span> <span class=o>=</span> <span class=nf>poll_get_entry</span><span class=p>(</span><span class=n>pwq</span><span class=p>);</span>  <span class=c1>// 分配条目
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>entry</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=n>entry</span><span class=o>-&gt;</span><span class=n>filp</span> <span class=o>=</span> <span class=nf>get_file</span><span class=p>(</span><span class=n>filp</span><span class=p>);</span>           <span class=c1>// 增加文件引用
+</span></span></span><span class=line><span class=cl>    <span class=n>entry</span><span class=o>-&gt;</span><span class=n>wait_address</span> <span class=o>=</span> <span class=n>wait_address</span><span class=p>;</span>     <span class=c1>// 记录等待队列头
+</span></span></span><span class=line><span class=cl>    <span class=n>entry</span><span class=o>-&gt;</span><span class=n>key</span> <span class=o>=</span> <span class=n>p</span><span class=o>-&gt;</span><span class=n>_key</span><span class=p>;</span>                   <span class=c1>// 记录感兴趣的事件
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 设置唤醒回调为pollwake
+</span></span></span><span class=line><span class=cl>    <span class=nf>init_waitqueue_func_entry</span><span class=p>(</span><span class=o>&amp;</span><span class=n>entry</span><span class=o>-&gt;</span><span class=n>wait</span><span class=p>,</span> <span class=n>pollwake</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=n>entry</span><span class=o>-&gt;</span><span class=n>wait</span><span class=p>.</span><span class=n>private</span> <span class=o>=</span> <span class=n>pwq</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 将等待队列项添加到文件的等待队列
+</span></span></span><span class=line><span class=cl>    <span class=nf>add_wait_queue</span><span class=p>(</span><span class=n>wait_address</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>entry</span><span class=o>-&gt;</span><span class=n>wait</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=53-pollwake---唤醒回调>5.3 pollwake - 唤醒回调</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/select.c:260-269
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>pollwake</span><span class=p>(</span><span class=kt>wait_queue_entry_t</span> <span class=o>*</span><span class=n>wait</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=n>mode</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sync</span><span class=p>,</span> <span class=kt>void</span> <span class=o>*</span><span class=n>key</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>poll_table_entry</span> <span class=o>*</span><span class=n>entry</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>entry</span> <span class=o>=</span> <span class=nf>container_of</span><span class=p>(</span><span class=n>wait</span><span class=p>,</span> <span class=k>struct</span> <span class=n>poll_table_entry</span><span class=p>,</span> <span class=n>wait</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 事件不匹配则不唤醒
+</span></span></span><span class=line><span class=cl>    <span class=k>if</span> <span class=p>(</span><span class=n>key</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=p>(</span><span class=nf>key_to_poll</span><span class=p>(</span><span class=n>key</span><span class=p>)</span> <span class=o>&amp;</span> <span class=n>entry</span><span class=o>-&gt;</span><span class=n>key</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>        <span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>__pollwake</span><span class=p>(</span><span class=n>wait</span><span class=p>,</span> <span class=n>mode</span><span class=p>,</span> <span class=n>sync</span><span class=p>,</span> <span class=n>key</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// fs/select.c:227-248
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>__pollwake</span><span class=p>(</span><span class=kt>wait_queue_entry_t</span> <span class=o>*</span><span class=n>wait</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=n>mode</span><span class=p>,</span> <span class=kt>int</span> <span class=n>sync</span><span class=p>,</span> <span class=kt>void</span> <span class=o>*</span><span class=n>key</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>poll_wqueues</span> <span class=o>*</span><span class=n>pwq</span> <span class=o>=</span> <span class=n>wait</span><span class=o>-&gt;</span><span class=n>private</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=nf>DECLARE_WAITQUEUE</span><span class=p>(</span><span class=n>dummy_wait</span><span class=p>,</span> <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>polling_task</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=nf>smp_wmb</span><span class=p>();</span>
+</span></span><span class=line><span class=cl>    <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>triggered</span> <span class=o>=</span> <span class=mi>1</span><span class=p>;</span>  <span class=c1>// 标记已触发
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 唤醒select进程
+</span></span></span><span class=line><span class=cl>    <span class=k>return</span> <span class=nf>default_wake_function</span><span class=p>(</span><span class=o>&amp;</span><span class=n>dummy_wait</span><span class=p>,</span> <span class=n>mode</span><span class=p>,</span> <span class=n>sync</span><span class=p>,</span> <span class=n>key</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=54-poll_freewait---清理资源>5.4 poll_freewait - 清理资源</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/select.c:155-177
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>poll_freewait</span><span class=p>(</span><span class=k>struct</span> <span class=n>poll_wqueues</span> <span class=o>*</span><span class=n>pwq</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>poll_table_page</span> <span class=o>*</span><span class=n>p</span> <span class=o>=</span> <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>table</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>i</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 释放内联条目
+</span></span></span><span class=line><span class=cl>    <span class=k>for</span> <span class=p>(</span><span class=n>i</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span> <span class=n>i</span> <span class=o>&lt;</span> <span class=n>pwq</span><span class=o>-&gt;</span><span class=n>inline_index</span><span class=p>;</span> <span class=n>i</span><span class=o>++</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>        <span class=nf>free_poll_entry</span><span class=p>(</span><span class=n>pwq</span><span class=o>-&gt;</span><span class=n>inline_entries</span> <span class=o>+</span> <span class=n>i</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=c1>// 释放页表链表
+</span></span></span><span class=line><span class=cl>    <span class=k>while</span> <span class=p>(</span><span class=n>p</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>        <span class=k>struct</span> <span class=n>poll_table_entry</span> <span class=o>*</span><span class=n>entry</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>struct</span> <span class=n>poll_table_page</span> <span class=o>*</span><span class=n>old</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=n>entry</span> <span class=o>=</span> <span class=n>p</span><span class=o>-&gt;</span><span class=n>entry</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=k>do</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=n>entry</span><span class=o>--</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>            <span class=nf>free_poll_entry</span><span class=p>(</span><span class=n>entry</span><span class=p>);</span>  <span class=c1>// 从等待队列移除，释放文件引用
+</span></span></span><span class=line><span class=cl>        <span class=p>}</span> <span class=k>while</span> <span class=p>(</span><span class=n>entry</span> <span class=o>&gt;</span> <span class=n>p</span><span class=o>-&gt;</span><span class=n>entries</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>        <span class=n>old</span> <span class=o>=</span> <span class=n>p</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=n>p</span> <span class=o>=</span> <span class=n>p</span><span class=o>-&gt;</span><span class=n>next</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>        <span class=nf>free_page</span><span class=p>((</span><span class=kt>unsigned</span> <span class=kt>long</span><span class=p>)</span> <span class=n>old</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=六vfs_poll调用链以tcp-socket为例>六、vfs_poll调用链（以TCP socket为例）</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>vfs_poll(file, wait)                           // include/linux/poll.h:86
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>file-&gt;f_op-&gt;poll(file, pt)                     // file-&gt;f_op = socket_file_ops
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock_poll(file, wait)                          // net/socket.c:1293
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock-&gt;ops-&gt;poll(file, sock, wait)              // sock-&gt;ops = inet_stream_ops
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_poll(file, sock, wait)                     // net/ipv4/tcp.c:499
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock_poll_wait(file, sock, wait)               // include/net/sock.h:2263
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>poll_wait(file, &amp;sock-&gt;wq.wait, wait)          // include/linux/poll.h:48
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>wait-&gt;_qproc(file, &amp;sock-&gt;wq.wait, wait)       // 对于select: _qproc = __pollwait
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>__pollwait()                                   // fs/select.c:283
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>add_wait_queue(&amp;sock-&gt;wq.wait, &amp;entry-&gt;wait)   // kernel/sched/wait.c:18
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=七唤醒流程数据到达socket时>七、唤醒流程（数据到达socket时）</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-fallback data-lang=fallback><span class=line><span class=cl>TCP数据到达
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>tcp_data_ready(sk)                             // net/ipv4/tcp_input.c:4992
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sk-&gt;sk_data_ready(sk)                          // = sock_def_readable
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>sock_def_readable(sk)                          // net/core/sock.c:3051
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>wake_up_interruptible_sync_poll(&amp;wq-&gt;wait, EPOLLIN | ...)
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>__wake_up_common()                             // kernel/sched/wait.c:103
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>curr-&gt;func()                                   // = pollwake
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>pollwake()                                     // fs/select.c:260
+</span></span><span class=line><span class=cl>    ↓
+</span></span><span class=line><span class=cl>__pollwake()                                   // fs/select.c:227
+</span></span><span class=line><span class=cl>    ├─→ pwq-&gt;triggered = 1
+</span></span><span class=line><span class=cl>    └─→ default_wake_function()                // kernel/sched/core.c:6753
+</span></span><span class=line><span class=cl>            ↓
+</span></span><span class=line><span class=cl>        try_to_wake_up()                       // 将进程加入运行队列
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=八关键数据结构>八、关键数据结构</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// 文件描述符位图集合
+</span></span></span><span class=line><span class=cl><span class=k>typedef</span> <span class=k>struct</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>in</span><span class=p>;</span>       <span class=c1>// 输入：监控可读
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>out</span><span class=p>;</span>      <span class=c1>// 输入：监控可写
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>ex</span><span class=p>;</span>       <span class=c1>// 输入：监控异常
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>res_in</span><span class=p>;</span>   <span class=c1>// 输出：就绪可读
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>res_out</span><span class=p>;</span>  <span class=c1>// 输出：就绪可写
+</span></span></span><span class=line><span class=cl>    <span class=kt>unsigned</span> <span class=kt>long</span> <span class=o>*</span><span class=n>res_ex</span><span class=p>;</span>   <span class=c1>// 输出：就绪异常
+</span></span></span><span class=line><span class=cl><span class=p>}</span> <span class=n>fd_set_bits</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// poll等待队列（include/linux/poll.h:103-111）
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>poll_wqueues</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>poll_table</span> <span class=n>pt</span><span class=p>;</span>           <span class=c1>// 包含_qproc回调函数指针
+</span></span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>poll_table_page</span> <span class=o>*</span><span class=n>table</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>task_struct</span> <span class=o>*</span><span class=n>polling_task</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>triggered</span><span class=p>;</span>           <span class=c1>// 是否被唤醒
+</span></span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>error</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=kt>int</span> <span class=n>inline_index</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>poll_table_entry</span> <span class=n>inline_entries</span><span class=p>[</span><span class=n>N_INLINE_POLL_ENTRIES</span><span class=p>];</span>
+</span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// poll table条目（include/linux/poll.h:93-98）
+</span></span></span><span class=line><span class=cl><span class=k>struct</span> <span class=n>poll_table_entry</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=k>struct</span> <span class=n>file</span> <span class=o>*</span><span class=n>filp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>    <span class=n>__poll_t</span> <span class=n>key</span><span class=p>;</span>                    <span class=c1>// 感兴趣的事件
+</span></span></span><span class=line><span class=cl>    <span class=kt>wait_queue_entry_t</span> <span class=n>wait</span><span class=p>;</span>         <span class=c1>// 等待队列项
+</span></span></span><span class=line><span class=cl>    <span class=kt>wait_queue_head_t</span> <span class=o>*</span><span class=n>wait_address</span><span class=p>;</span> <span class=c1>// 等待队列头
+</span></span></span><span class=line><span class=cl><span class=p>};</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=c1>// poll table（include/linux/poll.h:43-46）
+</span></span></span><span class=line><span class=cl><span class=k>typedef</span> <span class=k>struct</span> <span class=n>poll_table_struct</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=n>poll_queue_proc</span> <span class=n>_qproc</span><span class=p>;</span>  <span class=c1>// 回调函数（select时为__pollwait）
+</span></span></span><span class=line><span class=cl>    <span class=n>__poll_t</span> <span class=n>_key</span><span class=p>;</span>           <span class=c1>// 事件掩码
+</span></span></span><span class=line><span class=cl><span class=p>}</span> <span class=n>poll_table</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=九事件掩码定义>九、事件掩码定义</h2><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// fs/select.c:67-77
+</span></span></span><span class=line><span class=cl><span class=cp>#define POLLIN_SET  (EPOLLRDNORM | EPOLLRDBAND | EPOLLIN | EPOLLHUP | EPOLLERR)
+</span></span></span><span class=line><span class=cl><span class=cp>#define POLLOUT_SET (EPOLLWRBAND | EPOLLWRNORM | EPOLLOUT | EPOLLERR)
+</span></span></span><span class=line><span class=cl><span class=cp>#define POLLEX_SET  (EPOLLPRI)
+</span></span></span></code></pre></td></tr></table></div></div><div class=table-wrapper><table><thead><tr><th>事件类型</th><th>含义</th></tr></thead><tbody><tr><td>EPOLLIN</td><td>有数据可读</td></tr><tr><td>EPOLLOUT</td><td>可以写入数据</td></tr><tr><td>EPOLLPRI</td><td>有紧急数据</td></tr><tr><td>EPOLLHUP</td><td>连接挂断</td></tr><tr><td>EPOLLERR</td><td>发生错误</td></tr></tbody></table></div><hr><h2 id=十select-vs-epoll>十、select vs epoll</h2><div class=table-wrapper><table><thead><tr><th>特性</th><th>select</th><th>epoll</th></tr></thead><tbody><tr><td>数据结构</td><td>位图</td><td>红黑树 + 就绪链表</td></tr><tr><td>注册方式</td><td>每次都重新注册</td><td>只注册一次</td></tr><tr><td>就绪通知</td><td>遍历所有fd</td><td>只返回就绪fd</td></tr><tr><td>时间复杂度</td><td>O(n)</td><td>O(活跃连接数)</td></tr><tr><td>fd数量限制</td><td>FD_SETSIZE (1024)</td><td>无限制</td></tr></tbody></table></div><hr><h2 id=十一相关源码文件>十一、相关源码文件</h2><div class=table-wrapper><table><thead><tr><th>文件</th><th>功能</th></tr></thead><tbody><tr><td>fs/select.c</td><td>select/poll实现</td></tr><tr><td>include/linux/poll.h</td><td>poll数据结构和内联函数</td></tr><tr><td>net/socket.c</td><td>sock_poll实现</td></tr><tr><td>net/ipv4/tcp.c</td><td>tcp_poll实现</td></tr><tr><td>include/net/sock.h</td><td>sock_poll_wait实现</td></tr><tr><td>kernel/sched/wait.c</td><td>等待队列操作</td></tr><tr><td>kernel/sched/core.c</td><td>try_to_wake_up实现</td></tr></tbody></table></div></section><footer class=article-footer><section class=article-tags><a href=/tags/select/>Select</a>
+<a href=/tags/do_select/>Do_select</a>
+<a href=/tags/poll/>Poll</a>
+<a href=/tags/fd_set/>Fd_set</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/netfilter-%E6%A1%86%E6%9E%B6%E4%B8%8E%E9%92%A9%E5%AD%90%E6%9C%BA%E5%88%B6/><div class=article-details><h2 class=article-title>Netfilter 框架与钩子机制</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 定时器体系深度分析</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>

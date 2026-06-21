@@ -1,0 +1,1338 @@
+<!doctype html><html lang=en-us dir=ltr><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=description content="TCP 定时器体系深度分析 本文基于 Linux 5.15.78 内核源码，梳理 TCP 各类定时器的初始化、内核对象（timer_list / hrtimer）、回调分发与典型超时来源。所有路径与行号均来自本仓库 v5.15.78 树。\n一、定时器初始化 TCP 套接字在协议栈初始化发送路径时会安装：写定时器（重传 / 零窗口探测 / TLP / RACK 重排超时共用一根 icsk_retransmit_timer）、延迟 ACK 定时器（icsk_delack_timer）、保活定时器（挂在 sock->sk_timer），以及两根 高精度定时器：pacing 与 压缩 ACK。\n1.1 tcp_init_xmit_timers()（通用 TCP sock） 1 2 3 4 5 6 7 8 9 10 11 12 13 // net/ipv4/tcp_timer.c:791-802 void tcp_init_xmit_timers(struct sock *sk) { inet_csk_init_xmit_timers(sk, &amp;tcp_write_timer, &amp;tcp_delack_timer, &amp;tcp_keepalive_timer); hrtimer_init(&amp;tcp_sk(sk)->pacing_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED_SOFT); tcp_sk(sk)->pacing_timer.function = tcp_pace_kick; hrtimer_init(&amp;tcp_sk(sk)->compressed_ack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED_SOFT); tcp_sk(sk)->compressed_ack_timer.function = tcp_compressed_ack_kick; } 要点：\n"><title>TCP 定时器体系深度分析</title><link rel=canonical href=https://1bit2.github.io/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><link rel=stylesheet href=/scss/style.min.6a692fd055deae459f2a9767f57f3855ba80cafd5041317f24f7360f6ca47cdf.css><meta property='og:title' content="TCP 定时器体系深度分析"><meta property='og:description' content="TCP 定时器体系深度分析 本文基于 Linux 5.15.78 内核源码，梳理 TCP 各类定时器的初始化、内核对象（timer_list / hrtimer）、回调分发与典型超时来源。所有路径与行号均来自本仓库 v5.15.78 树。\n一、定时器初始化 TCP 套接字在协议栈初始化发送路径时会安装：写定时器（重传 / 零窗口探测 / TLP / RACK 重排超时共用一根 icsk_retransmit_timer）、延迟 ACK 定时器（icsk_delack_timer）、保活定时器（挂在 sock->sk_timer），以及两根 高精度定时器：pacing 与 压缩 ACK。\n1.1 tcp_init_xmit_timers()（通用 TCP sock） 1 2 3 4 5 6 7 8 9 10 11 12 13 // net/ipv4/tcp_timer.c:791-802 void tcp_init_xmit_timers(struct sock *sk) { inet_csk_init_xmit_timers(sk, &amp;tcp_write_timer, &amp;tcp_delack_timer, &amp;tcp_keepalive_timer); hrtimer_init(&amp;tcp_sk(sk)->pacing_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED_SOFT); tcp_sk(sk)->pacing_timer.function = tcp_pace_kick; hrtimer_init(&amp;tcp_sk(sk)->compressed_ack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED_SOFT); tcp_sk(sk)->compressed_ack_timer.function = tcp_compressed_ack_kick; } 要点：\n"><meta property='og:url' content='https://1bit2.github.io/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/'><meta property='og:site_name' content='深栈'><meta property='og:type' content='article'><meta property='article:section' content='Post'><meta property='article:tag' content='TCP'><meta property='article:tag' content='定时器'><meta property='article:tag' content='RTO'><meta property='article:tag' content='延迟ACK'><meta property='article:tag' content='keepalive'><meta property='article:tag' content='pacing'><meta property='article:tag' content='TLP'><meta property='article:tag' content='TIME_WAIT'><meta property='article:tag' content='SYN-ACK重传'><meta property='article:tag' content='压缩ACK'><meta property='article:published_time' content='2026-04-29T00:00:00+00:00'><meta property='article:modified_time' content='2026-04-29T00:00:00+00:00'><meta name=twitter:title content="TCP 定时器体系深度分析"><meta name=twitter:description content="TCP 定时器体系深度分析 本文基于 Linux 5.15.78 内核源码，梳理 TCP 各类定时器的初始化、内核对象（timer_list / hrtimer）、回调分发与典型超时来源。所有路径与行号均来自本仓库 v5.15.78 树。\n一、定时器初始化 TCP 套接字在协议栈初始化发送路径时会安装：写定时器（重传 / 零窗口探测 / TLP / RACK 重排超时共用一根 icsk_retransmit_timer）、延迟 ACK 定时器（icsk_delack_timer）、保活定时器（挂在 sock->sk_timer），以及两根 高精度定时器：pacing 与 压缩 ACK。\n1.1 tcp_init_xmit_timers()（通用 TCP sock） 1 2 3 4 5 6 7 8 9 10 11 12 13 // net/ipv4/tcp_timer.c:791-802 void tcp_init_xmit_timers(struct sock *sk) { inet_csk_init_xmit_timers(sk, &amp;tcp_write_timer, &amp;tcp_delack_timer, &amp;tcp_keepalive_timer); hrtimer_init(&amp;tcp_sk(sk)->pacing_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED_SOFT); tcp_sk(sk)->pacing_timer.function = tcp_pace_kick; hrtimer_init(&amp;tcp_sk(sk)->compressed_ack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED_SOFT); tcp_sk(sk)->compressed_ack_timer.function = tcp_compressed_ack_kick; } 要点：\n"><link rel="shortcut icon" href=/favicon.svg></head><body class=article-page><script>(function(){const e="StackColorScheme";localStorage.getItem(e)||localStorage.setItem(e,"auto")})()</script><script>(function(){const t="StackColorScheme",e=localStorage.getItem(t),n=window.matchMedia("(prefers-color-scheme: dark)").matches===!0;e=="dark"||e==="auto"&&n?document.documentElement.dataset.scheme="dark":document.documentElement.dataset.scheme="light"})()</script><div class="container main-container flex on-phone--column extended"><aside class="sidebar left-sidebar sticky"><button class="hamburger hamburger--spin" type=button id=toggle-menu aria-label="Toggle Menu">
+<span class=hamburger-box><span class=hamburger-inner></span></span></button><header><div class=site-meta><h1 class=site-name><a href=/>深栈</a></h1><h2 class=site-description>学无止境</h2></div></header><ol class=menu id=main-menu><li><a href=/><svg class="icon icon-tabler icon-tabler-home" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><polyline points="5 12 3 12 12 3 21 12 19 12"/><path d="M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/><path d="M9 21v-6a2 2 0 012-2h2a2 2 0 012 2v6"/></svg>
+<span>Home</span></a></li><li><a href=/about/><svg class="icon icon-tabler icon-tabler-user" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="7" r="4"/><path d="M6 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/></svg>
+<span>About</span></a></li><li><a href=/archives/><svg class="icon icon-tabler icon-tabler-archive" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><rect x="3" y="4" width="18" height="4" rx="2"/><path d="M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+<span>Archives</span></a></li><li><a href=/search/><svg class="icon icon-tabler icon-tabler-search" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="10" cy="10" r="7"/><line x1="21" y1="21" x2="15" y2="15"/></svg>
+<span>Search</span></a></li><li class=menu-bottom-section><ol class=menu><li id=dark-mode-toggle><svg class="icon icon-tabler icon-tabler-toggle-left" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="8" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<svg class="icon icon-tabler icon-tabler-toggle-right" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="16" cy="12" r="2"/><rect x="2" y="6" width="20" height="12" rx="6"/></svg>
+<span>Dark Mode</span></li></ol></li></ol></aside><aside class="sidebar right-sidebar sticky"><section class="widget archives"><div class=widget-icon><svg class="icon icon-tabler icon-tabler-hash" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="11" y1="4" x2="7" y2="20"/><line x1="17" y1="4" x2="13" y2="20"/></svg></div><h2 class="widget-title section-title">Table of contents</h2><div class=widget--toc><nav id=TableOfContents><ol><li><a href=#一定时器初始化>一、定时器初始化</a><ol><li><a href=#11-tcp_init_xmit_timers通用-tcp-sock>1.1 <code>tcp_init_xmit_timers()</code>（通用 TCP sock）</a></li><li><a href=#12-inet_csk_init_xmit_timers三根基类-timer_list>1.2 <code>inet_csk_init_xmit_timers()</code>（三根基类 <code>timer_list</code>）</a></li><li><a href=#13-inet_csk_reset_keepalive_timer保活周期重装>1.3 <code>inet_csk_reset_keepalive_timer()</code>（保活周期重装）</a></li></ol></li><li><a href=#二写定时器分发>二、写定时器分发</a><ol><li><a href=#21-tcp_write_timer_handler按-icsk_pending-分支>2.1 <code>tcp_write_timer_handler()</code>：按 <code>icsk_pending</code> 分支</a></li><li><a href=#22-与用户进程并发tcp_write_timer-延迟处理>2.2 与用户进程并发：<code>tcp_write_timer()</code> 延迟处理</a></li><li><a href=#23-inet_csk_reset_xmit_timer如何挂到写定时器>2.3 <code>inet_csk_reset_xmit_timer()</code>：如何「挂」到写定时器</a></li></ol></li><li><a href=#三重传定时器rto>三、重传定时器（RTO）</a><ol><li><a href=#31-tcp_retransmit_timer-主流程>3.1 <code>tcp_retransmit_timer()</code> 主流程</a></li><li><a href=#32-指数退避icsk_rto--1>3.2 指数退避：<code>icsk_rto &lt;&lt;= 1</code></a></li><li><a href=#33-tcp_write_timeouttcp_retries1--tcp_retries2-与-mtu-黑洞探测>3.3 <code>tcp_write_timeout()</code>：<code>tcp_retries1</code> / <code>tcp_retries2</code> 与 MTU 黑洞探测</a></li><li><a href=#34-发送后重装-rtoinet_csk_reset_xmit_timer-与-pacing>3.4 发送后重装 RTO：<code>inet_csk_reset_xmit_timer</code> 与 pacing</a></li></ol></li><li><a href=#四延迟-ack-定时器>四、延迟 ACK 定时器</a><ol><li><a href=#41-tcp_delack_timer_handler>4.1 <code>tcp_delack_timer_handler()</code></a></li><li><a href=#42-__tcp_ack_snd_check立即-ack-vs-延迟-vs-压缩-ack>4.2 <code>__tcp_ack_snd_check()</code>：立即 ACK vs 延迟 vs 压缩 ACK</a></li><li><a href=#43-tcp_send_delayed_ackato-与上界>4.3 <code>tcp_send_delayed_ack()</code>：ATO 与上界</a></li><li><a href=#44-tcp_in_quickack_mode跳过延迟>4.4 <code>tcp_in_quickack_mode()</code>：跳过延迟</a></li><li><a href=#45-内存耗尽时的延迟-ack-退路>4.5 内存耗尽时的延迟 ACK 退路</a></li></ol></li><li><a href=#五keepalive-定时器>五、Keepalive 定时器</a><ol><li><a href=#51-tcp_set_keepalive用户态开关>5.1 <code>tcp_set_keepalive()</code>：用户态开关</a></li><li><a href=#52-时间跨度辅助函数per-sock-覆盖-sysctl>5.2 时间跨度辅助函数（per-sock 覆盖 sysctl）</a></li><li><a href=#53-tcp_keepalive_timer-完整逻辑>5.3 <code>tcp_keepalive_timer()</code> 完整逻辑</a></li><li><a href=#54-tcp_write_wakeup-与探测-skb>5.4 <code>tcp_write_wakeup()</code> 与探测 skb</a></li></ol></li><li><a href=#六pacing-定时器hrtimer>六、Pacing 定时器（<code>hrtimer</code>）</a><ol><li><a href=#61-tcp_pace_kick到期后推进发送>6.1 <code>tcp_pace_kick()</code>：到期后推进发送</a></li><li><a href=#62-tcp_pacing_checktcp_write_xmit-门前的第一道闸>6.2 <code>tcp_pacing_check()</code>：<code>tcp_write_xmit</code> 门前的第一道闸</a></li><li><a href=#63-与-tcp_write_xmit-的交织>6.3 与 <code>tcp_write_xmit()</code> 的交织</a></li><li><a href=#64-bbr-与-sk_pacing_rate>6.4 BBR 与 <code>sk_pacing_rate</code></a></li></ol></li><li><a href=#七零窗口探测定时器>七、零窗口探测定时器</a><ol><li><a href=#71-tcp_probe_timer>7.1 <code>tcp_probe_timer()</code></a></li><li><a href=#72-tcp_send_probe0退避与用户超时钳制>7.2 <code>tcp_send_probe0()</code>：退避与用户超时钳制</a></li></ol></li><li><a href=#八syn-ack-重传定时器半连接-request_sock>八、SYN-ACK 重传定时器（半连接 <code>request_sock</code>）</a><ol><li><a href=#81-reqsk_queue_hash_req入-ehash-时启动定时器>8.1 <code>reqsk_queue_hash_req()</code>：入 ehash 时启动定时器</a></li><li><a href=#82-reqsk_timer_handler-核心逻辑>8.2 <code>reqsk_timer_handler()</code> 核心逻辑</a></li></ol></li><li><a href=#九压缩-ack-定时器compressed_ack_timer>九、压缩 ACK 定时器（<code>compressed_ack_timer</code>）</a><ol><li><a href=#91-tcp_compressed_ack_kick>9.1 <code>tcp_compressed_ack_kick()</code></a></li><li><a href=#92-sysctl_tcp_comp_sack_-默认值与语义>9.2 <code>sysctl_tcp_comp_sack_*</code> 默认值与语义</a></li><li><a href=#93-与-__tcp_ack_snd_check-的闭环>9.3 与 <code>__tcp_ack_snd_check()</code> 的闭环</a></li></ol></li><li><a href=#附time_wait-与本文定时器的关系>附：TIME_WAIT 与本文定时器的关系</a></li><li><a href=#总结表定时器类型与回调>总结表：定时器类型与回调</a></li><li><a href=#参考文献源码文件>参考文献（源码文件）</a></li></ol></nav></div></section></aside><main class="main full-width"><article class=main-article><header class=article-header><div class=article-details><header class=article-category><a href=/categories/%E7%BD%91%E7%BB%9C/ style=background-color:#ea4335;color:#fff>网络</a></header><div class=article-title-wrapper><h2 class=article-title><a href=/p/tcp-%E5%AE%9A%E6%97%B6%E5%99%A8%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/>TCP 定时器体系深度分析</a></h2></div><footer class=article-time><div><svg class="icon icon-tabler icon-tabler-calendar-time" width="56" height="56" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><path d="M11.795 21H5a2 2 0 01-2-2V7a2 2 0 012-2h12a2 2 0 012 2v4"/><circle cx="18" cy="18" r="4"/><path d="M15 3v4"/><path d="M7 3v4"/><path d="M3 11h16"/><path d="M18 16.496V18l1 1"/></svg>
+<time class=article-time--published>Apr 29, 2026</time></div><div><svg class="icon icon-tabler icon-tabler-clock" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+<time class=article-time--reading>15 minute read</time></div></footer></div></header><section class=article-content><h1 id=tcp-定时器体系深度分析>TCP 定时器体系深度分析</h1><p>本文基于 <strong>Linux 5.15.78</strong> 内核源码，梳理 TCP 各类定时器的初始化、内核对象（<code>timer_list</code> / <code>hrtimer</code>）、回调分发与典型超时来源。所有路径与行号均来自本仓库 <code>v5.15.78</code> 树。</p><hr><h2 id=一定时器初始化>一、定时器初始化</h2><p>TCP 套接字在协议栈初始化发送路径时会安装：<strong>写定时器</strong>（重传 / 零窗口探测 / TLP / RACK 重排超时共用一根 <code>icsk_retransmit_timer</code>）、<strong>延迟 ACK 定时器</strong>（<code>icsk_delack_timer</code>）、<strong>保活定时器</strong>（挂在 <code>sock->sk_timer</code>），以及两根 <strong>高精度定时器</strong>：<strong>pacing</strong> 与 <strong>压缩 ACK</strong>。</p><h3 id=11-tcp_init_xmit_timers通用-tcp-sock>1.1 <code>tcp_init_xmit_timers()</code>（通用 TCP sock）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:791-802
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_init_xmit_timers</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_csk_init_xmit_timers</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tcp_write_timer</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>tcp_delack_timer</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				  <span class=o>&amp;</span><span class=n>tcp_keepalive_timer</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>hrtimer_init</span><span class=p>(</span><span class=o>&amp;</span><span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>pacing_timer</span><span class=p>,</span> <span class=n>CLOCK_MONOTONIC</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>		     <span class=n>HRTIMER_MODE_ABS_PINNED_SOFT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>pacing_timer</span><span class=p>.</span><span class=n>function</span> <span class=o>=</span> <span class=n>tcp_pace_kick</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>hrtimer_init</span><span class=p>(</span><span class=o>&amp;</span><span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>compressed_ack_timer</span><span class=p>,</span> <span class=n>CLOCK_MONOTONIC</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>		     <span class=n>HRTIMER_MODE_REL_PINNED_SOFT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>compressed_ack_timer</span><span class=p>.</span><span class=n>function</span> <span class=o>=</span> <span class=n>tcp_compressed_ack_kick</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>要点：</p><ul><li>前三类使用 <code>inet_csk_init_xmit_timers()</code> 绑定到 <code>struct inet_connection_sock</code> / <code>struct sock</code> 的 <code>timer_list</code>。</li><li><code>pacing_timer</code> 为 <code>HRTIMER_MODE_ABS_PINNED_SOFT</code>：绝对到期、与 CPU 亲和的软中断模式回调。</li><li><code>compressed_ack_timer</code> 为 <code>HRTIMER_MODE_REL_PINNED_SOFT</code>：相对延迟、<code>min()</code> 选取的纳秒量级。</li></ul><h3 id=12-inet_csk_init_xmit_timers三根基类-timer_list>1.2 <code>inet_csk_init_xmit_timers()</code>（三根基类 <code>timer_list</code>）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c:649-660
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>inet_csk_init_xmit_timers</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>			       <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>retransmit_handler</span><span class=p>)(</span><span class=k>struct</span> <span class=n>timer_list</span> <span class=o>*</span><span class=n>t</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>			       <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>delack_handler</span><span class=p>)(</span><span class=k>struct</span> <span class=n>timer_list</span> <span class=o>*</span><span class=n>t</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>			       <span class=kt>void</span> <span class=p>(</span><span class=o>*</span><span class=n>keepalive_handler</span><span class=p>)(</span><span class=k>struct</span> <span class=n>timer_list</span> <span class=o>*</span><span class=n>t</span><span class=p>))</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>timer_setup</span><span class=p>(</span><span class=o>&amp;</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmit_timer</span><span class=p>,</span> <span class=n>retransmit_handler</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>timer_setup</span><span class=p>(</span><span class=o>&amp;</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_delack_timer</span><span class=p>,</span> <span class=n>delack_handler</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>timer_setup</span><span class=p>(</span><span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_timer</span><span class=p>,</span> <span class=n>keepalive_handler</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_pending</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>TCP 传入的回调分别为 <code>tcp_write_timer</code>、<code>tcp_delack_timer</code>、<code>tcp_keepalive_timer</code>（定义于 <code>tcp_timer.c</code>）。保活使用 <code>sk->sk_timer</code> 与连接级 <code>icsk</code> 结构解耦命名，但语义上仍是「该 sock 的 keepalive」。</p><h3 id=13-inet_csk_reset_keepalive_timer保活周期重装>1.3 <code>inet_csk_reset_keepalive_timer()</code>（保活周期重装）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c:681-684
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>inet_csk_reset_keepalive_timer</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>len</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_reset_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_timer</span><span class=p>,</span> <span class=n>jiffies</span> <span class=o>+</span> <span class=n>len</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>启用 <code>SO_KEEPALIVE</code> 时，<code>tcp_set_keepalive()</code> 会首次按 <code>keepalive_time_when()</code> 调度；关闭则 <code>inet_csk_delete_keepalive_timer()</code> 停止 <code>sk_timer</code>（见第五节）。</p><hr><h2 id=二写定时器分发>二、写定时器分发</h2><p><strong>一根</strong> <code>icsk_retransmit_timer</code> 通过 <code>icsk->icsk_pending</code> 复用，区分 RTO、零窗口探测、TLP、RACK <code>reo_wnd</code> 超时。到期后由 <code>tcp_write_timer()</code> 在软中断上下文加 <code>bh_lock_sock</code>，最终进入 <code>tcp_write_timer_handler()</code>。</p><h3 id=21-tcp_write_timer_handler按-icsk_pending-分支>2.1 <code>tcp_write_timer_handler()</code>：按 <code>icsk_pending</code> 分支</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:600-636
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_write_timer_handler</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>event</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(((</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCPF_CLOSE</span> <span class=o>|</span> <span class=n>TCPF_LISTEN</span><span class=p>))</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=o>!</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_pending</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>time_after</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_timeout</span><span class=p>,</span> <span class=n>jiffies</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>sk_reset_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmit_timer</span><span class=p>,</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_mstamp_refresh</span><span class=p>(</span><span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>	<span class=n>event</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_pending</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>switch</span> <span class=p>(</span><span class=n>event</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>ICSK_TIME_REO_TIMEOUT</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_rack_reo_timeout</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>ICSK_TIME_LOSS_PROBE</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_loss_probe</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>ICSK_TIME_RETRANS</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_pending</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_retransmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>case</span> <span class=nl>ICSK_TIME_PROBE0</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_pending</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_probe_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>break</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>out</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_mem_reclaim</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>常量定义在 <code>include/net/inet_connection_sock.h</code>：<code>ICSK_TIME_RETRANS</code>、<code>ICSK_TIME_PROBE0</code>、<code>ICSK_TIME_LOSS_PROBE</code>、<code>ICSK_TIME_REO_TIMEOUT</code> 等。注意 <strong>RTO 与 PROBE0</strong> 分支在调用具体处理函数前将 <code>icsk_pending</code> 清零，避免重复进入；RACK/TLP 由各自实现内部重装定时器。</p><h3 id=22-与用户进程并发tcp_write_timer-延迟处理>2.2 与用户进程并发：<code>tcp_write_timer()</code> 延迟处理</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:638-654
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_write_timer</span><span class=p>(</span><span class=k>struct</span> <span class=n>timer_list</span> <span class=o>*</span><span class=n>t</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span>
+</span></span><span class=line><span class=cl>			<span class=nf>from_timer</span><span class=p>(</span><span class=n>icsk</span><span class=p>,</span> <span class=n>t</span><span class=p>,</span> <span class=n>icsk_retransmit_timer</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span> <span class=o>=</span> <span class=o>&amp;</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_inet</span><span class=p>.</span><span class=n>sk</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>bh_lock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>sock_owned_by_user</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_write_timer_handler</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>test_and_set_bit</span><span class=p>(</span><span class=n>TCP_WRITE_TIMER_DEFERRED</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_tsq_flags</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=nf>sock_hold</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=nf>bh_unlock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_put</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>若 sock 正被用户态持有，则设置 <code>TCP_WRITE_TIMER_DEFERRED</code>，稍后在 <code>tcp_release_cb()</code> 路径补跑，保证与锁规则一致。</p><h3 id=23-inet_csk_reset_xmit_timer如何挂到写定时器>2.3 <code>inet_csk_reset_xmit_timer()</code>：如何「挂」到写定时器</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/inet_connection_sock.h:245-271
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=k>const</span> <span class=kt>int</span> <span class=n>what</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					     <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>when</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					     <span class=k>const</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>max_when</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>when</span> <span class=o>&gt;</span> <span class=n>max_when</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>pr_debug</span><span class=p>(</span><span class=s>&#34;reset_xmit_timer: sk=%p %d when=0x%lx, caller=%p</span><span class=se>\n</span><span class=s>&#34;</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>			 <span class=n>sk</span><span class=p>,</span> <span class=n>what</span><span class=p>,</span> <span class=n>when</span><span class=p>,</span> <span class=p>(</span><span class=kt>void</span> <span class=o>*</span><span class=p>)</span><span class=n>_THIS_IP_</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>when</span> <span class=o>=</span> <span class=n>max_when</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>what</span> <span class=o>==</span> <span class=n>ICSK_TIME_RETRANS</span> <span class=o>||</span> <span class=n>what</span> <span class=o>==</span> <span class=n>ICSK_TIME_PROBE0</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=n>what</span> <span class=o>==</span> <span class=n>ICSK_TIME_LOSS_PROBE</span> <span class=o>||</span> <span class=n>what</span> <span class=o>==</span> <span class=n>ICSK_TIME_REO_TIMEOUT</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_pending</span> <span class=o>=</span> <span class=n>what</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_timeout</span> <span class=o>=</span> <span class=n>jiffies</span> <span class=o>+</span> <span class=n>when</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>sk_reset_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmit_timer</span><span class=p>,</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>what</span> <span class=o>==</span> <span class=n>ICSK_TIME_DACK</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>|=</span> <span class=n>ICSK_ACK_TIMER</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>timeout</span> <span class=o>=</span> <span class=n>jiffies</span> <span class=o>+</span> <span class=n>when</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=nf>sk_reset_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_delack_timer</span><span class=p>,</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>pr_debug</span><span class=p>(</span><span class=s>&#34;inet_csk BUG: unknown timer value</span><span class=se>\n</span><span class=s>&#34;</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>发送新数据后</strong>重传定时器普遍通过此接口（或 <code>tcp_reset_xmit_timer()</code>，见下文 pacing 叠加）以当前 RTO 或探测间隔重装，从而在 ACK 到店时由数据路径取消或再次推远超时点。</p><hr><h2 id=三重传定时器rto>三、重传定时器（RTO）</h2><h3 id=31-tcp_retransmit_timer-主流程>3.1 <code>tcp_retransmit_timer()</code> 主流程</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span><span class=lnt>74
+</span><span class=lnt>75
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:452-596
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_retransmit_timer</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>request_sock</span> <span class=o>*</span><span class=n>req</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>req</span> <span class=o>=</span> <span class=nf>rcu_dereference_protected</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>fastopen_rsk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					<span class=nf>lockdep_sock_is_held</span><span class=p>(</span><span class=n>sk</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>req</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>WARN_ON_ONCE</span><span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_SYN_RECV</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>			     <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>!=</span> <span class=n>TCP_FIN_WAIT1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_fastopen_synack_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>req</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>packets_out</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>skb</span> <span class=o>=</span> <span class=nf>tcp_rtx_queue_head</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>WARN_ON_ONCE</span><span class=p>(</span><span class=o>!</span><span class=n>skb</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>tp</span><span class=o>-&gt;</span><span class=n>tlp_high_seq</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>snd_wnd</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=o>!</span><span class=p>((</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCPF_SYN_SENT</span> <span class=o>|</span> <span class=n>TCPF_SYN_RECV</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=c1>// ... 对端窗口缩为 0 的特殊路径：进入 loss、重传、清 dst ...
+</span></span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>tcp_jiffies32</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_tstamp</span> <span class=o>&gt;</span> <span class=n>TCP_RTO_MAX</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_write_err</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_enter_loss</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_retransmit_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>skb</span><span class=p>,</span> <span class=mi>1</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__sk_dst_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out_reset_timer</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>__NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_TCPTIMEOUTS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_write_timeout</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=c1>// ... 首次重传 MIB 统计 ...
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_enter_loss</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_retransmit_skb</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nf>tcp_rtx_queue_head</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=mi>1</span><span class=p>)</span> <span class=o>&gt;</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ICSK_TIME_RETRANS</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					  <span class=n>TCP_RESOURCE_PROBE_INTERVAL</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					  <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_backoff</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>out_reset_timer</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_ESTABLISHED</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>thin_lto</span> <span class=o>||</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_thin_linear_timeouts</span><span class=p>))</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=nf>tcp_stream_is_thin</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span> <span class=o>&lt;=</span> <span class=n>TCP_THIN_LINEAR_RETRIES</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_backoff</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_rto</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=nf>__tcp_set_rto</span><span class=p>(</span><span class=n>tp</span><span class=p>),</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_rto</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_rto</span> <span class=o>&lt;&lt;</span> <span class=mi>1</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ICSK_TIME_RETRANS</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				  <span class=nf>tcp_clamp_rto_to_user_timeout</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>retransmits_timed_out</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_retries1</span><span class=p>)</span> <span class=o>+</span> <span class=mi>1</span><span class=p>,</span> <span class=mi>0</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__sk_dst_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>out</span><span class=p>:;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>路径要点：</p><ul><li><strong>Fast Open</strong>：若 <code>fastopen_rsk</code> 非空，转 <code>tcp_fastopen_synack_timer()</code>，不再走常规数据重传。</li><li><strong>无在途数据</strong>（<code>!tp->packets_out</code>）直接返回，避免空跑。</li><li><strong>零窗口且非孤儿</strong>：走「窗口探测式」重传分支，与 <code>ICSK_TIME_PROBE0</code> 逻辑互补。</li><li>正常路径：<code>tcp_write_timeout()</code> 判是否应放弃连接 → <code>tcp_enter_loss()</code> → 递增 <code>icsk_retransmits</code> 并重传；本地拥塞导致 <code>tcp_retransmit_skb</code> 失败时，用 <code>TCP_RESOURCE_PROBE_INTERVAL</code>（<code>tcp.h</code>：<code>HZ/2</code>）缓和重试。</li></ul><h3 id=32-指数退避icsk_rto--1>3.2 指数退避：<code>icsk_rto &lt;&lt;= 1</code></h3><p>在非 thin-linear 模式下，<code>icsk->icsk_rto = min(icsk->icsk_rto &lt;&lt; 1, TCP_RTO_MAX)</code>（<code>net/ipv4/tcp_timer.c:587-588</code>），即每次 <strong>成功安排了一次重传尝试</strong> 后将 RTO 倍增并夹在 <code>TCP_RTO_MAX</code>（<code>include/net/tcp.h</code>：<code>120*HZ</code>）以下。thin 流且满足 <code>sysctl_tcp_thin_linear_timeouts</code> 等条件时，则重置 <code>icsk_backoff</code> 并用 <code>__tcp_set_rto(tp)</code> 线性重算。</p><h3 id=33-tcp_write_timeouttcp_retries1--tcp_retries2-与-mtu-黑洞探测>3.3 <code>tcp_write_timeout()</code>：<code>tcp_retries1</code> / <code>tcp_retries2</code> 与 MTU 黑洞探测</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:231-287
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>int</span> <span class=nf>tcp_write_timeout</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=kt>bool</span> <span class=n>expired</span> <span class=o>=</span> <span class=nb>false</span><span class=p>,</span> <span class=n>do_reset</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>retry_until</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>((</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCPF_SYN_SENT</span> <span class=o>|</span> <span class=n>TCPF_SYN_RECV</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=nf>__dst_negative_advice</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>retry_until</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_syn_retries</span> <span class=o>?</span> <span class=o>:</span>
+</span></span><span class=line><span class=cl>			<span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_syn_retries</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>expired</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_retransmits</span> <span class=o>&gt;=</span> <span class=n>retry_until</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>retransmits_timed_out</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_retries1</span><span class=p>),</span> <span class=mi>0</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_mtu_probing</span><span class=p>(</span><span class=n>icsk</span><span class=p>,</span> <span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=nf>__dst_negative_advice</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=n>retry_until</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_retries2</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=k>const</span> <span class=kt>bool</span> <span class=n>alive</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_rto</span> <span class=o>&lt;</span> <span class=n>TCP_RTO_MAX</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>			<span class=n>retry_until</span> <span class=o>=</span> <span class=nf>tcp_orphan_retries</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>alive</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=n>do_reset</span> <span class=o>=</span> <span class=n>alive</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>				<span class=o>!</span><span class=nf>retransmits_timed_out</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>retry_until</span><span class=p>,</span> <span class=mi>0</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>			<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_out_of_resources</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>do_reset</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>				<span class=k>return</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>expired</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=n>expired</span> <span class=o>=</span> <span class=nf>retransmits_timed_out</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>retry_until</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>						<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=c1>// ... Fast Open 黑洞检测、BPF RTO 回调 ...
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>expired</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_write_err</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span> <span class=mi>1</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=c1>// ... txhash rethink ...
+</span></span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong><code>tcp_retries1</code></strong>：与 <code>retransmits_timed_out()</code> 结合触发 <strong>路径 MTU 探测</strong>（<code>tcp_mtu_probing</code>）与 <strong>负向路由缓存建议</strong>。</li><li><strong><code>tcp_retries2</code></strong>：作为 established 等状态 <strong>放弃连接</strong> 的边界（孤儿套接字另有 <code>tcp_orphan_retries()</code> 折叠逻辑）。</li><li><strong><code>icsk_user_timeout</code></strong>：<code>TCP_USER_TIMEOUT</code> 可覆盖/参与「是否 expired」判定。</li></ul><h3 id=34-发送后重装-rtoinet_csk_reset_xmit_timer-与-pacing>3.4 发送后重装 RTO：<code>inet_csk_reset_xmit_timer</code> 与 pacing</h3><p>封装函数 <code>tcp_reset_xmit_timer()</code> 在通用 RTO 上 <strong>叠加 pacing 造成的 jiffies 延迟</strong>，避免排程过早（<code>include/net/tcp.h</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h:1450-1457
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>void</span> <span class=nf>tcp_reset_xmit_timer</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					<span class=k>const</span> <span class=kt>int</span> <span class=n>what</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					<span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>when</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>					<span class=k>const</span> <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>max_when</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>what</span><span class=p>,</span> <span class=n>when</span> <span class=o>+</span> <span class=nf>tcp_pacing_delay</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>				  <span class=n>max_when</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>tcp_pacing_delay()</code> 由 <code>tcp_wstamp_ns</code> 与 <code>tcp_clock_cache</code> 推导，保证定时器与节流后的「可发送时刻」一致。</p><p>主动打开路径在发出 SYN 后设置首次重传定时器示例：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:4949-4952
+</span></span></span><span class=line><span class=cl>	<span class=nf>inet_csk_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ICSK_TIME_RETRANS</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				  <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_rto</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><hr><h2 id=四延迟-ack-定时器>四、延迟 ACK 定时器</h2><p>延迟 ACK 的目标是：<strong>合并确认</strong>、<strong>等待反向数据捎带 ACK</strong>。是否延迟由 <code>__tcp_ack_snd_check()</code> 决定；一旦决定延迟，<code>tcp_send_delayed_ack()</code> 用 <code>icsk_delack_timer</code> 调度。</p><h3 id=41-tcp_delack_timer_handler>4.1 <code>tcp_delack_timer_handler()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:290-325
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_delack_timer_handler</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_mem_reclaim_partial</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(((</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCPF_CLOSE</span> <span class=o>|</span> <span class=n>TCPF_LISTEN</span><span class=p>))</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=o>!</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>&amp;</span> <span class=n>ICSK_ACK_TIMER</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>time_after</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>timeout</span><span class=p>,</span> <span class=n>jiffies</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>sk_reset_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_delack_timer</span><span class=p>,</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>&amp;=</span> <span class=o>~</span><span class=n>ICSK_ACK_TIMER</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>inet_csk_ack_scheduled</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>inet_csk_in_pingpong_mode</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>ato</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>ato</span> <span class=o>&lt;&lt;</span> <span class=mi>1</span><span class=p>,</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_rto</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=nf>inet_csk_exit_pingpong_mode</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>ato</span>      <span class=o>=</span> <span class=n>TCP_ATO_MIN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_mstamp_refresh</span><span class=p>(</span><span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>));</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>__NET_INC_STATS</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>),</span> <span class=n>LINUX_MIB_DELAYEDACKS</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>out</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_under_memory_pressure</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=nf>sk_mem_reclaim</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>ATO 膨胀</strong>：非 pingpong 下定时器「爽约」会将 <code>ato</code> 左移一位直至 <code>icsk_rto</code>，抑制过于激进的延迟。pingpong 下则退出 pingpong 并 <code>ato = TCP_ATO_MIN</code>（<code>TCP_ATO_MIN</code> 与 <code>TCP_DELACK_MIN</code> 在 <code>tcp.h</code> 中随 <code>HZ</code> 定义，典型 <code>HZ=100</code> 时为 <code>HZ/25</code> ≈ 40ms）。</p><p>外层 <code>tcp_delack_timer()</code> 与写定时器类似，在 <code>sock_owned_by_user</code> 时设 <code>TCP_DELACK_TIMER_DEFERRED</code>（略）。</p><h3 id=42-__tcp_ack_snd_check立即-ack-vs-延迟-vs-压缩-ack>4.2 <code>__tcp_ack_snd_check()</code>：立即 ACK vs 延迟 vs 压缩 ACK</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:6571-6628
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>__tcp_ack_snd_check</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>ofo_possible</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>rtt</span><span class=p>,</span> <span class=n>delay</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	    <span class=cm>/* More than one full frame received... */</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(((</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_wup</span><span class=p>)</span> <span class=o>&gt;</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>rcv_mss</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	     <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span> <span class=o>-</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>copied_seq</span> <span class=o>&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_rcvlowat</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	     <span class=nf>__tcp_select_window</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>&gt;=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_wnd</span><span class=p>))</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=nf>tcp_in_quickack_mode</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>&amp;</span> <span class=n>ICSK_ACK_NOW</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl><span class=nl>send_now</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>ofo_possible</span> <span class=o>||</span> <span class=nf>RB_EMPTY_ROOT</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>out_of_order_queue</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_delayed_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_is_sack</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack</span> <span class=o>&gt;=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_nr</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>send_now</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack_rcv_nxt</span> <span class=o>!=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack_rcv_nxt</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_nxt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>tp</span><span class=o>-&gt;</span><span class=n>dup_ack_counter</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>dup_ack_counter</span> <span class=o>&lt;</span> <span class=n>TCP_FASTRETRANS_THRESH</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>tp</span><span class=o>-&gt;</span><span class=n>dup_ack_counter</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>send_now</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>hrtimer_is_queued</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack_timer</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>rtt</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>rcv_rtt_est</span><span class=p>.</span><span class=n>rtt_us</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>srtt_us</span> <span class=o>&amp;&amp;</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>srtt_us</span> <span class=o>&lt;</span> <span class=n>rtt</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=n>rtt</span> <span class=o>=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>srtt_us</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>delay</span> <span class=o>=</span> <span class=kt>min_t</span><span class=p>(</span><span class=kt>unsigned</span> <span class=kt>long</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>		      <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_delay_ns</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>		      <span class=n>rtt</span> <span class=o>*</span> <span class=p>(</span><span class=n>NSEC_PER_USEC</span> <span class=o>&gt;&gt;</span> <span class=mi>3</span><span class=p>)</span><span class=o>/</span><span class=mi>20</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_hold</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>hrtimer_start_range_ns</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack_timer</span><span class=p>,</span> <span class=nf>ns_to_ktime</span><span class=p>(</span><span class=n>delay</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>			       <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_slack_ns</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>			       <span class=n>HRTIMER_MODE_REL_PINNED_SOFT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong>立即 ACK</strong>：收到的数据量、窗口条件满足、<strong>quickack</strong>、<code>ICSK_ACK_NOW</code>。</li><li><strong>无乱序或调用方不允许 OFO 逻辑</strong>：普通 <code>tcp_send_delayed_ack()</code>。</li><li><strong>SACK + 乱序队列非空</strong>：可能进入 <strong>压缩 ACK</strong> 路径（第九节），否则回到 <code>send_now</code>。</li></ul><h3 id=43-tcp_send_delayed_ackato-与上界>4.3 <code>tcp_send_delayed_ack()</code>：ATO 与上界</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:4970-5020
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_send_delayed_ack</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>ato</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>ato</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>timeout</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>ato</span> <span class=o>&gt;</span> <span class=n>TCP_DELACK_MIN</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=kt>int</span> <span class=n>max_ato</span> <span class=o>=</span> <span class=n>HZ</span> <span class=o>/</span> <span class=mi>2</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>inet_csk_in_pingpong_mode</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>		    <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>&amp;</span> <span class=n>ICSK_ACK_PUSHED</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=n>max_ato</span> <span class=o>=</span> <span class=n>TCP_DELACK_MAX</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>srtt_us</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=kt>int</span> <span class=n>rtt</span> <span class=o>=</span> <span class=kt>max_t</span><span class=p>(</span><span class=kt>int</span><span class=p>,</span> <span class=nf>usecs_to_jiffies</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>srtt_us</span> <span class=o>&gt;&gt;</span> <span class=mi>3</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>					<span class=n>TCP_DELACK_MIN</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>			<span class=k>if</span> <span class=p>(</span><span class=n>rtt</span> <span class=o>&lt;</span> <span class=n>max_ato</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>				<span class=n>max_ato</span> <span class=o>=</span> <span class=n>rtt</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=n>ato</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=n>ato</span><span class=p>,</span> <span class=n>max_ato</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>ato</span> <span class=o>=</span> <span class=kt>min_t</span><span class=p>(</span><span class=n>u32</span><span class=p>,</span> <span class=n>ato</span><span class=p>,</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>icsk_delack_max</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=n>timeout</span> <span class=o>=</span> <span class=n>jiffies</span> <span class=o>+</span> <span class=n>ato</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>&amp;</span> <span class=n>ICSK_ACK_TIMER</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>time_before_eq</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>timeout</span><span class=p>,</span> <span class=n>jiffies</span> <span class=o>+</span> <span class=p>(</span><span class=n>ato</span> <span class=o>&gt;&gt;</span> <span class=mi>2</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_send_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>time_before</span><span class=p>(</span><span class=n>timeout</span><span class=p>,</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>timeout</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=n>timeout</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>timeout</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>pending</span> <span class=o>|=</span> <span class=n>ICSK_ACK_SCHED</span> <span class=o>|</span> <span class=n>ICSK_ACK_TIMER</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>timeout</span> <span class=o>=</span> <span class=n>timeout</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_reset_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_delack_timer</span><span class=p>,</span> <span class=n>timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong>pingpong 或 <code>ICSK_ACK_PUSHED</code></strong>：<code>max_ato</code> 放宽到 <code>TCP_DELACK_MAX</code>（<code>HZ/5</code>，典型 200ms）。</li><li>否则默认 <code>max_ato = HZ/2</code>，再用 <strong>平滑 RTT</strong>（<code>srtt_us >> 3</code>）收紧。</li><li>若已有更早的 delack 超时预约，则 <strong>不推迟</strong>已有更早熄火点；若新算出的延迟「几乎到了」也会直接 <code>tcp_send_ack()</code>。</li></ul><h3 id=44-tcp_in_quickack_mode跳过延迟>4.4 <code>tcp_in_quickack_mode()</code>：跳过延迟</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span><span class=lnt>7
+</span><span class=lnt>8
+</span><span class=lnt>9
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_input.c:492-499
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>bool</span> <span class=nf>tcp_in_quickack_mode</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>const</span> <span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>const</span> <span class=k>struct</span> <span class=n>dst_entry</span> <span class=o>*</span><span class=n>dst</span> <span class=o>=</span> <span class=nf>__sk_dst_get</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=p>(</span><span class=n>dst</span> <span class=o>&amp;&amp;</span> <span class=nf>dst_metric</span><span class=p>(</span><span class=n>dst</span><span class=p>,</span> <span class=n>RTAX_QUICKACK</span><span class=p>))</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>		<span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_ack</span><span class=p>.</span><span class=n>quick</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=nf>inet_csk_in_pingpong_mode</span><span class=p>(</span><span class=n>sk</span><span class=p>));</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>路由度量 <code>RTAX_QUICKACK</code> 或残留的 <strong>quickack 计数</strong>（且非 pingpong）都会立即触发 ACK。</p><h3 id=45-内存耗尽时的延迟-ack-退路>4.5 内存耗尽时的延迟 ACK 退路</h3><p><code>__tcp_send_ack()</code> 分配 skb 失败时，会退化为 <code>ICSK_TIME_DACK</code> 定时器重试（<code>tcp_output.c:5040-5051</code>），与 <code>inet_csk_reset_xmit_timer(..., ICSK_TIME_DACK, ...)</code> 共用 <code>icsk_delack_timer</code>。</p><hr><h2 id=五keepalive-定时器>五、Keepalive 定时器</h2><h3 id=51-tcp_set_keepalive用户态开关>5.1 <code>tcp_set_keepalive()</code>：用户态开关</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:664-673
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_set_keepalive</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>,</span> <span class=kt>int</span> <span class=n>val</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>((</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCPF_CLOSE</span> <span class=o>|</span> <span class=n>TCPF_LISTEN</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>val</span> <span class=o>&amp;&amp;</span> <span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_KEEPOPEN</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=nf>inet_csk_reset_keepalive_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nf>keepalive_time_when</span><span class=p>(</span><span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>)));</span>
+</span></span><span class=line><span class=cl>	<span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>val</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=nf>inet_csk_delete_keepalive_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>SOCK_KEEPOPEN</code> 与 setsockopt <code>SO_KEEPALIVE</code> 对应；开启时首次超时取 <strong><code>keepalive_time_when()</code></strong>。</p><h3 id=52-时间跨度辅助函数per-sock-覆盖-sysctl>5.2 时间跨度辅助函数（per-sock 覆盖 sysctl）</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// include/net/tcp.h:1642-1664
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>int</span> <span class=nf>keepalive_intvl_when</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>sock_net</span><span class=p>((</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>keepalive_intvl</span> <span class=o>?</span> <span class=o>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_keepalive_intvl</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>int</span> <span class=nf>keepalive_time_when</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>sock_net</span><span class=p>((</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>keepalive_time</span> <span class=o>?</span> <span class=o>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_keepalive_time</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=k>static</span> <span class=kr>inline</span> <span class=kt>int</span> <span class=nf>keepalive_probes</span><span class=p>(</span><span class=k>const</span> <span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>sock_net</span><span class=p>((</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>keepalive_probes</span> <span class=o>?</span> <span class=o>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_keepalive_probes</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>默认值见 <code>tcp.h</code>：<code>TCP_KEEPALIVE_TIME</code>（2 小时）、<code>TCP_KEEPALIVE_PROBES</code>（9）、<code>TCP_KEEPALIVE_INTVL</code>（75s）；命名空间可通过 <code>ipv4.sysctl_tcp_keepalive_*</code> 调整。</p><h3 id=53-tcp_keepalive_timer-完整逻辑>5.3 <code>tcp_keepalive_timer()</code> 完整逻辑</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span><span class=lnt>39
+</span><span class=lnt>40
+</span><span class=lnt>41
+</span><span class=lnt>42
+</span><span class=lnt>43
+</span><span class=lnt>44
+</span><span class=lnt>45
+</span><span class=lnt>46
+</span><span class=lnt>47
+</span><span class=lnt>48
+</span><span class=lnt>49
+</span><span class=lnt>50
+</span><span class=lnt>51
+</span><span class=lnt>52
+</span><span class=lnt>53
+</span><span class=lnt>54
+</span><span class=lnt>55
+</span><span class=lnt>56
+</span><span class=lnt>57
+</span><span class=lnt>58
+</span><span class=lnt>59
+</span><span class=lnt>60
+</span><span class=lnt>61
+</span><span class=lnt>62
+</span><span class=lnt>63
+</span><span class=lnt>64
+</span><span class=lnt>65
+</span><span class=lnt>66
+</span><span class=lnt>67
+</span><span class=lnt>68
+</span><span class=lnt>69
+</span><span class=lnt>70
+</span><span class=lnt>71
+</span><span class=lnt>72
+</span><span class=lnt>73
+</span><span class=lnt>74
+</span><span class=lnt>75
+</span><span class=lnt>76
+</span><span class=lnt>77
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:677-762
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_keepalive_timer</span><span class=p>(</span><span class=k>struct</span> <span class=n>timer_list</span> <span class=o>*</span><span class=n>t</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span> <span class=o>=</span> <span class=nf>from_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>t</span><span class=p>,</span> <span class=n>sk_timer</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=n>u32</span> <span class=n>elapsed</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>bh_lock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>sock_owned_by_user</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>inet_csk_reset_keepalive_timer</span> <span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>HZ</span><span class=o>/</span><span class=mi>20</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_LISTEN</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>pr_err</span><span class=p>(</span><span class=s>&#34;Hmm... keepalive on a LISTEN ???</span><span class=se>\n</span><span class=s>&#34;</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_mstamp_refresh</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span> <span class=o>==</span> <span class=n>TCP_FIN_WAIT2</span> <span class=o>&amp;&amp;</span> <span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>linger2</span> <span class=o>&gt;=</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=k>const</span> <span class=kt>int</span> <span class=n>tmo</span> <span class=o>=</span> <span class=nf>tcp_fin_time</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span> <span class=o>-</span> <span class=n>TCP_TIMEWAIT_LEN</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>			<span class=k>if</span> <span class=p>(</span><span class=n>tmo</span> <span class=o>&gt;</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>				<span class=nf>tcp_time_wait</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_FIN_WAIT2</span><span class=p>,</span> <span class=n>tmo</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>				<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>			<span class=p>}</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_active_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>GFP_ATOMIC</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>death</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_KEEPOPEN</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	    <span class=p>((</span><span class=mi>1</span> <span class=o>&lt;&lt;</span> <span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_state</span><span class=p>)</span> <span class=o>&amp;</span> <span class=p>(</span><span class=n>TCPF_CLOSE</span> <span class=o>|</span> <span class=n>TCPF_SYN_SENT</span><span class=p>)))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>elapsed</span> <span class=o>=</span> <span class=nf>keepalive_time_when</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>packets_out</span> <span class=o>||</span> <span class=o>!</span><span class=nf>tcp_write_queue_empty</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>resched</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>elapsed</span> <span class=o>=</span> <span class=nf>keepalive_time_elapsed</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>elapsed</span> <span class=o>&gt;=</span> <span class=nf>keepalive_time_when</span><span class=p>(</span><span class=n>tp</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>((</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span> <span class=o>!=</span> <span class=mi>0</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>		    <span class=n>elapsed</span> <span class=o>&gt;=</span> <span class=nf>msecs_to_jiffies</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span><span class=p>)</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>		    <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span> <span class=o>&gt;</span> <span class=mi>0</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>		    <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span> <span class=o>==</span> <span class=mi>0</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>		    <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span> <span class=o>&gt;=</span> <span class=nf>keepalive_probes</span><span class=p>(</span><span class=n>tp</span><span class=p>)))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_send_active_reset</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>GFP_ATOMIC</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_write_err</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>			<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_write_wakeup</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>LINUX_MIB_TCPKEEPALIVE</span><span class=p>)</span> <span class=o>&lt;=</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>			<span class=n>elapsed</span> <span class=o>=</span> <span class=nf>keepalive_intvl_when</span><span class=p>(</span><span class=n>tp</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=n>elapsed</span> <span class=o>=</span> <span class=n>TCP_RESOURCE_PROBE_INTERVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>elapsed</span> <span class=o>=</span> <span class=nf>keepalive_time_when</span><span class=p>(</span><span class=n>tp</span><span class=p>)</span> <span class=o>-</span> <span class=n>elapsed</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>sk_mem_reclaim</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>resched</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_csk_reset_keepalive_timer</span> <span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>elapsed</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>goto</span> <span class=n>out</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>death</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_done</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>out</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>bh_unlock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_put</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>要点：</p><ul><li><strong>FIN_WAIT2 孤儿</strong>：可转 <code>tcp_time_wait()</code> 或发 RST <code>tcp_done()</code>。</li><li><strong>空闲判定</strong>：无 <code>packets_out</code> 且写队列空才进入 probe 计数逻辑；否则仅 <strong>resched</strong> 完整 idle 周期。</li><li><strong>探测发送</strong>：<code>tcp_write_wakeup(sk, LINUX_MIB_TCPKEEPALIVE)</code>；失败（本地拥塞）时用 <code>TCP_RESOURCE_PROBE_INTERVAL</code>。</li><li><strong>终止条件</strong>：<code>TCP_USER_TIMEOUT</code> 与 <code>icsk_probes_out</code> 联立，或传统 <code>keepalive_probes()</code> 上限。</li></ul><p><code>keepalive_time_elapsed()</code>（<code>tcp.h:1666-1672</code>）取 <code>lrcvtime</code> 与 <code>rcv_tstamp</code> 相对 <code>tcp_jiffies32</code> 的较小值，避免应用层未读导致误判「有流量」。</p><h3 id=54-tcp_write_wakeup-与探测-skb>5.4 <code>tcp_write_wakeup()</code> 与探测 skb</h3><p>Keepalive 与零窗口探测共用发送探测段逻辑，<code>tcp_write_wakeup()</code>（<code>tcp_output.c:5130-5171</code>）在 <strong>不能发正文</strong> 时调用 <code>tcp_xmit_probe_skb()</code>（序列号 <code>snd_una - 1</code> 一类技巧，见该文件 5087-5106 行注释）。</p><hr><h2 id=六pacing-定时器hrtimer>六、Pacing 定时器（<code>hrtimer</code>）</h2><h3 id=61-tcp_pace_kick到期后推进发送>6.1 <code>tcp_pace_kick()</code>：到期后推进发送</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:1614-1623
+</span></span></span><span class=line><span class=cl><span class=k>enum</span> <span class=n>hrtimer_restart</span> <span class=nf>tcp_pace_kick</span><span class=p>(</span><span class=k>struct</span> <span class=n>hrtimer</span> <span class=o>*</span><span class=n>timer</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>container_of</span><span class=p>(</span><span class=n>timer</span><span class=p>,</span> <span class=k>struct</span> <span class=n>tcp_sock</span><span class=p>,</span> <span class=n>pacing_timer</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span> <span class=o>=</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_tsq_handler</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_put</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>HRTIMER_NORESTART</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>回调 <strong>不自动周期重装</strong>；下一次发送窗口由 <code>tcp_pacing_check()</code> 在 <code>tcp_write_xmit()</code> 中视 <code>tcp_wstamp_ns</code> 决定。</p><h3 id=62-tcp_pacing_checktcp_write_xmit-门前的第一道闸>6.2 <code>tcp_pacing_check()</code>：<code>tcp_write_xmit</code> 门前的第一道闸</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:3254-3274
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>bool</span> <span class=nf>tcp_pacing_check</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>tcp_needs_internal_pacing</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_wstamp_ns</span> <span class=o>&lt;=</span> <span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_clock_cache</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span> <span class=nb>false</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>hrtimer_is_queued</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>pacing_timer</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>hrtimer_start</span><span class=p>(</span><span class=o>&amp;</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>pacing_timer</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>			      <span class=nf>ns_to_ktime</span><span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>tcp_wstamp_ns</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>			      <span class=n>HRTIMER_MODE_ABS_PINNED_SOFT</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>sock_hold</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=nb>true</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>tcp_needs_internal_pacing()</code>（<code>tcp.h:1435-1438</code>）检测 <code>sk->sk_pacing_status == SK_PACING_NEEDED</code>；若由 <strong>qdisc fq</strong> 等完全接管，可不走内部 hrtimer。</p><h3 id=63-与-tcp_write_xmit-的交织>6.3 与 <code>tcp_write_xmit()</code> 的交织</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:3496-3498 (tcp_write_xmit 内部)
+</span></span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_pacing_check</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=k>break</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><p>发送循环在此处断开，等待 <code>tcp_pace_kick</code> → <code>tcp_tsq_handler</code> 再次拉起 <code>tcp_write_xmit</code>。</p><h3 id=64-bbr-与-sk_pacing_rate>6.4 BBR 与 <code>sk_pacing_rate</code></h3><p>拥塞控制算法设置 <strong>字节/秒</strong> 级 <code>sk->sk_pacing_rate</code>。例如 BBR 在 <code>net/ipv4/tcp_bbr.c</code> 中更新 pacing 速率（如 <code>sk->sk_pacing_rate = bbr_bw_to_pacing_rate(...)</code> 等）。<strong>实际包间距</strong> 在 <code>tcp_update_skb_after_send()</code>（<code>tcp_output.c:1638-1661</code>）按 <code>skb->len / rate</code> 累加 <code>tcp_wstamp_ns</code>，与定时器到期时间一致。</p><hr><h2 id=七零窗口探测定时器>七、零窗口探测定时器</h2><p>对端通告 <strong>零窗口</strong> 且发送方仍有数据想发时，通过 <code>ICSK_TIME_PROBE0</code> 路径周期发送窗口探测。</p><h3 id=71-tcp_probe_timer>7.1 <code>tcp_probe_timer()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span><span class=lnt>34
+</span><span class=lnt>35
+</span><span class=lnt>36
+</span><span class=lnt>37
+</span><span class=lnt>38
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:356-400
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>tcp_probe_timer</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sk_buff</span> <span class=o>*</span><span class=n>skb</span> <span class=o>=</span> <span class=nf>tcp_send_head</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>max_probes</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>packets_out</span> <span class=o>||</span> <span class=o>!</span><span class=n>skb</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_tstamp</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_tstamp</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_tstamp</span> <span class=o>=</span> <span class=n>tcp_jiffies32</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>else</span> <span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>		 <span class=p>(</span><span class=n>s32</span><span class=p>)(</span><span class=n>tcp_jiffies32</span> <span class=o>-</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_tstamp</span><span class=p>)</span> <span class=o>&gt;=</span>
+</span></span><span class=line><span class=cl>		 <span class=nf>msecs_to_jiffies</span><span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_user_timeout</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>		<span class=k>goto</span> <span class=n>abort</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>max_probes</span> <span class=o>=</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_retries2</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=nf>sock_flag</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>SOCK_DEAD</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>const</span> <span class=kt>bool</span> <span class=n>alive</span> <span class=o>=</span> <span class=nf>inet_csk_rto_backoff</span><span class=p>(</span><span class=n>icsk</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>)</span> <span class=o>&lt;</span> <span class=n>TCP_RTO_MAX</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=n>max_probes</span> <span class=o>=</span> <span class=nf>tcp_orphan_retries</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>alive</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>alive</span> <span class=o>&amp;&amp;</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_backoff</span> <span class=o>&gt;=</span> <span class=n>max_probes</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=k>goto</span> <span class=n>abort</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=nf>tcp_out_of_resources</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=nb>true</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span> <span class=o>&gt;=</span> <span class=n>max_probes</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl><span class=nl>abort</span><span class=p>:</span>		<span class=nf>tcp_write_err</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=nf>tcp_send_probe0</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>注意：若存在 <strong>在途包</strong>（<code>packets_out</code>）或无待发 skb（<code>!tcp_send_head</code>），探测状态清零并返回，与 RTO 路径分工。</p><h3 id=72-tcp_send_probe0退避与用户超时钳制>7.2 <code>tcp_send_probe0()</code>：退避与用户超时钳制</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_output.c:5182-5214
+</span></span></span><span class=line><span class=cl><span class=kt>void</span> <span class=nf>tcp_send_probe0</span><span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>inet_connection_sock</span> <span class=o>*</span><span class=n>icsk</span> <span class=o>=</span> <span class=nf>inet_csk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>tcp_sk</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>net</span> <span class=o>*</span><span class=n>net</span> <span class=o>=</span> <span class=nf>sock_net</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>timeout</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=kt>int</span> <span class=n>err</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>err</span> <span class=o>=</span> <span class=nf>tcp_write_wakeup</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>LINUX_MIB_TCPWINPROBE</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>packets_out</span> <span class=o>||</span> <span class=nf>tcp_write_queue_empty</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_backoff</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_tstamp</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_probes_out</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=n>err</span> <span class=o>&lt;=</span> <span class=mi>0</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_backoff</span> <span class=o>&lt;</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_retries2</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_backoff</span><span class=o>++</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>		<span class=n>timeout</span> <span class=o>=</span> <span class=nf>tcp_probe0_when</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=n>timeout</span> <span class=o>=</span> <span class=n>TCP_RESOURCE_PROBE_INTERVAL</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>timeout</span> <span class=o>=</span> <span class=nf>tcp_clamp_probe0_to_user_timeout</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>timeout</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>tcp_reset_xmit_timer</span><span class=p>(</span><span class=n>sk</span><span class=p>,</span> <span class=n>ICSK_TIME_PROBE0</span><span class=p>,</span> <span class=n>timeout</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><code>tcp_probe0_when()</code>（<code>tcp.h:1471-1478</code>）在 <code>tcp_probe0_base()</code>（至少 <code>TCP_RTO_MIN</code>）基础上按 <code>icsk_backoff</code> 指数放大并封顶 <code>TCP_RTO_MAX</code>。<code>tcp_reset_xmit_timer()</code> 会加上 <strong>pacing 延迟</strong>，避免与内部 pacing 冲突。</p><p>首次.arm 探测的常见入口之一为 <code>tcp_check_probe_timer()</code>（<code>tcp.h:1481-1486</code>）：在无在途包且无 pending 写定时器事件时 <code>tcp_reset_xmit_timer(..., ICSK_TIME_PROBE0, tcp_probe0_base(sk), ...)</code>。</p><hr><h2 id=八syn-ack-重传定时器半连接-request_sock>八、SYN-ACK 重传定时器（半连接 <code>request_sock</code>）</h2><p>监听套接字accept 队列上的 <strong>半连接</strong> 使用 <strong>独立的</strong> <code>req->rsk_timer</code>，与 established <code>tcp_sock</code> 的 <code>icsk_retransmit_timer</code> 不同。</p><h3 id=81-reqsk_queue_hash_req入-ehash-时启动定时器>8.1 <code>reqsk_queue_hash_req()</code>：入 ehash 时启动定时器</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span><span class=lnt>5
+</span><span class=lnt>6
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c:1008-1013
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>reqsk_queue_hash_req</span><span class=p>(</span><span class=k>struct</span> <span class=n>request_sock</span> <span class=o>*</span><span class=n>req</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				 <span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>timeout</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=nf>timer_setup</span><span class=p>(</span><span class=o>&amp;</span><span class=n>req</span><span class=o>-&gt;</span><span class=n>rsk_timer</span><span class=p>,</span> <span class=n>reqsk_timer_handler</span><span class=p>,</span> <span class=n>TIMER_PINNED</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=nf>mod_timer</span><span class=p>(</span><span class=o>&amp;</span><span class=n>req</span><span class=o>-&gt;</span><span class=n>rsk_timer</span><span class=p>,</span> <span class=n>jiffies</span> <span class=o>+</span> <span class=n>timeout</span><span class=p>);</span>
+</span></span></code></pre></td></tr></table></div></div><h3 id=82-reqsk_timer_handler-核心逻辑>8.2 <code>reqsk_timer_handler()</code> 核心逻辑</h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span><span class=lnt>24
+</span><span class=lnt>25
+</span><span class=lnt>26
+</span><span class=lnt>27
+</span><span class=lnt>28
+</span><span class=lnt>29
+</span><span class=lnt>30
+</span><span class=lnt>31
+</span><span class=lnt>32
+</span><span class=lnt>33
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/inet_connection_sock.c:890-1003
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=kt>void</span> <span class=nf>reqsk_timer_handler</span><span class=p>(</span><span class=k>struct</span> <span class=n>timer_list</span> <span class=o>*</span><span class=n>t</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>request_sock</span> <span class=o>*</span><span class=n>req</span> <span class=o>=</span> <span class=nf>from_timer</span><span class=p>(</span><span class=n>req</span><span class=p>,</span> <span class=n>t</span><span class=p>,</span> <span class=n>rsk_timer</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=c1>// ... listener 迁移、max_syn_ack_retries 动态压缩 ...
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=n>max_syn_ack_retries</span> <span class=o>=</span> <span class=n>icsk</span><span class=o>-&gt;</span><span class=n>icsk_syn_retries</span> <span class=o>?</span> <span class=o>:</span>
+</span></span><span class=line><span class=cl>		<span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_synack_retries</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=c1>// ... qlen/young 杠杆可能压低 max_syn_ack_retries ...
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>syn_ack_recalc</span><span class=p>(</span><span class=n>req</span><span class=p>,</span> <span class=n>max_syn_ack_retries</span><span class=p>,</span> <span class=nf>READ_ONCE</span><span class=p>(</span><span class=n>queue</span><span class=o>-&gt;</span><span class=n>rskq_defer_accept</span><span class=p>),</span>
+</span></span><span class=line><span class=cl>		       <span class=o>&amp;</span><span class=n>expire</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>resend</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=n>req</span><span class=o>-&gt;</span><span class=n>rsk_ops</span><span class=o>-&gt;</span><span class=nf>syn_ack_timeout</span><span class=p>(</span><span class=n>req</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=n>expire</span> <span class=o>&amp;&amp;</span>
+</span></span><span class=line><span class=cl>	    <span class=p>(</span><span class=o>!</span><span class=n>resend</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	     <span class=o>!</span><span class=nf>inet_rtx_syn_ack</span><span class=p>(</span><span class=n>sk_listener</span><span class=p>,</span> <span class=n>req</span><span class=p>)</span> <span class=o>||</span>
+</span></span><span class=line><span class=cl>	     <span class=nf>inet_rsk</span><span class=p>(</span><span class=n>req</span><span class=p>)</span><span class=o>-&gt;</span><span class=n>acked</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=kt>unsigned</span> <span class=kt>long</span> <span class=n>timeo</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>req</span><span class=o>-&gt;</span><span class=n>num_timeout</span><span class=o>++</span> <span class=o>==</span> <span class=mi>0</span><span class=p>)</span>
+</span></span><span class=line><span class=cl>			<span class=nf>atomic_dec</span><span class=p>(</span><span class=o>&amp;</span><span class=n>queue</span><span class=o>-&gt;</span><span class=n>young</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=n>timeo</span> <span class=o>=</span> <span class=nf>min</span><span class=p>(</span><span class=n>TCP_TIMEOUT_INIT</span> <span class=o>&lt;&lt;</span> <span class=n>req</span><span class=o>-&gt;</span><span class=n>num_timeout</span><span class=p>,</span> <span class=n>TCP_RTO_MAX</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=nf>mod_timer</span><span class=p>(</span><span class=o>&amp;</span><span class=n>req</span><span class=o>-&gt;</span><span class=n>rsk_timer</span><span class=p>,</span> <span class=n>jiffies</span> <span class=o>+</span> <span class=n>timeo</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>		<span class=c1>// ... migrated nreq 成功插入 ehash 的分支 ...
+</span></span></span><span class=line><span class=cl>		<span class=k>return</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=c1>// ... 迁移失败清理 ...
+</span></span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl><span class=nl>drop</span><span class=p>:</span>
+</span></span><span class=line><span class=cl>	<span class=nf>inet_csk_reqsk_queue_drop_and_put</span><span class=p>(</span><span class=n>oreq</span><span class=o>-&gt;</span><span class=n>rsk_listener</span><span class=p>,</span> <span class=n>oreq</span><span class=p>);</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong><code>syn_ack_recalc()</code></strong>（<code>inet_connection_sock.c:763</code> 起）：结合 <code>tcp_defer_accept</code> 决定 <strong>仅过期丢弃</strong> 还是 <strong>继续重传</strong>。</li><li><strong>重传间隔</strong>：<code>TCP_TIMEOUT_INIT &lt;&lt; num_timeout</code> 封顶 <code>TCP_RTO_MAX</code>（与数据 RTO 初始 1s 同性质的指数退避刻度）。</li><li><strong><code>req->num_timeout</code></strong>：每次实际进入重传调度递增；首次从 <strong>young</strong> 计数迁出。</li><li><strong>失败归宿</strong>：<code>inet_csk_reqsk_queue_drop_and_put()</code> 释放半连接；<code>tcp_syn_ack_timeout()</code> 在 TCP 层可做统计（<code>tcp_timer.c:656-661</code> <code>__NET_INC_STATS(...TCPTIMEOUTS)</code> 由具体路径触发）。</li></ul><p><code>define TCP_SYNACK_RETRIES</code> 在 <code>tcp.h:116-121</code> 给出协议注释层面的默认尺度；运行时可由 <code>sysctl_tcp_synack_retries</code> 覆盖。</p><hr><h2 id=九压缩-ack-定时器compressed_ack_timer>九、压缩 ACK 定时器（<code>compressed_ack_timer</code>）</h2><h3 id=91-tcp_compressed_ack_kick>9.1 <code>tcp_compressed_ack_kick()</code></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span><span class=lnt>15
+</span><span class=lnt>16
+</span><span class=lnt>17
+</span><span class=lnt>18
+</span><span class=lnt>19
+</span><span class=lnt>20
+</span><span class=lnt>21
+</span><span class=lnt>22
+</span><span class=lnt>23
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_timer.c:764-789
+</span></span></span><span class=line><span class=cl><span class=k>static</span> <span class=k>enum</span> <span class=n>hrtimer_restart</span> <span class=nf>tcp_compressed_ack_kick</span><span class=p>(</span><span class=k>struct</span> <span class=n>hrtimer</span> <span class=o>*</span><span class=n>timer</span><span class=p>)</span>
+</span></span><span class=line><span class=cl><span class=p>{</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>tcp_sock</span> <span class=o>*</span><span class=n>tp</span> <span class=o>=</span> <span class=nf>container_of</span><span class=p>(</span><span class=n>timer</span><span class=p>,</span> <span class=k>struct</span> <span class=n>tcp_sock</span><span class=p>,</span> <span class=n>compressed_ack_timer</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=n>sk</span> <span class=o>=</span> <span class=p>(</span><span class=k>struct</span> <span class=n>sock</span> <span class=o>*</span><span class=p>)</span><span class=n>tp</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>bh_lock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>sock_owned_by_user</span><span class=p>(</span><span class=n>sk</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>			<span class=n>tp</span><span class=o>-&gt;</span><span class=n>compressed_ack</span><span class=o>--</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>			<span class=nf>tcp_send_ack</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>		<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span> <span class=k>else</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>		<span class=k>if</span> <span class=p>(</span><span class=o>!</span><span class=nf>test_and_set_bit</span><span class=p>(</span><span class=n>TCP_DELACK_TIMER_DEFERRED</span><span class=p>,</span>
+</span></span><span class=line><span class=cl>				      <span class=o>&amp;</span><span class=n>sk</span><span class=o>-&gt;</span><span class=n>sk_tsq_flags</span><span class=p>))</span>
+</span></span><span class=line><span class=cl>			<span class=nf>sock_hold</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>	<span class=p>}</span>
+</span></span><span class=line><span class=cl>	<span class=nf>bh_unlock_sock</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=nf>sock_put</span><span class=p>(</span><span class=n>sk</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>	<span class=k>return</span> <span class=n>HRTIMER_NORESTART</span><span class=p>;</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p>每次到期发送 <strong>一个</strong> ACK，并将 <code>compressed_ack</code> 计数递减，用于在 <strong>乱序 + SACK</strong> 场景下合并多次确认触发。</p><h3 id=92-sysctl_tcp_comp_sack_-默认值与语义>9.2 <code>sysctl_tcp_comp_sack_*</code> 默认值与语义</h3><p>初始化（<code>net/ipv4/tcp_ipv4.c</code>）：</p><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt>1
+</span><span class=lnt>2
+</span><span class=lnt>3
+</span><span class=lnt>4
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=c1>// net/ipv4/tcp_ipv4.c:3960-3962
+</span></span></span><span class=line><span class=cl>	<span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_delay_ns</span> <span class=o>=</span> <span class=n>NSEC_PER_MSEC</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_slack_ns</span> <span class=o>=</span> <span class=mi>100</span> <span class=o>*</span> <span class=n>NSEC_PER_USEC</span><span class=p>;</span>
+</span></span><span class=line><span class=cl>	<span class=n>net</span><span class=o>-&gt;</span><span class=n>ipv4</span><span class=p>.</span><span class=n>sysctl_tcp_comp_sack_nr</span> <span class=o>=</span> <span class=mi>44</span><span class=p>;</span>
+</span></span></code></pre></td></tr></table></div></div><ul><li><strong><code>tcp_comp_sack_delay_ns</code></strong>：<strong>硬顶</strong> 延迟；默认 <strong>1ms</strong>（<code>NSEC_PER_MSEC</code>）。与 <code>__tcp_ack_snd_check()</code> 中 <strong>RTT/20</strong>（纳秒换算，<code>rtt * (NSEC_PER_USEC >> 3)/20</code>）取 <strong>min</strong>。</li><li><strong><code>tcp_comp_sack_nr</code></strong>：<strong>批量阈值</strong>，<code>compressed_ack</code> 达到后不再压缩、立即走 <code>send_now</code>（<code>tcp_input.c:6599-6600</code>）。</li><li><strong><code>tcp_comp_sack_slack_ns</code></strong>：传给 <code>hrtimer_start_range_ns()</code> 的 <strong>范围 slack</strong>（默认 100µs），允许合并少量调度抖动。</li></ul><h3 id=93-与-__tcp_ack_snd_check-的闭环>9.3 与 <code>__tcp_ack_snd_check()</code> 的闭环</h3><p>乱序路径在 <code>dup_ack_counter</code> 达到 <code>TCP_FASTRETRANS_THRESH</code>（值为 3，<code>tcp.h:80</code>）后才累加 <code>compressed_ack</code> 并启动 hrtimer；若定时器已在队列中则直接返回，由 <strong>单次 hrtimer</strong> 聚合多次「本可立即发的 ACK」。定时器触发后 <code>tcp_compressed_ack_kick</code> 发送 ACK 并递减计数，从而在 <strong>减少 ACK 数</strong> 与 <strong>时延</strong> 之间折中。</p><hr><h2 id=附time_wait-与本文定时器的关系>附：TIME_WAIT 与本文定时器的关系</h2><p><strong>TIME_WAIT</strong> 不是 <code>tcp_sock</code> 上上述 <code>timer_list</code>/<code>hrtimer</code> 的延长线，而是迁入 <strong><code>inet_timewait_sock</code></strong> 后由 <strong>timewait 死亡行</strong>（<code>tcp_death_row</code>）管理与定时回收。入口如 <code>tcp_time_wait()</code>（<code>net/ipv4/tcp_minisocks.c:308</code> 起）将状态、序列号窗口等拷入 <code>tcp_timewait_sock</code>；收包路径可对 <strong>已有 TIME_WAIT</strong> 连接 <code>inet_twsk_reschedule(tw, TCP_TIMEWAIT_LEN)</code>（同文件 293-294 行附近）刷新约 <strong>60s</strong> 寿命（<code>TCP_TIMEWAIT_LEN</code>，<code>tcp.h:123-124</code>）。故总结表中 <strong>单独一行</strong> 说明其机制与 <code>tcp_sock</code> 定时器列不同。</p><hr><h2 id=总结表定时器类型与回调>总结表：定时器类型与回调</h2><div class=table-wrapper><table><thead><tr><th>定时器（语义）</th><th>内核对象</th><th>回调 / 处理函数</th><th>典型超时或刻度</th></tr></thead><tbody><tr><td>写定时器（RTO / PROBE0 / TLP / RACK reo）</td><td><code>icsk->icsk_retransmit_timer</code> (<code>timer_list</code>)</td><td><code>tcp_write_timer</code> → <code>tcp_write_timer_handler</code> → 各分支</td><td><code>icsk_rto</code>、探测 <code>tcp_probe0_when</code>、TLP/RACK 各自设置</td></tr><tr><td>延迟 ACK</td><td><code>icsk->icsk_delack_timer</code></td><td><code>tcp_delack_timer</code> → <code>tcp_delack_timer_handler</code></td><td><code>ato</code>，上界 <code>HZ/2</code> 或 <code>TCP_DELACK_MAX</code> + RTT</td></tr><tr><td>保活</td><td><code>sk->sk_timer</code></td><td><code>tcp_keepalive_timer</code></td><td><code>keepalive_time_when</code> / <code>keepalive_intvl_when</code></td></tr><tr><td>Pacing</td><td><code>tp->pacing_timer</code> (<code>hrtimer</code>)</td><td><code>tcp_pace_kick</code> → <code>tcp_tsq_handler</code></td><td><code>tcp_wstamp_ns</code>（绝对_ns）</td></tr><tr><td>压缩 ACK</td><td><code>tp->compressed_ack_timer</code> (<code>hrtimer</code>)</td><td><code>tcp_compressed_ack_kick</code></td><td><code>min(sysctl_tcp_comp_sack_delay_ns, RTT/20)</code> + slack</td></tr><tr><td>SYN-ACK 半连接</td><td><code>req->rsk_timer</code></td><td><code>reqsk_timer_handler</code></td><td><code>TCP_TIMEOUT_INIT &lt;&lt; num_timeout</code>（cap <code>TCP_RTO_MAX</code>）</td></tr><tr><td>TIME_WAIT 回收</td><td><code>inet_timewait_sock</code> 死亡行定时器</td><td><code>inet_twsk_kill</code> / <code>inet_twsk_reschedule</code> 等</td><td>约 <code>TCP_TIMEWAIT_LEN</code>（60s 量级）</td></tr></tbody></table></div><hr><h2 id=参考文献源码文件>参考文献（源码文件）</h2><ul><li><code>net/ipv4/tcp_timer.c</code> — 写/delack/keepalive/压缩 ACK 主体</li><li><code>net/ipv4/tcp_output.c</code>：<code>tcp_send_delayed_ack</code>、<code>tcp_pace_kick</code>、<code>tcp_pacing_check</code>、<code>tcp_write_xmit</code>、<code>tcp_send_probe0</code>、<code>tcp_write_wakeup</code></li><li><code>net/ipv4/tcp_input.c</code> — <code>__tcp_ack_snd_check</code>、<code>tcp_in_quickack_mode</code></li><li><code>net/ipv4/inet_connection_sock.c</code> — <code>inet_csk_init_xmit_timers</code>、<code>inet_csk_reset_keepalive_timer</code>、<code>reqsk_timer_handler</code></li><li><code>include/net/inet_connection_sock.h</code> — <code>inet_csk_reset_xmit_timer</code>、<code>ICSK_TIME_*</code></li><li><code>include/net/tcp.h</code> — 宏与 <code>keepalive_*</code>、<code>tcp_reset_xmit_timer</code>、<code>tcp_probe0_when</code>、<code>TCP_TIMEWAIT_LEN</code> 等</li></ul></section><footer class=article-footer><section class=article-tags><a href=/tags/tcp/>TCP</a>
+<a href=/tags/%E5%AE%9A%E6%97%B6%E5%99%A8/>定时器</a>
+<a href=/tags/rto/>RTO</a>
+<a href=/tags/%E5%BB%B6%E8%BF%9Fack/>延迟ACK</a>
+<a href=/tags/keepalive/>Keepalive</a>
+<a href=/tags/pacing/>Pacing</a>
+<a href=/tags/tlp/>TLP</a>
+<a href=/tags/time_wait/>TIME_WAIT</a>
+<a href=/tags/syn-ack%E9%87%8D%E4%BC%A0/>SYN-ACK重传</a>
+<a href=/tags/%E5%8E%8B%E7%BC%A9ack/>压缩ACK</a></section><section class=article-copyright><svg class="icon icon-tabler icon-tabler-copyright" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z"/><circle cx="12" cy="12" r="9"/><path d="M14.5 9a3.5 4 0 100 6"/></svg>
+<span>Licensed under CC BY-NC-SA 4.0</span></section></footer></article><aside class=related-content--wrapper><h2 class=section-title>Related content</h2><div class=related-content><div class="flex article-list--tile"><article><a href=/p/tcp-%E9%87%8D%E4%BC%A0%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 重传机制深度分析</h2></div></a></article><article><a href=/p/tcp/udp-%E6%B7%B1%E5%BA%A6%E6%8E%8C%E6%8F%A1%E9%97%AE%E7%AD%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%97%AE%E9%A2%98%E4%BB%8E%E5%86%85%E6%A0%B8%E6%BA%90%E7%A0%81%E5%88%B0%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/><div class=article-details><h2 class=article-title>TCP/UDP 深度掌握问答与实战问题——从内核源码到生产实践</h2></div></a></article><article><a href=/p/tcp-%E5%9B%9B%E6%AC%A1%E6%8C%A5%E6%89%8B%E4%B8%8E-close-%E6%B7%B1%E5%BA%A6%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 四次挥手与 close 深度源码分析</h2></div></a></article><article><a href=/p/tcp-%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%88%86%E6%9E%90/><div class=article-details><h2 class=article-title>TCP 内存管理与流量控制深度分析</h2></div></a></article><article><a href=/p/tcp-%E6%8B%A5%E5%A1%9E%E6%8E%A7%E5%88%B6%E5%9B%9B%E5%A4%A7%E6%9C%BA%E5%88%B6%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0/><div class=article-details><h2 class=article-title>TCP 拥塞控制四大机制源码实现</h2></div></a></article></div></div></aside><footer class=site-footer><section class=copyright>&copy;
+2026 深栈</section><section class=powerby></section></footer><div class=pswp tabindex=-1 role=dialog aria-hidden=true><div class=pswp__bg></div><div class=pswp__scroll-wrap><div class=pswp__container><div class=pswp__item></div><div class=pswp__item></div><div class=pswp__item></div></div><div class="pswp__ui pswp__ui--hidden"><div class=pswp__top-bar><div class=pswp__counter></div><button class="pswp__button pswp__button--close" title="Close (Esc)"></button>
+<button class="pswp__button pswp__button--share" title=Share></button>
+<button class="pswp__button pswp__button--fs" title="Toggle fullscreen"></button>
+<button class="pswp__button pswp__button--zoom" title="Zoom in/out"></button><div class=pswp__preloader><div class=pswp__preloader__icn><div class=pswp__preloader__cut><div class=pswp__preloader__donut></div></div></div></div></div><div class="pswp__share-modal pswp__share-modal--hidden pswp__single-tap"><div class=pswp__share-tooltip></div></div><button class="pswp__button pswp__button--arrow--left" title="Previous (arrow left)">
+</button>
+<button class="pswp__button pswp__button--arrow--right" title="Next (arrow right)"></button><div class=pswp__caption><div class=pswp__caption__center></div></div></div></div></div><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.js integrity="sha256-ePwmChbbvXbsO02lbM3HoHbSHTHFAeChekF1xKJdleo=" crossorigin=anonymous defer></script><script src=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe-ui-default.min.js integrity="sha256-UKkzOn/w1mBxRmLLGrSeyB4e1xbrp4xylgAWb3M42pU=" crossorigin=anonymous defer></script><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/default-skin/default-skin.min.css crossorigin=anonymous><link rel=stylesheet href=https://cdn.jsdelivr.net/npm/photoswipe@4.1.3/dist/photoswipe.min.css crossorigin=anonymous></main></div><script src=https://cdn.jsdelivr.net/npm/node-vibrant@3.1.6/dist/vibrant.min.js integrity="sha256-awcR2jno4kI5X0zL8ex0vi2z+KMkF24hUW8WePSA9HM=" crossorigin=anonymous></script><script type=text/javascript src=/ts/main.1e9a3bafd846ced4c345d084b355fb8c7bae75701c338f8a1f8a82c780137826.js defer></script><script>(function(){const e=document.createElement("link");e.href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap",e.type="text/css",e.rel="stylesheet",document.head.appendChild(e)})()</script></body></html>
